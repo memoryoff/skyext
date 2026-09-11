@@ -91,7 +91,7 @@ local function save_doc(coll_obj, key, unique_id, doc)
     return true
 end
 
-function M.load(dbname, dbcoll, key, unique_id, default)
+function M.load(dbname, dbcoll, key, unique_id)
     check_collection(dbname, dbcoll)
 
     local cache_collection = get_cache_collection(dbname, dbcoll)
@@ -104,23 +104,31 @@ function M.load(dbname, dbcoll, key, unique_id, default)
         loading = true,
     }
 
-    local t = default or {}
-    t[key] = unique_id
-    t._version = 0
-
-    -- 从数据库加载数据
+    -- 从数据库加载数据(纯读)
     local coll_obj = get_collection_obj(dbname, dbcoll)
-    local ret = coll_obj:find_and_modify({
-        query = { [key] = unique_id },
-        update = { ["$setOnInsert"] = t },
-        fields = g_default_projection,
-        upsert = true,
-        new = true,
-    })
+    local ok, ret = pcall(coll_obj.find_one, coll_obj, { [key] = unique_id }, g_default_projection)
+    if not ok then
+        log.error(
+            "load find_one failed",
+            "dbname",
+            dbname,
+            "dbcoll",
+            dbcoll,
+            "key",
+            key,
+            "unique_id",
+            unique_id,
+            "err",
+            ret
+        )
+        cache_collection[unique_id] = nil
+        return
+    end
 
     log.debug("load data", "dbname", dbname, "dbcoll", dbcoll, "key", key, "unique_id", unique_id, "ret", ret)
-    if ret.ok ~= 1 then
-        log.error("load failed", "dbname", dbname, "dbcoll", dbcoll, "key", key, "unique_id", unique_id, "ret", ret)
+    if type(ret) ~= "table" then
+        -- 不存在:不创建、不缓存、不挂存盘定时器(挂上会把这个空对象在 3 分钟后写库)
+        cache_collection[unique_id] = nil
         return
     end
 
@@ -131,7 +139,26 @@ function M.load(dbname, dbcoll, key, unique_id, default)
     end
 
     -- 用 orm 包裹: dbcoll 为 schema name
-    local doc = schema[dbcoll].new(ret.value)
+    local ok, doc = pcall(function()
+        return schema[dbcoll].new(ret)
+    end)
+    if not ok then
+        log.error(
+            "load schema new failed",
+            "dbname",
+            dbname,
+            "dbcoll",
+            dbcoll,
+            "key",
+            key,
+            "unique_id",
+            unique_id,
+            "err",
+            doc
+        )
+        cache_collection[unique_id] = nil
+        return
+    end
 
     -- 定时器入库脏数据(随机分布)
     local timer_obj = timer.repeat_random_delayed("dbmgr", db_save_interval, function()
