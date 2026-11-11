@@ -1036,10 +1036,51 @@ t.describe("fence claim majority 结果分类", function()
 
     t.it("reads the unclaimed document with majority read when available", function()
         local h = harness(nil, false, true)
-        h:enable_critical("CONFIRMED", { value = " ", lastErrorObject = { n = 0 } }, nil)
+        h:enable_critical("CONFIRMED", { value = "\0", lastErrorObject = { n = 0 } }, nil)
         local doc, err = h.db.load("demo", "role", "rid", 7, { fence = 5, valid = true }, { create = false })
         t.expect(doc).to.be_nil()
         t.expect(err).to.equal("not found")
         t.expect(h.critical_read.query).to.equal({ rid = 7 })
+    end)
+end)
+
+-- P07：关键元数据在 orm.decode 之前提取，普通 ORM 文档看不到它们
+t.describe("dbmgr 关键字段提取", function()
+    local OP_HASH = string.rep("ab", 16)
+    local OP_ID = "0123456789abcdef0123456789abcdef_0001"
+
+    t.it("keeps reserved metadata out of the ORM document and in the cache entry", function()
+        local stored = copy(DEFAULT_ROW)
+        stored._critical_intent_v1 = {
+            op_id = OP_ID,
+            op_type = "shop.buy",
+            param_hash = OP_HASH,
+            owner_fence = 5,
+            prepared_at = 1700000000,
+            state = "PREPARED",
+        }
+        local h = harness(nil, stored, true)
+        local doc = assert(h.db.load("demo", "role", "rid", 7, { fence = 5, valid = true }, { create = false }))
+        -- ORM 文档对未知键会直接报错，这里用快照证明它没有把保留字段带进普通保存路径
+        t.expect(doc.rid).to.equal(7)
+        t.expect(h.entry.critical._critical_intent_v1.op_id).to.equal(OP_ID)
+        -- 普通保存不能生成任何 _critical_* 路径
+        h.entry.doc.name = "changed"
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(true)
+        local update = h.updates[#h.updates].update
+        t.expect(update["$set"].name).to.equal("changed")
+        for key in pairs(update["$set"]) do
+            t.expect(key:sub(1, 10) == "_critical_").to.equal(false)
+        end
+    end)
+
+    t.it("refuses a document carrying an unknown critical field version", function()
+        local stored = copy(DEFAULT_ROW)
+        stored._critical_intent_v2 = { state = "PREPARED" }
+        local h = harness(nil, stored, true)
+        local doc, err = h.db.load("demo", "role", "rid", 7, { fence = 5, valid = true }, { create = false })
+        t.expect(doc).to.be_nil()
+        t.expect(err).to.equal("critical metadata rejected")
+        t.expect(h.entry).to.be_nil()
     end)
 end)

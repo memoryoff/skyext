@@ -3,6 +3,7 @@ local config = require "skyext.config"
 local log = require "skyext.log"
 local mongo_conn = require "skyext.mongo_conn"
 local orm = require "orm"
+local critical_fields = require "skyext.critical_fields"
 local SCHEMA_PATH = "game.orm.schema"
 local schema = require(SCHEMA_PATH)
 local save_wheel = require "skyext.save_wheel"
@@ -427,7 +428,25 @@ function M.load(dbname, dbcoll, key, unique_id, handle, opts)
         end
 
         local schema_type = assert(schema[dbcoll], "missing schema for " .. dbcoll)
-        local doc, dropped = orm.decode(schema_type, value)
+        -- `orm.decode` 会原地删除 schema 之外的字段。关键元数据必须在它之前提取出来，
+        -- 否则未决意图/已提交账本会被当成"旧版本残留"静默丢掉。未知的 _critical_*
+        -- 直接拒绝加载：那可能是新版本写的，旧代码没有资格删它。
+        local clean, critical, reject = critical_fields.extract(value)
+        if not clean then
+            log.error(
+                "refusing to load a document with unusable critical metadata",
+                "dbcoll",
+                dbcoll,
+                "unique_id",
+                unique_id,
+                "reason",
+                tostring(critical),
+                "fields",
+                reject and table.concat(reject, ",") or nil
+            )
+            return nil, "critical metadata rejected"
+        end
+        local doc, dropped = orm.decode(schema_type, clean)
         if #dropped > 0 then
             -- 库里还留着这些字段，只是这份内存文档不再带它们
             log.warn(
@@ -447,6 +466,9 @@ function M.load(dbname, dbcoll, key, unique_id, handle, opts)
             dbcoll = dbcoll,
             key = key,
             unique_id = unique_id,
+            -- 关键元数据的权威副本。普通 orm.snapshot_mongo 永远不会写这些路径，
+            -- 只有 P08 的专用 CAS 会读写它们
+            critical = critical,
         }
         cache_collection[unique_id] = entry
         save_wheel_obj():add(entry)

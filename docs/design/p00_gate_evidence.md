@@ -78,8 +78,9 @@ $ ./bin/skyext test lualib/skyext/critical_fields.test.lua
    512 KiB 把单文档上限放大成 1.5 MiB）；userdata/thread、环、超大值一律拒绝。
 
 **已知边界**：`extract` 返回的 `clean` 只做浅拷贝（与原始文档共享普通字段的引用），
-因为 `orm.decode` 之后原始表即丢弃；关键元数据本身是深拷贝。`dbmgr.load` 目前仍直接
-`orm.decode`，**尚未接入 `extract`**——这是 P07 的改动项，本阶段只冻结并验证合同。
+因为 `orm.decode` 之后原始表即丢弃；关键元数据本身是深拷贝。`dbmgr.load` 已在
+`orm.decode` 之前调用 `extract`，把关键元数据放进 cache entry 的 `critical` 字段；
+未知 `_critical_*` 直接拒绝加载（P07 接线完成）。
 
 ## 3. P00-C：WS 握手同步注册
 
