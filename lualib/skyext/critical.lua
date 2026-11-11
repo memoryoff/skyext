@@ -83,6 +83,11 @@ local m_decisions =
     metrics.counter("skyext_critical_decisions_total", "Critical operation decisions by status", { "status" })
 local m_quarantined =
     metrics.counter("skyext_critical_quarantined_total", "Critical caches quarantined by reason", { "reason" })
+local m_same_owner_resume = metrics.counter(
+    "skyext_critical_same_owner_resume_total",
+    "Critical operations resumed by the same owner after a PREPARE",
+    { "op_type" }
+)
 
 local function hex(bytes)
     return (bytes:gsub(".", function(c)
@@ -406,6 +411,12 @@ local function commit_core(ctx, req, handlers)
                 recovery_id = req.op_id,
             })
         end
+    end
+
+    -- 同 owner 续做：同一个 op 的意图还在，说明上一次 PREPARE 之后进程没崩。
+    -- 这个比例高说明 COMMIT 经常没发出，是容量/延迟问题的先兆
+    if intent and intent.op_id == req.op_id and intent.owner_fence == fence_of(ctx) then
+        m_same_owner_resume:inc(1, { op_type = req.op_type })
     end
 
     -- 单文档容量硬阈值：超了就受控拒绝新的关键操作，而不是等 Mongo 报文档过大

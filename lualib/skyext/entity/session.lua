@@ -20,7 +20,15 @@ local fingerprint = require "skyext.fingerprint"
 local log = require "skyext.log"
 local timer = require "skyext.timer"
 
+local metrics = require "skyext.metrics"
+
 local M = {}
+
+-- 上行幂等命中：客户端重发同一个 req_id 时直接回缓存，不重新执行。
+-- 这个值升高说明客户端在重传（网络抖动或 ACK 丢），不是错误，但要看趋势
+local m_dedup = metrics.counter("skyext_session_dedup_hit_total", "Upstream requests served from the response cache", {
+    "mode",
+})
 
 -- 会话协商后的下行模式，终身锁定，不混发。
 -- LEGACY：沿用隐式计数（客户端数收到的包，ping/resume 里对账）
@@ -619,6 +627,7 @@ function M.with_request(key, f, req_id, request_name, request_digest)
                     return false, "cached response is not usable", errcode.REQUEST_EXPIRED
                 end
                 -- 续接之后客户端按原 id 重发的在途请求：回缓存的响应，绝不重新执行
+                m_dedup:inc(1, { mode = "req_id" })
                 return true, cached.pack
             end
             if req_id < io_.min_cached_req_id then
