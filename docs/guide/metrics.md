@@ -97,6 +97,8 @@ curl http://127.0.0.1:9190/metrics
 | `skyext_outbox_enqueued_total{op_type}` | counter | Outbox 事件确认入队数 |
 | `skyext_outbox_pending{type}` | gauge | 本 VM 上仍为 `PENDING` 的 Outbox 事件数 |
 | `skyext_outbox_status_unknown_total{op_type}` | counter | Outbox 状态 CAS 结果未决的次数 |
+| `skyext_charge_orders_total{status}` | counter | 支付订单进入各状态的次数 |
+| `skyext_charge_grant_unknown_total{provider}` | counter | 发奖结果未决的次数（订单停在 `GRANTING`） |
 
 服务名取自 `.launcher`，并且会抹掉实例间的差异：`mongo_conn:center:1` 归到 `mongo_conn`，`http_agent_gm_2` 归到 `http_agent_gm`。不这么做的话服务一扩容时间序列就跟着涨。不是由 `.launcher` 拉起的服务（比如 skynet 自己启动的 logger）归到 `unknown`。
 
