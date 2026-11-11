@@ -1,5 +1,6 @@
 local t = require "skytest"
 local skynet = require "skynet"
+local downlink = require "skyext.downlink"
 local errcode = require "skyext.errcode"
 local fs = require "skyext.util.fs"
 local lfs = require "lfs"
@@ -10,6 +11,11 @@ local source = fs.join(fs.absolute(os.getenv("SKYTEST_ROOT") or lfs.currentdir()
 local SELF_NODE = "role1"
 local GATE = ".gate_tcp"
 local OWNER = ".entity_agent:role:1"
+
+-- 16 字节：session_epoch 要求 16 字节随机源，nonce 的断言也基于同一格式
+local function fake_nonce(n)
+    return string.format("nonce%011d", n)
+end
 
 local function harness(opts)
     opts = opts or {}
@@ -117,7 +123,7 @@ local function harness(opts)
         crypto = {
             random_bytes = function()
                 h.nonce_seq = h.nonce_seq + 1
-                return "nonce" .. h.nonce_seq
+                return fake_nonce(h.nonce_seq)
             end,
             const_equals = function(a, b)
                 return a == b
@@ -184,7 +190,7 @@ t.describe("session bind", function()
         local ok, key, nonce = bind(h, 9)
         t.expect(ok).to.equal(true)
         t.expect(key).to.equal("role1/9")
-        t.expect(nonce).to.equal("nonce1")
+        t.expect(nonce).to.equal(fake_nonce(1))
         t.expect(h.entity.session.key).to.equal("role1/9")
         t.expect(h.entity.session.gate_service).to.equal(GATE)
         t.expect(h.entity.unload_timer).to.be_nil()
@@ -595,7 +601,8 @@ t.describe("session downstream counting", function()
             h.session.push(h.entity, "mail_notify", { id = i })
         end
         t.expect(h.entity.session_io.unresumable).to.equal(true)
-        t.expect(h.session.resume("role1", GATE, 10, h.entity, OWNER, "nonce1", 0)).to.equal(errcode.RESUME_UNAVAILABLE)
+        t.expect(h.session.resume("role1", GATE, 10, h.entity, OWNER, fake_nonce(1), 0)).to
+            .equal(errcode.RESUME_UNAVAILABLE)
     end)
 
     t.it("marks the session unresumable when the client acknowledges an impossible count", function()
@@ -693,7 +700,8 @@ t.describe("session resume", function()
 
     t.it("rejects an entity that never had a session", function()
         local h = harness()
-        t.expect(h.session.resume("role1", GATE, 20, h.entity, OWNER, "nonce1", 0)).to.equal(errcode.RESUME_UNAVAILABLE)
+        t.expect(h.session.resume("role1", GATE, 20, h.entity, OWNER, fake_nonce(1), 0)).to
+            .equal(errcode.RESUME_UNAVAILABLE)
     end)
 
     -- 隐式计数不自带校验，这是唯一一次对账的机会
@@ -729,5 +737,123 @@ t.describe("session resume", function()
         local reply = h.session.cmds.ping({ recv = 2 }, 9, { entity = h.entity })
         t.expect(reply).to.equal({ sent = 2 })
         t.expect(h.entity.session_io.acked).to.equal(2)
+    end)
+end)
+
+-- P14 的协议门禁：session_epoch 只在完整登录时生成，模式终身锁定，V2 下行按
+-- (session_epoch, seq) 去重，续接不换 epoch。旧 SDK 走 LEGACY，行为不变
+t.describe("session downlink v2", function()
+    local function bind_v2(h, fd, mode)
+        return h.session.bind("role1", GATE, fd or 9, h.entity, OWNER, mode or h.session.MODE_V2)
+    end
+
+    t.it("issues a 32 hex epoch and locks the negotiated mode", function()
+        local h = harness()
+        local ok, nonce, epoch, mode = bind_v2(h, 9)
+        t.expect(ok).to.equal(true)
+        t.expect(mode).to.equal(h.session.MODE_V2)
+        t.expect(#epoch).to.equal(32)
+        t.expect(epoch:match("^[0-9a-f]+$") ~= nil).to.equal(true)
+        t.expect(epoch).to_not.equal(nonce)
+        t.expect(h.entity.session_io.session_epoch).to.equal(epoch)
+    end)
+
+    t.it("rejects an unknown mode instead of silently falling back to legacy", function()
+        local h = harness()
+        t.expect(h.session.bind("role1", GATE, 9, h.entity, OWNER, 7)).to.equal(false)
+        t.expect(h.entity.session_io).to.be_nil()
+    end)
+
+    t.it("wraps every counted downlink in DownlinkV2 and stores the encoded bytes", function()
+        local h = harness()
+        local _, _, epoch = bind_v2(h, 9)
+        h.session.push(h.entity, "mail_notify", { id = 1 })
+        local pack = pushes(h)[1]
+        local decoded = assert(downlink.decode(pack))
+        t.expect(decoded.session_epoch).to.equal(epoch)
+        t.expect(decoded.seq).to.equal(1)
+        t.expect(decoded.payload).to.equal("PACK:mail_notify:1")
+        -- out_buf 存的是完整信封，迁移时可以原样重放，不需要重新包装
+        t.expect(h.entity.session_io.out_buf[1]).to.equal(pack)
+    end)
+
+    t.it("keeps transport handshakes outside the envelope", function()
+        local h = harness()
+        bind_v2(h, 9)
+        h.sender(h.session.key("role1", 9), "PINGPACK", "login.ping")
+        t.expect(pushes(h)[1]).to.equal("PINGPACK")
+        t.expect(h.entity.session_io.sent).to.equal(0)
+    end)
+
+    t.it("acks by (epoch, last_contiguous_seq) and trims only on a matching epoch", function()
+        local h = harness()
+        local _, _, epoch = bind_v2(h, 9)
+        h.session.push(h.entity, "a", {})
+        h.session.push(h.entity, "b", {})
+
+        local reply = h.session.cmds.ping({
+            session_epoch = string.rep("a", 32),
+            last_contiguous_seq = 2,
+        }, 9, { entity = h.entity })
+        t.expect(h.entity.session_io.acked).to.equal(0)
+        t.expect(reply.acked).to.equal(0)
+        t.expect(reply.session_epoch).to.equal(epoch)
+
+        reply = h.session.cmds.ping({ session_epoch = epoch, last_contiguous_seq = 2 }, 9, { entity = h.entity })
+        t.expect(reply.acked).to.equal(2)
+        t.expect(h.entity.session_io.out_buf[1]).to.be_nil()
+        t.expect(h.entity.session_io.out_bytes).to.equal(0)
+    end)
+
+    t.it("keeps the same epoch across resume and only rotates the credential", function()
+        local h = harness()
+        local _, nonce, epoch = bind_v2(h, 9)
+        local code, new_nonce, sent, resumed_epoch, mode = h.session.resume(
+            "role1",
+            GATE,
+            10,
+            h.entity,
+            OWNER,
+            nonce,
+            0,
+            { session_mode = h.session.MODE_V2, session_epoch = epoch }
+        )
+        t.expect(code).to.equal(errcode.OK)
+        t.expect(new_nonce).to_not.equal(nonce)
+        t.expect(sent).to.equal(0)
+        t.expect(resumed_epoch).to.equal(epoch)
+        t.expect(mode).to.equal(h.session.MODE_V2)
+    end)
+
+    t.it("refuses a resume with another mode or another epoch", function()
+        local h = harness()
+        local _, nonce = bind_v2(h, 9)
+        t.expect(h.session.resume("role1", GATE, 10, h.entity, OWNER, nonce, 0, {
+            session_mode = h.session.MODE_LEGACY,
+        })).to
+            .equal(errcode.RESUME_UNAVAILABLE)
+        t.expect(h.session.resume("role1", GATE, 10, h.entity, OWNER, nonce, 0, {
+            session_mode = h.session.MODE_V2,
+            session_epoch = string.rep("b", 32),
+        })).to
+            .equal(errcode.RESUME_UNAVAILABLE)
+    end)
+
+    t.it("does not cache a NO_CACHE response in L1", function()
+        local h = harness()
+        local _, key = bind(h, 9)
+        local ok = h.session.with_request(key, function()
+            return "REJECT_PACK", nil, nil, "no_cache"
+        end, 1, "role.buy")
+        t.expect(ok).to.equal(true)
+        t.expect(h.entity.session_io.resp_cache[1]).to.be_nil()
+
+        -- 同 req_id 再传必须重新执行，而不是回放上一次的瞬时拒绝
+        local ran = false
+        h.session.with_request(key, function()
+            ran = true
+            return "OK_PACK", nil, nil, "no_cache"
+        end, 1, "role.buy")
+        t.expect(ran).to.equal(true)
     end)
 end)

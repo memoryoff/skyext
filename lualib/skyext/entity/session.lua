@@ -13,11 +13,22 @@ local skynet = require "skynet"
 local cluster = require "skynet.cluster"
 local crypto = require "crypto"
 local config = require "skyext.config"
+local downlink = require "skyext.downlink"
 local errcode = require "skyext.errcode"
 local log = require "skyext.log"
 local timer = require "skyext.timer"
 
 local M = {}
+
+-- 会话协商后的下行模式，终身锁定，不混发。
+-- LEGACY：沿用隐式计数（客户端数收到的包，ping/resume 里对账）
+-- V2：每个计数内下行包套 DownlinkV2 信封，客户端按 (session_epoch, seq) 去重
+M.MODE_LEGACY = 0
+M.MODE_V2 = 1
+
+-- sproto_api 的 NO_CACHE 决定元数据。字符串常量必须与 skyext.sproto_api.NO_CACHE 一致；
+-- 这里不 require sproto_api，避免会话层在初始化前拉入协议加载器
+local NO_CACHE = "no_cache"
 
 -- 续接凭据长度。必须用 crypto.random_bytes：skynet.crypto.randomkey 是 random() 且只有
 -- 8 字节，当会话凭据不合格
@@ -80,14 +91,28 @@ end
 
 -- ---------------------------------------------------------------- 会话状态
 
-local function new_session_io()
+local function new_session_io(mode)
+    mode = mode or M.MODE_LEGACY
+    -- 先取 nonce 再取 epoch：两者都来自同一 CSPRNG，顺序不影响安全性；
+    -- 先 nonce 让 bind 的返回值在既有调用方眼里保持不变
+    local nonce = crypto.random_bytes(NONCE_BYTES)
+    local epoch, err = downlink.epoch_from_bytes(crypto.random_bytes(16))
+    if not epoch then
+        -- 没有可信随机数就没有会话身份。宁可让登录失败，也不能退化成可预测的 epoch
+        error("session epoch unavailable: " .. tostring(err))
+    end
     return {
-        nonce = crypto.random_bytes(NONCE_BYTES),
-        -- 下行计数。seq 不上线：TCP/WS 在一条连接内保证有序不丢不半包，两端各自数就行，
-        -- 只在 resume/ping 里对一次账。计数从 session_io 创建时的 0 开始，不随连接重置
+        -- 逻辑会话身份。完整登录/顶号创建新的 session_io 时换新；断线续接和计划内
+        -- Role 迁移都保持不变，否则客户端会把同一个会话当成两次登录
+        session_epoch = epoch,
+        session_mode = mode,
+        nonce = nonce,
+        -- 下行计数。LEGACY 下 seq 不上线，两端各数各的，只在 resume/ping 对账；
+        -- V2 下 seq 写进 DownlinkV2 信封，客户端按 (session_epoch, seq) 去重。
+        -- 计数从 session_io 创建时的 0 开始，不随连接重置
         sent = 0,
         acked = 0,
-        out_buf = {}, -- seq -> 已编码的包，覆盖 (acked, sent]
+        out_buf = {}, -- seq -> 已编码的包（V2 下是完整 DownlinkV2），覆盖 (acked, sent]
         out_bytes = 0,
         -- 上行幂等。键是客户端的 request id（sproto 包头的 session 字段），
         -- 值是 { pack = 已编码的响应, name = 协议名 }
@@ -148,6 +173,17 @@ local function record_and_send(entity, pack)
         return false
     end
     io_.sent = io_.sent + 1
+    if io_.session_mode == M.MODE_V2 then
+        -- out_buf 里存的是完整的 DownlinkV2 原始字节：迁移时原样重放，不再 decode→换 epoch→
+        -- re-encode。seq 就是 io_.sent，不另设计数器
+        local wrapped, err = downlink.encode(io_.session_epoch, io_.sent, pack)
+        if not wrapped then
+            io_.sent = io_.sent - 1
+            log.error("downlink encode failed", "type", entity.type_name, "id", entity.id, "err", err)
+            return false
+        end
+        pack = wrapped
+    end
     io_.out_buf[io_.sent] = pack
     io_.out_bytes = io_.out_bytes + #pack
     if io_.out_bytes > conf_number("session_replay_bytes", 32 * 1024) then
@@ -202,33 +238,63 @@ local function install_conn(gate_node, gate_service, fd, entity)
 end
 
 -- 完整登录：把会话绑到实体上，并让网关把之后的包转给 owner_service（本服务的名字）。
--- 网关那边连接已经断开时返回 false，否则返回 true 和下发给客户端的续接凭据。
+-- 网关那边连接已经断开时返回 false，否则返回 true、续接凭据、session_epoch 和模式。
 --
 -- **无条件重建 session_io**。实体是长寿的，顶号和同账号重登走的是同一个实体对象，
 -- 沿用旧的 session_io 会让后来者继承前一个客户端的 nonce（能冒充续接）、下行计数
 -- （重放错位）和响应缓存（读到别人的回包）。
-function M.bind(gate_node, gate_service, fd, entity, owner_service)
+--
+-- session_mode 在完整登录时协商并终身锁定：只接受 0（LEGACY）/1（V2），
+-- 其它值 fail-closed，不能悄悄退回 LEGACY 让客户端以为自己在 V2
+function M.bind(gate_node, gate_service, fd, entity, owner_service, session_mode)
+    if session_mode ~= nil and session_mode ~= M.MODE_LEGACY and session_mode ~= M.MODE_V2 then
+        log.warn("reject unknown session mode", "mode", tostring(session_mode))
+        return false
+    end
     if not gate_call(gate_node, gate_service, "bind", fd, self_node(), owner_service) then
         return false
     end
     local conn = install_conn(gate_node, gate_service, fd, entity)
-    entity.session_io = new_session_io()
+    entity.session_io = new_session_io(session_mode)
     log.info("session bind", "type", entity.type_name, "id", entity.id, "session", conn.key)
-    return true, entity.session_io.nonce
+    return true, entity.session_io.nonce, entity.session_io.session_epoch, entity.session_io.session_mode
 end
 
 -- 续接：把会话热替换到一条新连接上。只作用于已经在内存里的实体，不查库、不抢锁。
--- 返回 errcode, 轮换后的新凭据, 服务端已发出的包数。
+-- 返回 errcode, 轮换后的新凭据, 服务端已发出的包数, session_epoch, session_mode。
+--
+-- opts（可选）是客户端声明的 { session_mode, session_epoch }：两者都必须与现有会话一致。
+-- 客户端拿旧 epoch 续接到另一个逻辑会话时必须失败，否则会把两次登录的包混在一起。
+-- 缺省（旧 SDK）按 LEGACY 处理，不校验 epoch。
 --
 -- 失败一律让客户端退化成完整登录，所以不区分"凭据错"和"状态没了"之外的细节。
-function M.resume(gate_node, gate_service, fd, entity, owner_service, nonce, recv)
+function M.resume(gate_node, gate_service, fd, entity, owner_service, nonce, recv, opts)
     local io_ = entity.session_io
     if not io_ or io_.unresumable then
         return errcode.RESUME_UNAVAILABLE
     end
-    -- 恒定时间比对，且只认当前这一枚：每次 bind / resume 都轮换，用过的立即失效
+    -- 恒定时间比对，且只认当前这一枚：每次 bind / resume 都轮换，用过的立即失效。
+    -- 先验 nonce 再看 mode/epoch：未认证的调用方不该能探测会话的协商结果
     if type(nonce) ~= "string" or not crypto.const_equals(nonce, io_.nonce) then
         return errcode.AUTH_FAILED
+    end
+    if opts then
+        if opts.session_mode ~= nil and opts.session_mode ~= io_.session_mode then
+            log.warn(
+                "resume mode mismatch",
+                "id",
+                entity.id,
+                "mode",
+                tostring(opts.session_mode),
+                "session_mode",
+                io_.session_mode
+            )
+            return errcode.RESUME_UNAVAILABLE
+        end
+        if opts.session_epoch ~= nil and opts.session_epoch ~= "" and opts.session_epoch ~= io_.session_epoch then
+            log.warn("resume epoch mismatch", "id", entity.id)
+            return errcode.RESUME_UNAVAILABLE
+        end
     end
     -- 隐式计数不自带校验，在这条低频路径上补一次：客户端报的收包数必须落在 [acked, sent]
     recv = recv or 0
@@ -257,7 +323,7 @@ function M.resume(gate_node, gate_service, fd, entity, owner_service, nonce, rec
     io_.nonce = crypto.random_bytes(NONCE_BYTES)
     io_.last_seen = skynet.now()
     log.info("session resume", "type", entity.type_name, "id", entity.id, "session", conn.key, "recv", recv)
-    return errcode.OK, io_.nonce, io_.sent
+    return errcode.OK, io_.nonce, io_.sent, io_.session_epoch, io_.session_mode
 end
 
 -- 重放客户端还没收到的下行包，然后解除 replaying。
@@ -310,6 +376,52 @@ function M.ack(entity, recv)
         end
     end
     io_.acked = recv
+end
+
+-- V2 的 ClientAckV2：带 session_epoch 的连续确认。
+-- epoch 不匹配时**绝不推进 acked**——旧逻辑会话的 ACK 落到新会话上会裁掉尚未送达的包。
+-- 返回是否接受了这次 ACK，调用方（ping）据此回显 acked，客户端发现 epoch 对不上就会重登。
+function M.ack_v2(entity, session_epoch, last_contiguous_seq)
+    local io_ = entity.session_io
+    if not io_ or io_.session_mode ~= M.MODE_V2 then
+        return false
+    end
+    if session_epoch ~= io_.session_epoch then
+        log.warn("ack epoch mismatch", "id", entity.id)
+        return false
+    end
+    -- sproto 的 integer 正常是 Lua integer；这里仍做一次无损归一，避免绑定层
+    -- 把整数解成整数值浮点时整条 ACK 被静默忽略
+    if math.type(last_contiguous_seq) ~= "integer" then
+        last_contiguous_seq = math.tointeger(last_contiguous_seq)
+        if not last_contiguous_seq then
+            return false
+        end
+    end
+    if last_contiguous_seq < io_.acked or last_contiguous_seq > io_.sent then
+        log.warn(
+            "ack v2 out of range",
+            "id",
+            entity.id,
+            "seq",
+            last_contiguous_seq,
+            "acked",
+            io_.acked,
+            "sent",
+            io_.sent
+        )
+        io_.unresumable = true
+        return false
+    end
+    for seq = io_.acked + 1, last_contiguous_seq do
+        local pack = io_.out_buf[seq]
+        if pack then
+            io_.out_bytes = io_.out_bytes - #pack
+            io_.out_buf[seq] = nil
+        end
+    end
+    io_.acked = last_contiguous_seq
+    return true
 end
 
 function M.unbind(key)
@@ -446,7 +558,10 @@ function M.with_request(key, f, req_id, request_name)
     if result == nil then
         return false, "client binding revoked"
     end
-    if io_ and req_id and type(result[1]) == "string" then
+    -- result[4] 是 sproto_api 的内部缓存处置（CACHEABLE/NO_CACHE）。纯读预检拒绝、
+    -- 环境 UNKNOWN 这类瞬时结果不能写 L1，否则客户端重传时会被旧拒绝钉死。
+    -- 旧 handler 不返回决定值时是 nil，维持原来的缓存规则
+    if io_ and req_id and type(result[1]) == "string" and result[4] ~= NO_CACHE then
         cache_response(io_, req_id, result[1], request_name)
     end
     return true, table.unpack(result, 1, result.n)
@@ -474,8 +589,20 @@ M.cmds = {}
 
 function M.cmds.ping(request, _, obj)
     local entity = obj.entity
-    M.ack(entity, request.recv)
     local io_ = entity.session_io
+    if io_ and io_.session_mode == M.MODE_V2 then
+        -- V2 的 ACK 走 ping 的扩展字段，而不是另开协议：ping 本来就在计数边界之外，
+        -- 心跳频率足够承载连续确认，也避免多一条需要协商的通道
+        if request.session_epoch == io_.session_epoch and request.last_contiguous_seq ~= nil then
+            M.ack_v2(entity, request.session_epoch, request.last_contiguous_seq)
+        end
+        return {
+            sent = io_.sent,
+            acked = io_.acked,
+            session_epoch = io_.session_epoch,
+        }
+    end
+    M.ack(entity, request.recv)
     return { sent = io_ and io_.sent or 0 }
 end
 

@@ -334,3 +334,64 @@ t.describe("sproto_api failing handlers", function()
         t.expect(response.errcode).to.equal(errcode.ENTITY_LOAD_FAILED)
     end)
 end)
+
+-- P03/P08 的缓存处置合同：NO_CACHE 只走内部返回值，不能占 reason/code。
+-- 否则一个没有 response 的单向协议会被 raw_dispatch 误判成"拒绝请求"并踢线
+t.describe("sproto_api critical decision", function()
+    t.it("encodes only decision.response and forwards cache_policy separately", function()
+        local seen_policy
+        local h = harness({
+            with_request = function(_, f)
+                local result = table.pack(f())
+                seen_policy = result[4]
+                return true, table.unpack(result, 1, result.n)
+            end,
+        })
+        h.handlers["role.login_info"] = function()
+            return h.api.decision({ name = "alice" }, h.api.NO_CACHE)
+        end
+        local response = h:request("role.login_info", { rid = 7 }, 21)
+        t.expect(response.name).to.equal("alice")
+        t.expect(seen_policy).to.equal(h.api.NO_CACHE)
+        t.expect(h.disconnects).to.equal({})
+    end)
+
+    t.it("does not disconnect a one-way NO_CACHE protocol that has no response", function()
+        local h = harness()
+        h.handlers["role.note"] = function()
+            return h.api.decision(nil, h.api.NO_CACHE)
+        end
+        t.expect(h:request("role.note", { text = "x" }, 22)).to.be_nil()
+        t.expect(#h.disconnects).to.equal(0)
+        t.expect(#h.written).to.equal(0)
+    end)
+
+    t.it("keeps the legacy caching rule when no decision is returned", function()
+        local seen_policy
+        local h = harness({
+            with_request = function(_, f)
+                local result = table.pack(f())
+                seen_policy = result[4]
+                return true, table.unpack(result, 1, result.n)
+            end,
+        })
+        local response = h:request("role.login_info", { rid = 7 }, 23)
+        t.expect(response.name).to.equal("ok")
+        t.expect(seen_policy).to.be_nil()
+    end)
+
+    t.it("rejects a decision without a response on a protocol that has one", function()
+        local h = harness()
+        h.handlers["role.login_info"] = function()
+            return h.api.decision(nil, h.api.NO_CACHE)
+        end
+        local response = h:request("role.login_info", { rid = 7 }, 24)
+        t.expect(response.errcode).to.equal(errcode.ENTITY_LOAD_FAILED)
+    end)
+
+    t.it("does not mistake a plain table for a decision", function()
+        local h = harness()
+        t.expect(h.api.is_decision({ name = "ok" })).to.equal(false)
+        t.expect(h.api.is_decision(h.api.decision({ name = "ok" }))).to.equal(true)
+    end)
+end)

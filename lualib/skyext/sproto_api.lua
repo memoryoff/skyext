@@ -15,6 +15,29 @@ M.errcode_rejected = errcode.ENTITY_NOT_FOUND
 M.errcode_internal = errcode.ENTITY_LOAD_FAILED
 -- response 里用于承载错误码的字段名，按顺序取第一个协议里存在的
 M.reject_fields = { "errcode", "code" }
+
+-- 内部缓存处置。只走 dispatch 内部返回值，不改变 wire 包：
+--   CACHEABLE  正常业务响应，可进 L1 resp_cache（旧 handler 的默认行为）
+--   NO_CACHE   纯读预检拒绝、环境 UNKNOWN 等瞬时结果，任何返回包都不写 resp_cache
+M.CACHEABLE = "cacheable"
+M.NO_CACHE = "no_cache"
+
+-- CriticalDecision 的私有哨兵。业务 handler 返回普通 table 时不可能撞上这个 metatable，
+-- 因此不会与真正的响应表混淆；也不导出给 sproto/RPC，客户端无法伪造
+local DECISION_MT = {}
+
+function M.decision(response, cache_policy)
+    cache_policy = cache_policy or M.CACHEABLE
+    if cache_policy ~= M.CACHEABLE and cache_policy ~= M.NO_CACHE then
+        error("invalid cache_policy: " .. tostring(cache_policy), 2)
+    end
+    return setmetatable({ response = response, cache_policy = cache_policy }, DECISION_MT)
+end
+
+function M.is_decision(value)
+    return type(value) == "table" and getmetatable(value) == DECISION_MT
+end
+
 local g_sproto_loader_service
 local g_schema
 local g_sproto_info
@@ -27,6 +50,7 @@ local WITH_REQUEST_CB = {}
 local MIDDLEWARE_CBS = {}
 local REJECT_CLIENT_CB = {}
 local g_reject_field = {}
+local g_has_response = {}
 
 local function register_request_func(request_name, func)
     if REQUEST_CMD[request_name] then
@@ -80,6 +104,19 @@ local function response_errcode_field(request_name)
     end
     g_reject_field[request_name] = field
     return field or nil
+end
+
+-- 协议是否声明了 response。注意 sproto 的 dispatch 即使没有 response 也会给一个
+-- gen_response 闭包（只编码包头），所以不能用 response_cb ~= nil 判断
+local function request_has_response(request_name)
+    local cached = g_has_response[request_name]
+    if cached ~= nil then
+        return cached
+    end
+    local ok, defaults = pcall(g_schema.default, g_schema, request_name, "RESPONSE")
+    local has = ok and type(defaults) == "table"
+    g_has_response[request_name] = has
+    return has
 end
 
 local function disconnect_client(fd, request_name, reason)
@@ -155,13 +192,29 @@ local function dispatch_request_unlocked(fd, request_name, request, response_cb)
     end
 
     local r = f(request, fd, obj)
+    local cache_policy
+    if M.is_decision(r) then
+        cache_policy = r.cache_policy
+        r = r.response
+        if r == nil then
+            if request_has_response(request_name) then
+                -- 有 response 的协议却拿不到响应表，是 handler 的编程错误；不能编码一个
+                -- 空包让客户端看起来像成功
+                return nil, "critical decision produced no response", M.errcode_internal, cache_policy
+            end
+            -- 单向协议：不写任何包。raw_dispatch 看到 (nil, nil) 不会走拒绝路径
+            return nil, nil, nil, cache_policy
+        end
+    end
     if response_cb == nil then
         if r ~= nil then
             log.error("request function should not return a value", "request_name", request_name, "fd", fd)
         end
-        return
+        return nil, nil, nil, cache_policy
     end
-    return response_cb(r)
+    -- cache_policy 走独立的第 4 个返回值，绝不能占用 reason/code：raw_dispatch 把
+    -- (nil, reason) 当成拒绝请求，NO_CACHE 的单向协议会被误判成拒绝并可能踢线
+    return response_cb(r), nil, nil, cache_policy
 end
 
 -- 返回 pack 或者 nil, reason, code
@@ -170,12 +223,12 @@ local function dispatch_request(fd, request_name, request, response_cb, req_id)
     if not with_request then
         return dispatch_request_unlocked(fd, request_name, request, response_cb)
     end
-    local ok, a, b, c = with_request(fd, function()
+    local ok, a, b, c, cache_policy = with_request(fd, function()
         return dispatch_request_unlocked(fd, request_name, request, response_cb)
     end, req_id, request_name)
     if ok == true then
-        -- f 已执行：a, b, c 就是它的 pack, reason, code
-        return a, b, c
+        -- f 已执行：a, b, c 就是它的 pack, reason, code；cache_policy 只用于 L1 决策
+        return a, b, c, cache_policy
     end
     if ok ~= false then
         -- 兼容只返回单个回包的旧版连接模块
@@ -225,8 +278,11 @@ function M.raw_dispatch(fd, type, request_name, request, response_cb, req_id)
             log.error("dispatch request error", "request_name", request_name, "result", result)
             result, reason, code = nil, "internal error", M.errcode_internal
         end
-        -- 没有产出回包时，只要客户端在等 session 就必须回错误码或断开连接
-        if result == nil and (response_cb ~= nil or reason ~= nil) then
+        -- 没有产出回包时，只要客户端在等 session 就必须回错误码或断开连接。
+        -- 注意 sproto 对没有 response 的协议也会给一个只编码包头的闭包，
+        -- 所以"客户端在等"必须看协议是否声明了 response，而不是 response_cb ~= nil：
+        -- NO_CACHE 的单向协议返回 (nil, nil) 是正常终态，不能走拒绝路径
+        if result == nil and (reason ~= nil or (response_cb ~= nil and request_has_response(request_name))) then
             result = reject_request(
                 fd,
                 request_name,
@@ -314,6 +370,7 @@ end
 local function reload_sproto()
     g_schema, g_sproto_info = get_sproto_schema()
     g_reject_field = {}
+    g_has_response = {}
     g_host = sproto_host.new(g_schema, "base.package")
     g_send_request = g_host:attach()
 end

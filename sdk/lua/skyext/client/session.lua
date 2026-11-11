@@ -7,10 +7,13 @@
 --   1. 每个请求带一个自增的 request id，续接之后**用原 id 重发**在途请求。
 --      换 id 服务端就认不出来，扣费、抽卡会执行第二遍。计数器只增不减，重连路径上
 --      绝不清零：续接不重建服务端会话，重置后的小 id 会命中另一个请求的缓存响应。
---   2. 数**收到的**下行包，不是数**认得的**。序号不在包里传（TCP/WS 在一条连接内有序不丢），
---      两端各数各的，只在 resume / ping 时对账。认不出 request id 的响应（续接后的重复回包）
---      照样要计数再丢。漏数一个，重放就错位，而且**不会报错**。
---   3. 传输层握手的回包不计数：login / resume / ping 的响应。
+--   2. 数**收到的**下行包，不是数**认得的**。LEGACY 模式序号不在包里传（TCP/WS 在一条
+--      连接内有序不丢），两端各数各的，只在 resume / ping 时对账。V2 模式每个计数内下行
+--      都套 DownlinkV2 信封，客户端按 (session_epoch, seq) 去重后推进同一个 recv。
+--      认不出 request id 的响应（续接后的重复回包）照样要计数再丢。漏数一个，重放就错位，
+--      而且**不会报错**。
+--   3. 传输层握手的回包不计数：login / resume / ping 的响应。V2 下它们也不套信封，
+--      是客户端在拿到 epoch 之前唯一的对账锚点。
 --   4. 自己发现断线：切网络时旧连接不产生 FIN/RST，它直接变黑洞。靠 ping 的**响应**判活。
 --   5. resume 的响应和重放的包之间**没有顺序保证**（响应来自登录服务，重放来自实体进程，
 --      跨节点时走两条 TCP 连接）。响应靠 request id 认领，又不计数，早到晚到都不影响。
@@ -19,10 +22,15 @@ local socket = require "skynet.socket"
 local netpack = require "skynet.netpack"
 local websocket = require "http.websocket"
 local sproto_api = require "skyext.sproto_api"
+local downlink = require "skyext.downlink"
 local errcode = require "skyext.errcode"
 local log = require "skyext.log"
 
 local M = {}
+
+-- 下行模式，必须与服务端 skyext.entity.session 一致
+M.MODE_LEGACY = 0
+M.MODE_V2 = 1
 
 -- 处在下行计数边界之外的回包，必须和服务端 skyext.entity.session 里的那份一致
 local UNCOUNTED_RESPONSE = {
@@ -132,8 +140,11 @@ Session.__index = Session
 --   login_param   function() -> login.login 的请求表（token 可能过期，所以是函数）
 --   on_push       function(name, msg) 服务端主动推送
 --   on_state      function(state) "online" / "offline" / "relogin"
+--   session_mode  0=LEGACY（默认，隐式计数）/1=V2（DownlinkV2 信封 + epoch ACK）
 function M.new(conf)
     local transport = assert(TRANSPORTS[conf.transport or "tcp"], "unknown transport")
+    local session_mode = conf.session_mode or M.MODE_LEGACY
+    assert(session_mode == M.MODE_LEGACY or session_mode == M.MODE_V2, "session_mode must be 0 (legacy) or 1 (v2)")
     return setmetatable({
         conf = conf,
         transport = transport,
@@ -147,7 +158,11 @@ function M.new(conf)
         closed = false,
         rid = nil,
         nonce = nil,
-        recv = 0, -- 已收到的计数内下行包数，必须和服务端的 sent 严格相等
+        -- V2：逻辑会话身份与已连续收到的最高 seq。LEGACY 下 recv 仍是收到的包数
+        session_mode = session_mode,
+        session_epoch = nil,
+        v2_gaps = {},
+        recv = 0,
         -- 只在这里置 0。重连、续接、完整重登都不重置，见义务 1
         next_req_id = 0,
         pending = {}, -- request id -> { name, param, co, response, answered }
@@ -212,19 +227,24 @@ local function answer(p, response)
     end
 end
 
-function Session:handle(bytes)
+-- counted=false 表示这个包已经由 V2 的 seq 计过数，这里只解析不再加计数
+function Session:handle_pack(bytes, counted)
     local host = packer()
     local ok, msg_type, a, b = pcall(host.dispatch, host, bytes)
     if not ok then
         -- 解不开码的包也要计数：服务端发出时计了数，这里漏数一个，recv 就
         -- 永久落后 sent 一位，ping 对账必然错位（义务 2）
-        self.recv = self.recv + 1
+        if counted then
+            self.recv = self.recv + 1
+        end
         log.error("client dispatch failed", "err", msg_type)
         return
     end
     if msg_type == "REQUEST" then
         -- 服务端推送，计数内
-        self.recv = self.recv + 1
+        if counted then
+            self.recv = self.recv + 1
+        end
         if self.conf.on_push then
             self.conf.on_push(a, b)
         end
@@ -239,15 +259,78 @@ function Session:handle(bytes)
         -- 一个，recv 就永久落后 sent 一位，而且不报错。
         -- 丢掉的这份一定是计数内的：握手类请求的 pending 条目在 resend_pending /
         -- fail_pending 里已经显式清过，而它们的响应从不进重放缓冲，不可能被重放
-        self.recv = self.recv + 1
+        if counted then
+            self.recv = self.recv + 1
+        end
         log.info("client dropped a duplicate response", "req_id", req_id, "recv", self.recv)
         return
     end
     self.pending[req_id] = nil
-    if not UNCOUNTED_RESPONSE[p.name] then
+    if counted and not UNCOUNTED_RESPONSE[p.name] then
         self.recv = self.recv + 1
     end
     answer(p, response)
+end
+
+-- 交付一个连续 seq。先推进 recv 再解析业务包：解析抛错也说明这个 seq 已经到过，
+-- 不能再让它挡住后面的包
+function Session:deliver_v2(seq, payload)
+    self.recv = seq
+    self:handle_pack(payload, false)
+end
+
+-- V2 下行：按 (session_epoch, seq) 去重。TCP 内有序，但重放与新包可能交错，
+-- 出现缺口时先缓存，等前面的 seq 补齐再连续交付
+function Session:handle_v2(decoded)
+    if self.session_epoch and decoded.session_epoch ~= self.session_epoch then
+        -- 另一个逻辑会话的包，绝不能混进当前会话。断开重来比静默错位安全
+        log.error("downlink from another session epoch", "client", self.session_epoch, "server", decoded.session_epoch)
+        self.nonce = nil
+        self.session_epoch = nil
+        self:drop(self.conn)
+        return
+    end
+    if not self.session_epoch then
+        -- 客户端也可能先从 DownlinkV2 信封学到 epoch（绑定后立即推送时）
+        self.session_epoch = decoded.session_epoch
+    end
+    if decoded.seq <= self.recv then
+        -- 重复包：业务只交付一次，但不用报错
+        return
+    end
+    if decoded.seq > self.recv + 1 then
+        if decoded.seq - self.recv > 256 then
+            log.error("downlink gap too large", "recv", self.recv, "seq", decoded.seq)
+            self.nonce = nil
+            self:drop(self.conn)
+            return
+        end
+        self.v2_gaps[decoded.seq] = decoded.payload
+        return
+    end
+
+    self:deliver_v2(decoded.seq, decoded.payload)
+    local next_seq = self.recv + 1
+    while self.v2_gaps[next_seq] do
+        local payload = self.v2_gaps[next_seq]
+        self.v2_gaps[next_seq] = nil
+        self:deliver_v2(next_seq, payload)
+        next_seq = next_seq + 1
+    end
+end
+
+function Session:handle(bytes)
+    if self.session_mode == M.MODE_V2 then
+        local decoded = downlink.decode(bytes)
+        if decoded then
+            self:handle_v2(decoded)
+            return
+        end
+        -- 传输层握手（login/resume/ping）的响应不套信封，也不计数
+        self:handle_pack(bytes, false)
+        return
+    end
+    self:handle_pack(bytes, true)
 end
 
 -- 连接断了（读失败或主动丢弃）。只处理当前这条，迟到的断开通知不能影响新连接
@@ -288,11 +371,23 @@ function Session:try_resume()
     if not self.nonce or not self.rid then
         return false
     end
-    local resp =
-        self:request("login.resume", { rid = self.rid, nonce = self.nonce, recv = self.recv }, self.handshake_timeout)
+    local param = { rid = self.rid, nonce = self.nonce, recv = self.recv }
+    if self.session_mode == M.MODE_V2 then
+        param.session_mode = M.MODE_V2
+        param.session_epoch = self.session_epoch or ""
+    end
+    local resp = self:request("login.resume", param, self.handshake_timeout)
     if not resp or resp.code ~= errcode.OK then
         log.info("resume rejected, falling back to login", "code", resp and resp.code)
         return false
+    end
+    if self.session_mode == M.MODE_V2 then
+        -- 续接不换 epoch。服务端回了别的 epoch 说明这是另一个逻辑会话，不能接
+        if resp.session_mode ~= M.MODE_V2 or (self.session_epoch and resp.session_epoch ~= self.session_epoch) then
+            log.error("resume answered with another session identity")
+            return false
+        end
+        self.session_epoch = resp.session_epoch
     end
     self.nonce = resp.nonce
     self.online = true
@@ -309,15 +404,33 @@ function Session:do_login()
     if not param then
         return false
     end
+    -- 完整登录是新的逻辑会话：先清掉旧的 epoch/计数，再发请求。
+    -- 登录响应不套信封、不计数；V2 的第一个计数内下行从 seq=1 开始
+    self.recv = 0
+    self.v2_gaps = {}
+    if self.session_mode == M.MODE_V2 then
+        param.session_mode = M.MODE_V2
+    end
     local resp = self:request("login.login", param, self.handshake_timeout)
     if not resp or resp.code ~= errcode.OK then
         log.warn("login failed", "code", resp and resp.code)
         return false
     end
-    -- 全新的会话：计数清零，旧的在途请求在服务端已经不存在了
+    local negotiated = resp.session_mode or M.MODE_LEGACY
+    -- 请求 V2 却被服务端降级：不能静默接受，否则客户端会按信封解析旧格式下行
+    if self.session_mode == M.MODE_V2 and negotiated ~= M.MODE_V2 then
+        log.error("server did not accept the v2 session mode")
+        return false
+    end
+    self.session_mode = negotiated
+    if self.session_mode == M.MODE_V2 and not resp.session_epoch then
+        log.error("login response is missing session_epoch")
+        return false
+    end
+    self.session_epoch = resp.session_epoch
+    -- 全新的会话：旧的在途请求在服务端已经不存在了
     self.rid = resp.rid
     self.nonce = resp.nonce
-    self.recv = 0
     self.online = true
     self:fail_pending()
     self:notify_state("online")
@@ -381,12 +494,28 @@ function Session:heartbeat()
         skynet.sleep(self.ping_interval * 100)
         if self.online then
             local conn = self.conn
-            local resp = self:request("login.ping", { recv = self.recv }, self.ping_interval)
+            local param
+            if self.session_mode == M.MODE_V2 then
+                param = { session_epoch = self.session_epoch or "", last_contiguous_seq = self.recv }
+            else
+                param = { recv = self.recv }
+            end
+            local resp = self:request("login.ping", param, self.ping_interval)
             if resp then
                 misses = 0
-                -- 隐式计数唯一的对账点。对不上说明两端已经错位，继续跑下去只会把
-                -- 错位的数据当正常数据用，不如立刻断开重来
-                if resp.sent ~= self.recv then
+                -- 对账点。对不上说明两端已经错位，继续跑下去只会把错位的数据当正常数据用
+                if self.session_mode == M.MODE_V2 then
+                    if resp.session_epoch ~= self.session_epoch then
+                        log.error("ping answered by another session epoch")
+                        self.nonce = nil
+                        self.session_epoch = nil
+                        self:drop(conn)
+                    elseif resp.sent ~= self.recv then
+                        log.error("downstream count desync", "client", self.recv, "server", resp.sent)
+                        self.nonce = nil
+                        self:drop(conn)
+                    end
+                elseif resp.sent ~= self.recv then
                     log.error("downstream count desync", "client", self.recv, "server", resp.sent)
                     self.nonce = nil
                     self:drop(conn)

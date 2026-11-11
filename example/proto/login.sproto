@@ -1,42 +1,63 @@
 # 角色登录。校验 JWT、查库，成功后把会话绑到角色实体上。
+#
+# session_mode 是客户端请求的下行模式：0=LEGACY（隐式计数），1=V2（DownlinkV2 信封）。
+# 会话创建后终身锁定，不能中途切换；服务端只接受 0/1，其它值按参数错误拒绝。
+# session_epoch 是逻辑会话身份（32 位小写 hex），只在完整登录/顶号时换新，
+# 断线续接与计划内 Role 迁移都保持不变。客户端按 (session_epoch, seq) 去重。
 login 100 {
     request {
         token 0 : string # jwt token {account}
         rid 1 : integer # role id 直接登录角色
         proto_checksum 2 : string # 协议文件 checksum
         server 3 : string # 区服ID
+        session_mode 4 : integer # 0=LEGACY, 1=V2；缺省/0 为旧客户端
     }
     response {
         code 0 : integer
         rid 1 : integer
         nonce 2 : binary # 续接凭据（16 字节原始随机字节），断线后拿它走 resume
+        session_mode 3 : integer # 协商结果，会话终身有效
+        session_epoch 4 : string # 32 位小写 hex；客户端必须原样保存
     }
 }
 
 # 会话续接。不验 token、不查库，也不会把实体从库里加载起来——
 # 只能续上还在内存里的实体。失败时客户端退化成走 login。
+# 客户端带上自己的 session_mode/session_epoch 做一致性校验：拿旧 epoch 续到另一个
+# 逻辑会话必须失败，不能把两次登录的包混在一起。旧客户端不填，服务端按 LEGACY 处理。
 resume 101 {
     request {
         rid 0 : integer # 仅用于路由
         nonce 1 : binary # 16 字节续接凭据（原始随机字节）
-        recv 2 : integer # 客户端已收到的包数（Tier 2）
+        recv 2 : integer # 客户端已收到的包数（LEGACY 模式使用）
+        session_mode 3 : integer # 客户端当前模式，缺省 0
+        session_epoch 4 : string # 客户端持有的 epoch，空串表示旧客户端不校验
     }
     response {
         code 0 : integer
         nonce 1 : binary # 轮换后的新凭据（原始随机字节）
-        sent 2 : integer # 服务端已发出的包数，供客户端自检（Tier 2）
+        sent 2 : integer # 服务端已发出的包数，供客户端自检
+        session_mode 3 : integer # 与请求一致，否则续接失败
+        session_epoch 4 : string # 逻辑会话身份，续接不换
     }
 }
 
 # 心跳。客户端每 15s 或未确认积压超过 64 包时发一次。
 # 必须是请求/响应而不是单向：单向心跳只让服务端知道客户端活着，
 # 客户端自己无从判断连接是不是已经黑洞了（WiFi 换 4G 不产生 FIN/RST）。
-# recv/sent 只有 Tier 2 才有意义，没做 Tier 2 时客户端填 0、服务端忽略。
+#
+# V2 模式复用 ping 承载 ClientAckV2：session_epoch + last_contiguous_seq。
+# ping 的响应本身不计数、不套 DownlinkV2，是客户端拿到 epoch 之前唯一的对账锚点。
+# LEGACY 模式只看 recv，忽略 V2 字段。
 ping 102 {
     request {
-        recv 0 : integer # 客户端已收到的包数
+        recv 0 : integer # LEGACY：客户端已收到的包数
+        session_epoch 1 : string # V2：客户端当前会话 epoch
+        last_contiguous_seq 2 : integer # V2：已连续收到的最高 seq
     }
     response {
         sent 0 : integer # 服务端已发出的包数
+        acked 1 : integer # V2：服务端已确认的连续 seq；epoch 不匹配时不推进
+        session_epoch 2 : string # V2：回显，客户端据此发现串会话
     }
 }

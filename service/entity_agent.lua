@@ -207,8 +207,8 @@ end
 
 -- 把网关上的一个会话绑到实体上（玩家登录）。由登录服务经 router.bind_session 调用。
 -- 实体还被别的节点持有着时向它要一次（重新登录的语义：对方卸载并踢掉旧连接）。
--- 返回错误码和下发给客户端的续接凭据
-function CMD.bind_session(entity_id, gate_node, gate_service, fd)
+-- 返回错误码、续接凭据、session_epoch 和协商后的下行模式
+function CMD.bind_session(entity_id, gate_node, gate_service, fd, session_mode)
     local ok, reason, holder_node = entitymgr:try_ensure_loaded(entity_id)
     if not ok then
         if reason == "not found" then
@@ -223,12 +223,13 @@ function CMD.bind_session(entity_id, gate_node, gate_service, fd)
     end
 
     local key = session.key(gate_node, fd)
-    local bound, result, nonce = entitymgr:with_entity(entity_id, function(entity)
+    local bound, result, nonce, epoch, mode = entitymgr:with_entity(entity_id, function(entity)
         local old = entity.session
         if old and old.key ~= key then
             session.unbind_kick(old.key, entity)
         end
-        local ok_bind, new_nonce = session.bind(gate_node, gate_service, fd, entity, self_service_name())
+        local ok_bind, new_nonce, new_epoch, new_mode =
+            session.bind(gate_node, gate_service, fd, entity, self_service_name(), session_mode)
         if not ok_bind then
             -- 排队期间客户端已经断开
             return errcode.SESSION_CLOSED
@@ -236,26 +237,29 @@ function CMD.bind_session(entity_id, gate_node, gate_service, fd)
         if handler.on_bind_client then
             handler.on_bind_client(entity, key)
         end
-        return errcode.OK, new_nonce
+        return errcode.OK, new_nonce, new_epoch, new_mode
     end)
     if not bound then
         log.error("bind_session failed", "type", type_name, "id", entity_id, "err", result)
         return errcode.LOCK_FAILED
     end
-    return result, nonce
+    return result, nonce, epoch, mode
 end
 
 -- 断线后把一条新连接接回原来的会话。和 bind_session 的区别是**绝不加载实体**：
 -- 续接不验 token、不查库，能触发加载就等于开放一个无认证的接口。实体不在内存里意味着
 -- 会话状态早已不存在，续接本来也必然失败，这不是额外限制。
--- 返回错误码、轮换后的新凭据、服务端已发出的包数
-function CMD.resume_session(entity_id, gate_node, gate_service, fd, nonce, recv)
+-- 返回错误码、轮换后的新凭据、服务端已发出的包数、session_epoch、模式
+function CMD.resume_session(entity_id, gate_node, gate_service, fd, nonce, recv, session_mode, session_epoch)
     if not session then
         -- 这类实体根本没启用会话层，不是"实体不存在"
         return errcode.RESUME_UNAVAILABLE
     end
-    local ok, code, new_nonce, sent = entitymgr:with_loaded_entity(entity_id, function(entity)
-        local c, n, s = session.resume(gate_node, gate_service, fd, entity, self_service_name(), nonce, recv)
+    local ok, code, new_nonce, sent, epoch, mode = entitymgr:with_loaded_entity(entity_id, function(entity)
+        local c, n, s, e, m = session.resume(gate_node, gate_service, fd, entity, self_service_name(), nonce, recv, {
+            session_mode = session_mode,
+            session_epoch = session_epoch,
+        })
         if c ~= errcode.OK then
             return c
         end
@@ -265,12 +269,12 @@ function CMD.resume_session(entity_id, gate_node, gate_service, fd, nonce, recv)
         if handler.on_resume_client then
             handler.on_resume_client(entity, entity.session.key)
         end
-        return c, n, s
+        return c, n, s, e, m
     end)
     if not ok then
         return errcode.ENTITY_NOT_FOUND
     end
-    return code, new_nonce, sent
+    return code, new_nonce, sent, epoch, mode
 end
 
 -- gate 转发来的上行包

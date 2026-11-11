@@ -71,7 +71,7 @@ client.close();
 | `account` / `codec` | 内部两层的实例，可单独使用 |
 | `online` / `nonce` / `recv` | 可观测性：在线状态、续接凭据（成功后必轮换）、下行计数 |
 
-构造参数除 `accountHosts` / `spb` / `tokenProvider`（必填）与 `onPush` / `onState` 外，还有 `fetchImpl`、`transport`，以及心跳/超时调参 `session: { pingIntervalMs, pingTolerance, reconnectDelayMs, handshakeTimeoutMs }`（透传给会话层，缺省值见下）。
+构造参数除 `accountHosts` / `spb` / `tokenProvider`（必填）与 `onPush` / `onState` 外，还有 `fetchImpl`、`transport`、`sessionMode`（`0`=LEGACY 默认，`1`=V2 显式下行序号），以及心跳/超时调参 `session: { pingIntervalMs, pingTolerance, reconnectDelayMs, handshakeTimeoutMs }`（透传给会话层，缺省值见下）。
 
 **`AccountClient`**（`account.ts`）：`new AccountClient({ hosts, fetchImpl? })`。hosts 随机起点轮换，**只在传输失败/非 200 时换下一台**；业务错误（200 + `code ≠ 0`）是有效应答，原样返回。所有方法失败返回 `null`。token 只进 `Authorization: Bearer` 头，绝不进 URL。
 
@@ -194,7 +194,7 @@ s:close()                               -- 关闭，pending 全部失败
 
 **`client_account`**：`new({ hosts })`，语义与 TS 的 `AccountClient` 完全一致（随机起点轮换、传输失败才换台、业务错误原样返回、失败返回 `nil`）。方法：`dev_login(name)`、`servers()`、`pick_recommended_server()`、`roles(token)`、`create_role(token, server, name)`、`ensure_role(token, name, server)`、`gates()`。
 
-**`client_session`**：`new(conf)` 后 `start()` / `call(name, param)` / `request(name, param, timeout)` / `reconnect()` / `close()`；可读字段 `online`、`nonce`（续接成功必轮换）、`recv`（下行计数，与服务端 `sent` 对账）、`rid`。调参项：`ping_interval=15`、`ping_tolerance=2`、`reconnect_delay=1`、`handshake_timeout=5`（单位秒）。
+**`client_session`**：`new(conf)` 后 `start()` / `call(name, param)` / `request(name, param, timeout)` / `reconnect()` / `close()`；可读字段 `online`、`nonce`（续接成功必轮换）、`recv`（LEGACY 下行计数 / V2 已连续收到的最高 seq，与服务端 `sent` 对账）、`rid`、`session_epoch`。调参项：`ping_interval=15`、`ping_tolerance=2`、`reconnect_delay=1`、`handshake_timeout=5`（单位秒）、`session_mode=0`（V2 传 1，见[下行协议 V2](../design/session_downlink_v2.md)）。
 
 ## 常见错误码
 

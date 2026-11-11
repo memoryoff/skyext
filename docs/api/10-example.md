@@ -189,7 +189,7 @@
 | · `M.get_obj(fd)` | 66 | 给 `sproto_api` 取协议 handler 的 `obj` | 跟踪对象或 `nil` |
 | `login/login_request.lua` · `self_node()` | 16 | 读并缓存 `cluster_node_name` |
 | · `proto_checksum_enable()` | 24 | 读 `proto_checksum_enable`（默认 false） |
-| · `load_bind_role(fd, rid, gate_service)` | 32 | 调 `router.bind_session` 把会话绑到角色实体，回 `{ code, rid, nonce }` | 绑定失败按错误码回包 |
+| · `load_bind_role(fd, rid, gate_service, session_mode)` | 32 | 调 `router.bind_session` 把会话绑到角色实体，回 `{ code, rid, nonce, session_mode, session_epoch }` | 绑定失败按错误码回包 |
 | · `M:login(fd, obj)` | 50 | 验 token → 校验 `proto_checksum` → 查角色 → 绑会话 | 各失败分支回不同错误码 |
 | · `M:resume(fd, obj)` | 113 | 断线续接：**只认 nonce、不验 token、不查库**，实体不在内存直接失败，绝不触发实体加载 | 任何错误客户端都退化成走 login |
 | · `M.ping()` | 134 | 登录阶段心跳，回 `{ sent = 0 }`（此时还没有会话计数） |

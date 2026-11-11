@@ -7,11 +7,13 @@
 //   1. 每个请求带一个自增的 request id，续接之后**用原 id 重发**在途请求。
 //      换 id 服务端就认不出来，扣费、抽卡会执行第二遍。计数器只增不减，重连路径上
 //      绝不清零：续接不重建服务端会话，重置后的小 id 会命中另一个请求的缓存响应。
-//   2. 数**收到的**下行包，不是数**认得的**。序号不在包里传（TCP/WS 在一条连接内
-//      有序不丢），两端各数各的，只在 resume / ping 时对账。认不出 request id 的
-//      响应（续接后的重复回包）照样要计数再丢；解不开码的包也要计数——服务端发出
-//      时计了数，这里漏数一个，重放就错位，而且**不会报错**。
-//   3. 传输层握手的回包不计数：login / resume / ping 的响应。
+//   2. 数**收到的**下行包，不是数**认得的**。LEGACY 模式序号不在包里传（TCP/WS 在一条
+//      连接内有序不丢），两端各数各的，只在 resume / ping 时对账。V2 模式每个计数内下行
+//      都套 DownlinkV2 信封，客户端按 (session_epoch, seq) 去重后推进同一个 recv。
+//      认不出 request id 的响应（续接后的重复回包）照样要计数再丢；解不开码的包也要
+//      计数——服务端发出时计了数，这里漏数一个，重放就错位，而且**不会报错**。
+//   3. 传输层握手的回包不计数：login / resume / ping 的响应。V2 下它们也不套信封，
+//      是客户端在拿到 epoch 之前唯一的对账锚点。
 //   4. 自己发现断线：切网络时旧连接不产生 FIN/RST，它直接变黑洞。靠 ping 的
 //      **响应**判活，单向心跳没有用。
 //   5. resume 的响应和重放的包之间**没有顺序保证**（响应来自登录服务，重放来自
@@ -26,12 +28,21 @@
 import type { Codec } from "./codec.js";
 import type { Endpoint, Transport, TransportConn } from "./transport.js";
 import { wsTransport } from "./transport.js";
+import { decodeDownlinkV2 } from "./downlink.js";
 import { ErrCode } from "./errcode.js";
 import type { ProtoArgs, SessionState } from "./types.js";
 
 /** 处在下行计数边界之外的回包，必须和服务端 skyext.entity.session、
  *  sdk/lua 的 UNCOUNTED_RESPONSE 一致 */
 const UNCOUNTED_RESPONSE = new Set(["login.login", "login.resume", "login.ping"]);
+
+/** 下行模式，必须与服务端 skyext.entity.session 一致 */
+export const MODE_LEGACY = 0;
+export const MODE_V2 = 1;
+export type SessionMode = typeof MODE_LEGACY | typeof MODE_V2;
+
+/** V2 缺口缓存上限；超过就断开重来，不能让内存无界增长 */
+const V2_GAP_LIMIT = 256;
 
 interface Pending {
     name: string;
@@ -60,6 +71,8 @@ export interface SessionOptions {
     reconnectDelayMs?: number;
     /** login/resume/ping 的等待上限，默认 5s。业务请求默认不设超时 */
     handshakeTimeoutMs?: number;
+    /** 0=LEGACY（默认，隐式计数）/1=V2（DownlinkV2 信封 + epoch ACK） */
+    sessionMode?: SessionMode;
     /** 服务端主动推送（计数内的 REQUEST）。回调抛错不会终止会话 */
     onPush?: (name: string, args?: ProtoArgs) => void;
     /** "online" / "offline" / "relogin" 状态变化 */
@@ -72,6 +85,9 @@ interface HandshakeResp {
     rid?: unknown;
     nonce?: unknown;
     sent?: number;
+    acked?: number;
+    session_mode?: number;
+    session_epoch?: string;
 }
 
 export class SessionClient {
@@ -88,7 +104,10 @@ export class SessionClient {
     private loopsStarted = false;
     private _rid: unknown = null;
     private _nonce: unknown = null;
-    private _recv = 0; // 已收到的计数内下行包数，必须和服务端的 sent 严格相等
+    private _recv = 0; // LEGACY：收到的计数内下行包数；V2：已连续收到的最高 seq
+    private _sessionMode: SessionMode;
+    private _sessionEpoch: string | null = null;
+    private v2Gaps = new Map<number, Uint8Array>();
     // 只在这里置 0。重连、续接、完整重登都不重置，见义务 1
     private nextReqId = 0;
     private pending = new Map<number, Pending>();
@@ -101,6 +120,10 @@ export class SessionClient {
         this.pingTolerance = opts.pingTolerance ?? 2;
         this.reconnectDelayMs = opts.reconnectDelayMs ?? 1_000;
         this.handshakeTimeoutMs = opts.handshakeTimeoutMs ?? 5_000;
+        this._sessionMode = opts.sessionMode ?? MODE_LEGACY;
+        if (this._sessionMode !== MODE_LEGACY && this._sessionMode !== MODE_V2) {
+            throw new Error("sessionMode must be 0 (legacy) or 1 (v2)");
+        }
     }
 
     get online(): boolean {
@@ -115,6 +138,13 @@ export class SessionClient {
     }
     get rid(): unknown {
         return this._rid;
+    }
+    get sessionMode(): SessionMode {
+        return this._sessionMode;
+    }
+    /** 逻辑会话身份，完整登录/顶号才换；续接与计划内迁移不变 */
+    get sessionEpoch(): string | null {
+        return this._sessionEpoch;
     }
 
     /** 建连、登录，并拉起重连与心跳循环。返回首次握手是否成功；
@@ -217,17 +247,22 @@ export class SessionClient {
         }
     }
 
-    private handle(bytes: Uint8Array): void {
+    /** counted=false 表示这个包已经由 V2 的 seq 计过数，这里只解析不再加计数 */
+    private handlePack(bytes: Uint8Array, counted: boolean): void {
         const r = this.opts.codec.dispatch(bytes);
         if (r === null) {
             // 解不开码也要计数：服务端发出时计了数，漏数一个 recv 就永久落后
             // sent 一位，而且不报错（义务 2）
-            this._recv += 1;
+            if (counted) {
+                this._recv += 1;
+            }
             return;
         }
         if (r.type === "request") {
             // 服务端推送，计数内
-            this._recv += 1;
+            if (counted) {
+                this._recv += 1;
+            }
             try {
                 this.opts.onPush?.(r.name, r.args);
             } catch {
@@ -243,14 +278,72 @@ export class SessionClient {
             // 服务端两份都计了，这里漏数一个，recv 就永久落后 sent 一位。
             // 丢掉的这份一定是计数内的：握手类请求的 pending 条目在 resendPending /
             // failPending 里已经显式清过，而它们的响应从不进重放缓冲，不可能被重放
-            this._recv += 1;
+            if (counted) {
+                this._recv += 1;
+            }
             return;
         }
         this.pending.delete(r.session);
-        if (!UNCOUNTED_RESPONSE.has(p.name)) {
+        if (counted && !UNCOUNTED_RESPONSE.has(p.name)) {
             this._recv += 1;
         }
         p.resolve(r.args ?? null);
+    }
+
+    /** 交付一个连续 seq。先推进 recv 再解析业务包：解析失败也说明这个 seq 到过 */
+    private deliverV2(seq: number, payload: Uint8Array): void {
+        this._recv = seq;
+        this.handlePack(payload, false);
+    }
+
+    /** V2 下行：按 (session_epoch, seq) 去重，缺口先缓存再连续交付 */
+    private handleV2(decoded: { sessionEpoch: string; seq: number; payload: Uint8Array }): void {
+        if (this._sessionEpoch !== null && decoded.sessionEpoch !== this._sessionEpoch) {
+            // 另一个逻辑会话的包，绝不能混进当前会话
+            this._nonce = null;
+            this._sessionEpoch = null;
+            this.drop(this.conn);
+            return;
+        }
+        if (this._sessionEpoch === null) {
+            // 绑定后立即推送时，客户端可以先从信封学到 epoch
+            this._sessionEpoch = decoded.sessionEpoch;
+        }
+        if (decoded.seq <= this._recv) {
+            return; // 重复包：业务只交付一次
+        }
+        if (decoded.seq > this._recv + 1) {
+            if (decoded.seq - this._recv > V2_GAP_LIMIT) {
+                this._nonce = null;
+                this.drop(this.conn);
+                return;
+            }
+            this.v2Gaps.set(decoded.seq, decoded.payload);
+            return;
+        }
+
+        this.deliverV2(decoded.seq, decoded.payload);
+        let next = this._recv + 1;
+        while (this.v2Gaps.has(next)) {
+            const payload = this.v2Gaps.get(next)!;
+            this.v2Gaps.delete(next);
+            this.deliverV2(next, payload);
+            next += 1;
+        }
+    }
+
+    private handle(bytes: Uint8Array): void {
+        if (this._sessionMode === MODE_V2) {
+            const decoded = decodeDownlinkV2(bytes);
+            if (decoded) {
+                this.handleV2(decoded);
+                return;
+            }
+            // 传输层握手（login/resume/ping）的响应不套信封，也不计数
+            this.handlePack(bytes, false);
+            return;
+        }
+        this.handlePack(bytes, true);
     }
 
     /** 连接断了（onClosed 或主动丢弃）。只处理当前这条，迟到的断开通知不能
@@ -295,14 +388,25 @@ export class SessionClient {
         if (this._nonce == null || this._rid == null) {
             return false;
         }
-        const resp = await this.request<HandshakeResp>(
-            "login.resume",
-            { rid: this._rid, nonce: this._nonce, recv: this._recv },
-            this.handshakeTimeoutMs,
-        );
+        const param: ProtoArgs = { rid: this._rid, nonce: this._nonce, recv: this._recv };
+        if (this._sessionMode === MODE_V2) {
+            param.session_mode = MODE_V2;
+            param.session_epoch = this._sessionEpoch ?? "";
+        }
+        const resp = await this.request<HandshakeResp>("login.resume", param, this.handshakeTimeoutMs);
         if (!resp || resp.code !== ErrCode.OK) {
             // 任何失败（超时/错误码）都清凭据走完整登录，绝不重试 resume
             return false;
+        }
+        if (this._sessionMode === MODE_V2) {
+            // 续接不换 epoch。服务端回了别的 epoch 说明这是另一个逻辑会话，不能接
+            if (
+                resp.session_mode !== MODE_V2 ||
+                (this._sessionEpoch !== null && resp.session_epoch !== this._sessionEpoch)
+            ) {
+                return false;
+            }
+            this._sessionEpoch = resp.session_epoch ?? null;
         }
         this._nonce = resp.nonce; // 轮换后的新凭据
         this._online = true;
@@ -323,14 +427,30 @@ export class SessionClient {
         if (!param) {
             return false;
         }
+        // 完整登录是新的逻辑会话：先清掉旧 epoch/计数。
+        // 登录响应不套信封、不计数；V2 的第一个计数内下行从 seq=1 开始
+        this._recv = 0;
+        this.v2Gaps.clear();
+        if (this._sessionMode === MODE_V2) {
+            param.session_mode = MODE_V2;
+        }
         const resp = await this.request<HandshakeResp>("login.login", param, this.handshakeTimeoutMs);
         if (!resp || resp.code !== ErrCode.OK) {
             return false;
         }
-        // 全新的会话：计数清零，旧的在途请求在服务端已经不存在了
+        const negotiated = (resp.session_mode ?? MODE_LEGACY) as SessionMode;
+        // 请求 V2 却被服务端降级：不能静默接受，否则客户端会按信封解析旧格式下行
+        if (this._sessionMode === MODE_V2 && negotiated !== MODE_V2) {
+            return false;
+        }
+        this._sessionMode = negotiated;
+        if (this._sessionMode === MODE_V2 && !resp.session_epoch) {
+            return false;
+        }
+        this._sessionEpoch = resp.session_epoch ?? null;
+        // 全新的会话：旧的在途请求在服务端已经不存在了
         this._rid = resp.rid ?? null;
         this._nonce = resp.nonce ?? null;
-        this._recv = 0;
         this._online = true;
         this.failPending();
         this.notifyState("online");
@@ -414,17 +534,21 @@ export class SessionClient {
                 continue;
             }
             const conn = this.conn;
-            const resp = await this.request<HandshakeResp>(
-                "login.ping",
-                { recv: this._recv },
-                this.pingIntervalMs,
-            );
+            const param: ProtoArgs =
+                this._sessionMode === MODE_V2
+                    ? { session_epoch: this._sessionEpoch ?? "", last_contiguous_seq: this._recv }
+                    : { recv: this._recv };
+            const resp = await this.request<HandshakeResp>("login.ping", param, this.pingIntervalMs);
             if (resp) {
                 misses = 0;
-                // 隐式计数唯一的对账点。对不上说明两端已经错位，继续跑下去只会把
-                // 错位的数据当正常数据用，不如立刻断开重来
-                if (resp.sent !== this._recv) {
+                // 对账点。对不上说明两端已经错位，继续跑下去只会把错位的数据当正常数据用
+                const epochMismatch =
+                    this._sessionMode === MODE_V2 && resp.session_epoch !== this._sessionEpoch;
+                if (epochMismatch || resp.sent !== this._recv) {
                     this._nonce = null; // 计数错位后重放对不上，续接没有意义
+                    if (epochMismatch) {
+                        this._sessionEpoch = null;
+                    }
                     this.drop(conn);
                 }
             } else {

@@ -66,7 +66,7 @@ sproto。`example/proto/base.sproto` 定义了包头：
 
 ### 义务二：数收到的下行包
 
-序号**不在包里传**。TCP/WS 在一条连接内有序不丢，所以两端各数各的，只在 `resume` 和 `ping` 的时候对账一次。这省掉了每个包上的几个字节和一次写入。
+序号**不在包里传**（V2 模式例外：每个计数内下行都带 `seq` 信封）。TCP/WS 在一条连接内有序不丢，所以 LEGACY 模式下两端各数各的，只在 `resume` 和 `ping` 的时候对账一次。这省掉了每个包上的几个字节和一次写入。
 
 代价是**会失同步**：漏数一个或多数一个，重放就错位。所以计数的位置要固定——**收到就数，在解码分发之前数**。这样协议热更导致的解码失败也不会让计数跑偏。
 
@@ -85,6 +85,10 @@ sproto。`example/proto/base.sproto` 定义了包头：
 官方 SDK 的这份名单在 `sdk/lua/skyext/client/session.lua` 和 `sdk/ts/src/session.ts` 的 `UNCOUNTED_RESPONSE`，两个实现必须一致。服务端 `lualib/skyext/entity/session.lua` 里的同名表只有 `login.resume` 和 `login.ping` 两条：`login.login` 的响应由登录服务在会话建立之前发出，根本不经过会话层的计数收口，不需要列进去。
 
 为什么是这三个：`resume` 的响应如果计数，客户端会在收到重放的旧包之前先把计数加一，下一次自校验立刻失配；`ping` 的响应如果计数，「已发出多少包」就得回答「包括我自己吗」，是现成的差一错误；`login` 发生在会话还不存在的时候。
+
+V2 模式下这三个握手响应仍然不套信封、不计数；`session_epoch` 由登录/续接响应体下发。
+绑定后立即产生的推送才是第一个计数内下行（seq=1），规则见
+[下行协议 V2](../design/session_downlink_v2.md)。
 
 注意是按**请求名**判断，不是按包的方向——服务端主动推的包（push）照常计数。
 
@@ -115,8 +119,8 @@ sproto。`example/proto/base.sproto` 定义了包头：
 ### login.login（100）
 
 ```sproto
-request  { token, rid, proto_checksum, server }
-response { code, rid, nonce }
+request  { token, rid, proto_checksum, server, session_mode }
+response { code, rid, nonce, session_mode, session_epoch }
 ```
 
 `token` 是 JWT（签发方式见[登录流程](login.md)），`rid` / `server` 是客户端自报的角色和出生服——服务端会查库确认这个角色确实属于 token 里的账号、且在那个服。
@@ -130,8 +134,8 @@ response { code, rid, nonce }
 ### login.resume（101）
 
 ```sproto
-request  { rid, nonce, recv }
-response { code, nonce, sent }
+request  { rid, nonce, recv, session_mode, session_epoch }
+response { code, nonce, sent, session_mode, session_epoch }
 ```
 
 断线重连后**先试这个**，失败了再走完整登录。它不验 token、不查库，**也不会把实体从数据库里加载起来**——只能续上还在内存里的会话。
@@ -148,13 +152,32 @@ response { code, nonce, sent }
 ### login.ping（102）
 
 ```sproto
-request  { recv }
-response { sent }
+request  { recv, session_epoch, last_contiguous_seq }
+response { sent, acked, session_epoch }
 ```
 
 心跳兼对账。`recv` 顺便让服务端确认客户端已经收到的包，让它释放重放缓冲——所以心跳不只是保活，不发会让服务端的缓冲一直涨到上限（`session_replay_bytes` / `session_replay_packets`，默认 32 KiB / 256 包），撑爆之后会话就不可续接了。
 
 客户端应当校验 `sent` 等于自己的计数，不等就说明已经失同步：清掉 nonce、断开、走完整登录。这个检查很便宜，因为它只在心跳这条低频路径上。
+
+### 4.4 V2 模式（`session_mode = 1`）
+
+LEGACY 的隐式计数无法证明"客户端实际收到并去重了哪个包"，计划内 Role 迁移需要显式序号。
+V2 是可选模式：登录请求带 `session_mode = 1`，服务端在响应里确认；**会话创建后终身锁定**，
+`resume` 时模式不一致直接失败。完整契约见 [下行协议 V2](../design/session_downlink_v2.md)。
+
+- 每个计数内下行都套一个固定 45 字节信封：`"SKX2"` + version + 32 位 hex `session_epoch`
+  + 8 字节大端 `seq` + 原始 sproto 包。`seq` 就是服务端的 `sent`，不另设计数器。
+- `login.login` / `login.resume` / `login.ping` 的响应都**不套信封、不计数**；
+  `session_epoch` 由登录/续接响应体下发。绑定后立即产生的推送才是第一个计数内下行（seq=1）。
+- 客户端按 `(session_epoch, seq)` 去重：`seq <= recv` 的重复包不交付业务；出现缺口先缓存，
+  等连续后再交付；`session_epoch` 变化视为另一次完整登录，必须重走握手。
+- ACK 复用 `ping`：`session_epoch` + `last_contiguous_seq`。服务端 epoch 不匹配时**不推进
+  acked**，响应回显当前 epoch，客户端据此发现串会话并重登。**拿到 epoch 之前不要发 ACK。**
+- `seq` 用 8 字节大端；JS 侧必须用 `BigInt` 读取并校验不超过 `Number.MAX_SAFE_INTEGER`，
+  不能按 32 位截断。
+- Role 计划内迁移只推进网关内部 `owner_epoch`，`session_epoch` 与 `seq` 不变，
+  `out_buf` 里的完整信封原样重放，禁止重新编码。
 
 ## 5. 状态机
 
@@ -221,3 +244,6 @@ sequenceDiagram
 - [ ] 收包线程/协程在连接被别处关闭时**不会死掉**（参考实现在这里栽过：`websocket.read` 在连接关闭时是抛异常而不是返回空，收包协程一死整个会话就哑了，续接和重登都只能等到超时）
 - [ ] ping 超时判定基于**收到响应**，不是基于发送成功
 - [ ] 两种传输跑同一套用例，行为完全一致（robot 就是这么验的，见 `robot_transports`）
+- [ ] V2：`session_epoch` 原样保存，续接/迁移前后不换；ACK 只在拿到 epoch 之后发送
+- [ ] V2：重复 seq 不交付业务，缺口先缓存；`session_epoch` 变化按完整登录处理
+- [ ] V2：`seq` 用 64 位读取，JS 侧校验不超过 `Number.MAX_SAFE_INTEGER`

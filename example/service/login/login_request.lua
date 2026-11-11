@@ -29,8 +29,9 @@ local function proto_checksum_enable()
 end
 
 -- 把会话绑到角色实体上。实体加载在哪个节点由实体系统决定，和本网关在不在一个节点无关
-local function load_bind_role(fd, rid, gate_service)
-    local code, nonce = router.bind_session("role", rid, self_node(), gate_service, fd)
+local function load_bind_role(fd, rid, gate_service, session_mode)
+    local code, nonce, session_epoch, bound_mode =
+        router.bind_session("role", rid, self_node(), gate_service, fd, session_mode)
     if code ~= errcode.OK then
         log.warn("bind_session failed", "rid", rid, "fd", fd, "code", code)
         return { code = code }
@@ -38,13 +39,28 @@ local function load_bind_role(fd, rid, gate_service)
 
     -- 会话已经交给实体，之后的包网关直接转过去，登录服务不再管它
     client.unbind(fd)
-    log.info("load_bind_role success", "rid", rid, "fd", fd)
+    log.info("load_bind_role success", "rid", rid, "fd", fd, "mode", bound_mode)
     return {
         code = errcode.OK,
         rid = rid,
         -- 续接凭据。断线后客户端拿它走 resume，不用重新登录
         nonce = nonce,
+        -- 下行协议协商结果。客户端必须原样保存 epoch，V2 的 ACK 要带它
+        session_mode = bound_mode,
+        session_epoch = session_epoch,
     }
+end
+
+-- session_mode 只接受 0/1；缺省按 LEGACY，其它值 fail-closed。
+-- 不能把未知值悄悄当 LEGACY：客户端以为自己在 V2，会按信封解析所有下行包
+local function normalize_session_mode(value)
+    if value == nil then
+        return 0
+    end
+    if value == 0 or value == 1 then
+        return value
+    end
+    return nil
 end
 
 function M:login(fd, obj)
@@ -104,7 +120,15 @@ function M:login(fd, obj)
         }
     end
 
-    return load_bind_role(fd, rid, obj.gate)
+    local session_mode = normalize_session_mode(self.session_mode)
+    if not session_mode then
+        log.warn("login rejected, unsupported session_mode", "mode", tostring(self.session_mode))
+        return {
+            code = errcode.PARAM_ERROR,
+        }
+    end
+
+    return load_bind_role(fd, rid, obj.gate, session_mode)
 end
 
 -- 断线续接。不验 token、不查库：凭据是 nonce，它只代表一条会话、最长活到实体卸载，
@@ -115,17 +139,33 @@ function M:resume(fd, obj)
     if (not rid) or (rid <= 0) then
         return { code = errcode.PARAM_ERROR }
     end
-    local code, nonce, sent = router.resume_session("role", rid, self_node(), obj.gate, fd, self.nonce, self.recv)
+    local session_mode = normalize_session_mode(self.session_mode)
+    if not session_mode then
+        return { code = errcode.PARAM_ERROR }
+    end
+    local code, nonce, sent, session_epoch, bound_mode = router.resume_session(
+        "role",
+        rid,
+        self_node(),
+        obj.gate,
+        fd,
+        self.nonce,
+        self.recv,
+        session_mode,
+        self.session_epoch
+    )
     if code ~= errcode.OK then
         log.info("resume rejected", "rid", rid, "fd", fd, "code", code)
         return { code = code }
     end
     client.unbind(fd)
-    log.info("resume success", "rid", rid, "fd", fd)
+    log.info("resume success", "rid", rid, "fd", fd, "mode", bound_mode)
     return {
         code = errcode.OK,
         nonce = nonce,
         sent = sent,
+        session_mode = bound_mode,
+        session_epoch = session_epoch,
     }
 end
 
