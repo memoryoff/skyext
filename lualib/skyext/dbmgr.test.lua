@@ -1060,7 +1060,8 @@ end)
 
 -- P07：关键元数据在 orm.decode 之前提取，普通 ORM 文档看不到它们
 t.describe("dbmgr 关键字段提取", function()
-    local OP_HASH = string.rep("ab", 16)
+    -- 与 critical.param_hash_of 的真实输出一致：32 字节摘要的 64 位 hex
+    local OP_HASH = string.rep("ab", 32)
     local OP_ID = "0123456789abcdef0123456789abcdef_0001"
 
     t.it("keeps reserved metadata out of the ORM document and in the cache entry", function()
@@ -1202,6 +1203,28 @@ t.describe("dbmgr 关键状态机", function()
             .equal("REJECTED")
         t.expect(h.db.critical_update("demo", "role", "rid", 7, 2, { ["$set"] = {} })).to.equal("REJECTED")
         t.expect(h.db.critical_update("demo", "role", "rid", 7, 1.5, { ["$set"] = {} })).to.equal("REJECTED")
+        t.expect(#h.critical_updates).to.equal(0)
+        t.expect(h.doc._version).to.equal(0)
+    end)
+
+    t.it("refuses parent/child and duplicate update paths before sending the CAS", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+
+        -- 合并 ORM 增量与 _critical_* 字段时，父子路径会让 Mongo 整条拒绝 CAS；
+        -- 那已经是发出去的写入，调用方只能误判成 UNKNOWN 并隔离玩家资产
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, {
+            ["$set"] = {
+                ["_critical_ops_v1"] = {},
+                ["_critical_ops_v1.op1"] = { status = "COMMITTED" },
+            },
+        })).to
+            .equal("REJECTED")
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, {
+            ["$set"] = { gold = 1 },
+            ["$unset"] = { gold = true },
+        })).to
+            .equal("REJECTED")
         t.expect(#h.critical_updates).to.equal(0)
         t.expect(h.doc._version).to.equal(0)
     end)

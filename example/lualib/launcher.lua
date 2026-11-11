@@ -5,6 +5,32 @@ local node_shutdown_api = require "skyext.node_shutdown_api"
 
 local M = {}
 
+-- 关键经济链路的可选服务（P08/P09/P13/P15）。
+-- 默认**不启动**：它们依赖 Mongo 索引门禁、实体类型的 critical_ledger/critical_jobs
+-- 配置，以及支付渠道密钥。配置表存在且 enabled = true 才起，避免"没配好就静默跑起来"。
+-- start 里会跑 ensure_indexes；失败必须让节点启动失败，不能降级成全表扫描的调度器。
+M.OPTIONAL_SERVICES = {
+    { config_key = "outbox_worker", service = "outbox_worker" },
+    { config_key = "critical_maintenance", service = "critical_maintenance" },
+    { config_key = "pay_callback", service = "pay_callback" },
+    { config_key = "migration", service = "migration_coordinator" },
+}
+
+function M.launch_optional_services()
+    for _, spec in ipairs(M.OPTIONAL_SERVICES) do
+        local conf = config.get_table(spec.config_key)
+        if type(conf) == "table" and conf.enabled == true then
+            local addr = skynet.newservice(spec.service)
+            local ok, err = skynet.call(addr, "lua", "start", conf)
+            if not ok then
+                log.error("optional service failed to start", "service", spec.service, "err", tostring(err))
+                error("optional service " .. spec.service .. " failed to start: " .. tostring(err))
+            end
+            log.info("optional service started", "service", spec.service)
+        end
+    end
+end
+
 function M.launcher_node()
     log.info("launcher_node begin")
     -- metrics 先起：业务服务首次声明指标时就会去找 .metrics，晚一步它们得走重试
@@ -22,6 +48,9 @@ function M.launcher_node()
     assert(all_ok, "auto create indexes failed")
     skynet.kill(mongo_index)
     log.info("auto create indexes success")
+
+    -- 索引与实体服务都就绪之后再起关键链路调度器：它们会立刻扫 Mongo
+    M.launch_optional_services()
 end
 
 -- 客户端接入：网关管连接，login 处理还没绑定的会话。

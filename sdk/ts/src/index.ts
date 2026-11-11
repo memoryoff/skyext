@@ -29,5 +29,17 @@ export {
     type Endpoint,
 } from "./transport.js";
 export { SessionClient, type SessionOptions, type LoginParam } from "./session.js";
+export {
+    CRITICAL_GRANT_VERSION,
+    MAX_SEQ,
+    validateGrant,
+    buildRequest,
+    buildQuery,
+    type OperationGrantV1,
+    type CriticalRequestV1,
+    type CriticalRequestOptions,
+    type CriticalQueryOptions,
+    type BuildResult,
+} from "./critical.js";
 export { AccountClient, type AccountOptions } from "./account.js";
 export { SkyextClient, type SkyextClientOptions, type EnterGameOptions } from "./client.js";

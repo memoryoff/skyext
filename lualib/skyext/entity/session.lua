@@ -581,81 +581,92 @@ function M.with_request(key, f, req_id, request_name, request_digest)
         return false, "entity manager not ready"
     end
     local entity = conn.entity
-    local io_ = entity.session_io
-    if io_ then
-        io_.last_seen = skynet.now()
-        if req_id then
-            local cached = io_.resp_cache[req_id]
-            if cached then
-                -- 同 req_id 必须同时满足协议名与参数摘要。只看协议名会让"同协议不同参数"
-                -- 的重传拿到上一次的结果；续接不重建 session_io，这张缓存还是断线前那张
-                local same, why, kind =
-                    fingerprint.matches_digest(cached, request_name, request_digest, crypto.const_equals)
-                if not same then
-                    if kind == fingerprint.KIND.PROTOCOL_MISMATCH or kind == fingerprint.KIND.MISMATCH then
-                        log.warn(
-                            "request id reused for a different request",
-                            "id",
-                            entity.id,
-                            "req_id",
-                            req_id,
-                            "cached",
-                            cached.name,
-                            "got",
-                            request_name,
-                            "reason",
-                            why
-                        )
-                        return false, "request id reused for a different request", errcode.REQUEST_CONFLICT
-                    end
-                    if kind == fingerprint.KIND.INTERNAL then
-                        -- 比较函数/摘要本身出问题：按内部失败处理，不能伪装成"缓存过期"
-                        -- 让客户端重走流程，那可能把同一个操作执行第二遍
-                        log.error(
-                            "request fingerprint comparison failed",
-                            "id",
-                            entity.id,
-                            "req_id",
-                            req_id,
-                            "reason",
-                            why
-                        )
-                        return false, "request fingerprint unavailable"
-                    end
-                    -- 旧格式条目（没有 version/hash）：不能猜测着重放
-                    log.warn("cached response is not usable", "id", entity.id, "req_id", req_id, "reason", why)
-                    return false, "cached response is not usable", errcode.REQUEST_EXPIRED
-                end
-                -- 续接之后客户端按原 id 重发的在途请求：回缓存的响应，绝不重新执行
-                m_dedup:inc(1, { mode = "req_id" })
-                return true, cached.pack
-            end
-            if req_id < io_.min_cached_req_id then
-                return false, "response for this request id was already evicted", errcode.REQUEST_EXPIRED
-            end
-        end
-    end
 
-    local ok, result = g_entitymgr:with_loaded_entity(entity.id, function(active)
+    -- 查重、比对指纹、执行业务、写响应缓存必须在**同一个实体串行队列**里完成。
+    -- 队列外读 resp_cache 会让两个同 req_id 的协程都先 miss，再先后进队列各执行一次；
+    -- 队列外捕获的 io_ 指针也可能在排队期间被续接/解绑换掉。闭包内一律重新取当前值。
+    -- 缓存命中同样走这里，因此连接身份校验对命中路径也生效。
+    local ok, packed = g_entitymgr:with_loaded_entity(entity.id, function(active)
         -- 排队等待期间会话可能已经解绑，或者换绑到别的实体上
         if active ~= entity or g_conns[key] ~= conn then
-            return nil
+            return table.pack(false, "client binding revoked")
         end
-        return table.pack(f())
+        local io_ = entity.session_io
+        if io_ then
+            io_.last_seen = skynet.now()
+            if req_id then
+                local cached = io_.resp_cache[req_id]
+                if cached then
+                    -- 同 req_id 必须同时满足协议名与参数摘要。只看协议名会让"同协议不同参数"
+                    -- 的重传拿到上一次的结果；续接不重建 session_io，这张缓存还是断线前那张
+                    local same, why, kind =
+                        fingerprint.matches_digest(cached, request_name, request_digest, crypto.const_equals)
+                    if not same then
+                        if kind == fingerprint.KIND.PROTOCOL_MISMATCH or kind == fingerprint.KIND.MISMATCH then
+                            log.warn(
+                                "request id reused for a different request",
+                                "id",
+                                entity.id,
+                                "req_id",
+                                req_id,
+                                "cached",
+                                cached.name,
+                                "got",
+                                request_name,
+                                "reason",
+                                why
+                            )
+                            return table.pack(
+                                false,
+                                "request id reused for a different request",
+                                errcode.REQUEST_CONFLICT
+                            )
+                        end
+                        if kind == fingerprint.KIND.INTERNAL then
+                            -- 比较函数/摘要本身出问题：按内部失败处理，不能伪装成"缓存过期"
+                            -- 让客户端重走流程，那可能把同一个操作执行第二遍
+                            log.error(
+                                "request fingerprint comparison failed",
+                                "id",
+                                entity.id,
+                                "req_id",
+                                req_id,
+                                "reason",
+                                why
+                            )
+                            return table.pack(false, "request fingerprint unavailable")
+                        end
+                        -- 旧格式条目（没有 version/hash）：不能猜测着重放
+                        log.warn("cached response is not usable", "id", entity.id, "req_id", req_id, "reason", why)
+                        return table.pack(false, "cached response is not usable", errcode.REQUEST_EXPIRED)
+                    end
+                    -- 续接之后客户端按原 id 重发的在途请求：回缓存的响应，绝不重新执行
+                    m_dedup:inc(1, { mode = "req_id" })
+                    return table.pack(true, cached.pack)
+                end
+                if req_id < io_.min_cached_req_id then
+                    return table.pack(
+                        false,
+                        "response for this request id was already evicted",
+                        errcode.REQUEST_EXPIRED
+                    )
+                end
+            end
+        end
+
+        local result = table.pack(f())
+        -- result[4] 是 sproto_api 的内部缓存处置（CACHEABLE/NO_CACHE）。纯读预检拒绝、
+        -- 环境 UNKNOWN 这类瞬时结果不能写 L1，否则客户端重传时会被旧拒绝钉死。
+        -- 旧 handler 不返回决定值时是 nil，维持原来的缓存规则
+        if io_ and req_id and type(result[1]) == "string" and result[4] ~= NO_CACHE then
+            cache_response(io_, req_id, result[1], request_name, request_digest)
+        end
+        return table.pack(true, table.unpack(result, 1, result.n))
     end)
     if not ok then
-        return false, tostring(result or "entity unavailable")
+        return false, tostring(packed or "entity unavailable")
     end
-    if result == nil then
-        return false, "client binding revoked"
-    end
-    -- result[4] 是 sproto_api 的内部缓存处置（CACHEABLE/NO_CACHE）。纯读预检拒绝、
-    -- 环境 UNKNOWN 这类瞬时结果不能写 L1，否则客户端重传时会被旧拒绝钉死。
-    -- 旧 handler 不返回决定值时是 nil，维持原来的缓存规则
-    if io_ and req_id and type(result[1]) == "string" and result[4] ~= NO_CACHE then
-        cache_response(io_, req_id, result[1], request_name, request_digest)
-    end
-    return true, table.unpack(result, 1, result.n)
+    return table.unpack(packed, 1, packed.n)
 end
 
 -- 请求被拒绝、且错误码无法通过协议回给客户端时的兜底：断开连接，让客户端立刻失败重连

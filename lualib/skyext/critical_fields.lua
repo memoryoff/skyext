@@ -35,6 +35,18 @@ M.MAX_NODES = 4096
 M.MAX_BYTES = 512 * 1024
 M.MAX_KEY_LEN = 128
 
+-- 参数摘要是 HMAC-SHA256 的**十六进制字符串**：32 字节摘要 -> 64 个小写 hex 字符。
+-- fingerprint.HASH_BYTES = 32 是字节数，不是字符数。这个值必须与
+-- skyext.critical.param_hash_of 的输出严格一致：两边各写一个字面量曾经让任何
+-- 残留 PREPARED 的角色文档在 dbmgr.load 时被当成损坏数据拒绝，恢复闭环直接瘫痪。
+M.PARAM_HASH_HEX_LEN = 64
+
+local function is_param_hash(value)
+    return type(value) == "string" and #value == M.PARAM_HASH_HEX_LEN and value:match("^[0-9a-f]+$") ~= nil
+end
+
+M.is_param_hash = is_param_hash
+
 local function is_safe_key(k)
     if type(k) ~= "string" then
         return false
@@ -135,6 +147,11 @@ local function check_entry_table(name, value)
         if type(v.status) ~= "string" then
             return nil, name .. " entry is missing status"
         end
+        -- 热账本条目带了摘要就必须和意图用同一种格式，否则"同 op 换参数"的比对
+        -- 会拿两种长度的字符串恒不相等，静默变成 OP_CONFLICT 或漏检
+        if name == M.OPS and v.param_hash ~= nil and not is_param_hash(v.param_hash) then
+            return nil, name .. " has an invalid param_hash"
+        end
     end
     return true
 end
@@ -149,7 +166,7 @@ local function validate_intent(value)
     if type(value.op_type) ~= "string" or #value.op_type == 0 then
         return nil, M.INTENT .. " has an invalid op_type"
     end
-    if type(value.param_hash) ~= "string" or #value.param_hash ~= 32 then
+    if not is_param_hash(value.param_hash) then
         return nil, M.INTENT .. " has an invalid param_hash"
     end
     if value.owner_fence ~= nil and type(value.owner_fence) ~= "string" and type(value.owner_fence) ~= "number" then

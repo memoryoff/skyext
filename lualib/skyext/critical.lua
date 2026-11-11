@@ -19,6 +19,7 @@
 --   * `validate` / `apply` 必须是纯内存、不 yield、不 DB、不 RPC、不推送；
 --   * UNKNOWN 一律隔离缓存并返回 recovery 信息，绝不重试成"没写"，也不声称成功。
 local capability = require "skyext.capability"
+local critical_fields = require "skyext.critical_fields"
 local dbmgr = require "skyext.dbmgr"
 local fingerprint = require "skyext.fingerprint"
 local grant = require "skyext.grant"
@@ -77,6 +78,9 @@ M.OPS_OLDEST_FIELD = "_critical_ops_oldest_at"
 M.EVENT_PREFIX = "evt_"
 M.SERVICE_PREFIX = "srv_"
 M.HEX64_LEN = 64
+
+-- 摘要格式只在这里定义一次，加载侧的校验也用同一个常量
+M.PARAM_HASH_HEX_LEN = critical_fields.PARAM_HASH_HEX_LEN
 
 M.JOB_STATE = {
     PENDING = "PENDING",
@@ -308,7 +312,13 @@ local function param_hash_of(op_type, params, hash_fn)
     if not digest then
         return nil, err
     end
-    return hex(digest)
+    local out = hex(digest)
+    -- 写进去的长度必须与 critical_fields.validate_intent 的校验一致。
+    -- 这里直接 fail-closed，避免再次出现"写得出、加载不回"的元数据
+    if not critical_fields.is_param_hash(out) then
+        return nil, "param hash has an unexpected format"
+    end
+    return out
 end
 -- 接收方（Outbox / Saga）要用同一个摘要函数校验"同一事件换了参数"，
 -- 因此导出而不是复制一份实现：两份实现的规范化差异就是两套指纹
@@ -356,6 +366,25 @@ local function commit_core(ctx, req, handlers)
     end
 
     local existing = lookup_op(critical, req.op_id)
+    -- 热条目被归档移走后，同 op_id 的历史事实只剩冷账本。不查就把"已发奖"
+    -- 报成 NOT_STARTED，重放会二次入账。读失败一律 UNKNOWN，绝不猜测"没执行过"
+    if not existing and req.ledger then
+        local called, archived, aerr = pcall(req.ledger.critical_find, req.ledger, {
+            rid = ctx.rid,
+            op_id = req.op_id,
+        }, { _id = false })
+        if not called then
+            return decision(M.STATUS.UNKNOWN, nil, M.NO_CACHE, { reason = "ledger read raised" })
+        end
+        if archived == nil and aerr ~= nil then
+            return decision(M.STATUS.UNKNOWN, nil, M.NO_CACHE, {
+                reason = "ledger read failed: " .. tostring(aerr),
+            })
+        end
+        if type(archived) == "table" then
+            existing = archived
+        end
+    end
     if existing then
         local same = existing.op_type == req.op_type
             and existing.param_hash == req.param_hash
@@ -745,6 +774,7 @@ function M.execute_client(entity, grant_fields, seq, op_type, params, handlers, 
         params = params,
         now = now,
         outbox = opts.outbox,
+        ledger = opts.ledger,
     }, handlers)
 end
 
@@ -776,9 +806,24 @@ function M.execute_internal(entity, service_op_id, op_type, params, handlers, op
         return decision(M.STATUS.INTERNAL_AUTH_DENIED, nil, M.NO_CACHE, { reason = "source_id is required" })
     end
 
-    local cap = opts.capability
+    -- 优先取受控分发上下文（capability.run_with）。旧调用方显式传 opts.capability
+    -- 仍然兼容，但两者同时存在且不一致时必须拒绝，不能让旁路参数盖过当前上下文
+    local current_cap = capability.current()
+    if current_cap ~= nil and opts.capability ~= nil and current_cap ~= opts.capability then
+        return decision(M.STATUS.INTERNAL_AUTH_DENIED, nil, M.NO_CACHE, {
+            reason = "capability does not match the dispatch context",
+        })
+    end
+    local cap = current_cap or opts.capability
     if cap == nil then
         return decision(M.STATUS.INTERNAL_AUTH_DENIED, nil, M.NO_CACHE, { reason = "capability is required" })
+    end
+    -- cap 必须来自受信任分发入口的命名空间，不能是任意自造 issuer 签出来的
+    local cap_namespace = capability.namespace_of(cap)
+    if not cap_namespace or not capability.ALLOWED_NAMESPACES[cap_namespace] then
+        return decision(M.STATUS.INTERNAL_AUTH_DENIED, nil, M.NO_CACHE, {
+            reason = "capability has an untrusted namespace",
+        })
     end
     -- 先做一次无副作用核验：明显伪造/过期/绑定不符的 cap 不必走到读取状态
     local verified, cap_err = capability.verify(cap, {
@@ -801,6 +846,7 @@ function M.execute_internal(entity, service_op_id, op_type, params, handlers, op
         params = params,
         now = now_of(opts),
         outbox = opts.outbox,
+        ledger = opts.ledger,
         -- 真正核销放在第一个写入点之前：纯读预检拒绝不该烧掉凭证
         authorize = function()
             return capability.consume(cap, {

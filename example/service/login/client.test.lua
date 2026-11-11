@@ -10,7 +10,7 @@ local source = fs.join(fs.absolute(os.getenv("SKYTEST_ROOT") or lfs.currentdir()
 local CID = "v1|gate1|.gate_ws|" .. string.rep("a", 32) .. "|9"
 
 local function harness()
-    local h = { sent = {}, timers = {}, cancelled = 0 }
+    local h = { sent = {}, timers = {}, cancelled = 0, now = 1000 }
     local noop = function() end
 
     local function new_timer(name, sec, fn)
@@ -40,6 +40,12 @@ local function harness()
         ["skyext.log"] = { info = noop, warn = noop, error = noop, debug = noop },
     }
     local env = setmetatable({
+        -- 墓碑用墙钟秒做 TTL；注入时钟才能测过期而不真的等 60 秒
+        os = {
+            time = function()
+                return h.now
+            end,
+        },
         require = function(name)
             return imports[name] or require(name)
         end,
@@ -92,14 +98,30 @@ t.describe("login client registration", function()
         t.expect(h.sent).to.equal({})
     end)
 
-    -- 迟到的 open 在 disconnect 之后到达：new 会重新建记录，网关随后会补发 disconnect，
-    -- 这里只证明登录端两条路径都不抛错
-    t.it("tolerates open and disconnect arriving in either order", function()
+    -- 迟到的 open 在 disconnect 之后到达：墓碑必须挡住它，否则会复活一个已经关闭
+    -- 的连接，留下孤儿登录态（T04/I01）。旧实现会重新建记录，只靠网关补发 disconnect
+    t.it("refuses a late open that arrives after disconnect", function()
         local h = harness()
         h.client.closed(CID)
         local conf = h.client.new({ conn_id = CID, addr = "a", gate = ".gate_ws" })
-        t.expect(conf).to.exist()
-        h.client.closed(CID)
+        t.expect(conf).to.be_nil()
         t.expect(h.client.get_obj(CID)).to.be_nil()
+    end)
+
+    t.it("does not treat a successful unbind as a closed connection", function()
+        local h = harness()
+        local other = "v1|gate1|.gate_ws|" .. string.rep("b", 32) .. "|10"
+        t.expect(h.client.new({ conn_id = other, addr = "a", gate = ".gate_ws" }) ~= nil).to.equal(true)
+        h.client.unbind(other)
+        -- 登录成功后会话移交实体，unbind 不是断连，不该留下墓碑
+        t.expect(h.client.new({ conn_id = other, addr = "a", gate = ".gate_ws" }) ~= nil).to.equal(true)
+    end)
+
+    t.it("lets a tombstone expire after the TTL", function()
+        local h = harness()
+        h.client.closed(CID)
+        t.expect(h.client.new({ conn_id = CID, addr = "a", gate = ".gate_ws" })).to.be_nil()
+        h.now = h.now + 61
+        t.expect(h.client.new({ conn_id = CID, addr = "a", gate = ".gate_ws" }) ~= nil).to.equal(true)
     end)
 end)

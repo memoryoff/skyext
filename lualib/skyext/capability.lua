@@ -41,6 +41,16 @@ local CONTEXT = setmetatable({}, { __mode = "k" })
 
 local DEFAULT_TTL = 30
 
+-- 只有这三条受信任分发链（加支付适配层）能持有 issuer。命名空间本身不是鉴权材料，
+-- 但把可签发来源收口到固定集合，可以挡住"随便造一个 issuer 再自签 cap"的路径。
+-- 同 VM 内可任意执行 Lua 的攻击者不是本模块的防御边界（见文件头注释）。
+M.ALLOWED_NAMESPACES = {
+    outbox = true,
+    charge_order = true,
+    payment = true,
+    saga = true,
+}
+
 local function check_text(value, name)
     if type(value) ~= "string" or #value == 0 or #value > 256 then
         return nil, name .. " must be a non-empty string"
@@ -54,14 +64,25 @@ function M.new_issuer(namespace, allowed_op_types)
     if not ns then
         return nil, err
     end
+    if not M.ALLOWED_NAMESPACES[ns] then
+        return nil, "namespace is not a trusted dispatch entry"
+    end
+    -- 空白名单原本等价于"放行任意 op_type"，等于把业务白名单交给了签发调用方。
+    -- 到这里必须给出至少一个明确允许的操作类型
+    if type(allowed_op_types) ~= "table" or #allowed_op_types == 0 then
+        return nil, "allowed_op_types must be a non-empty list"
+    end
     local issuer = setmetatable({}, ISSUER_MT)
     local ops = {}
-    for _, op in ipairs(allowed_op_types or {}) do
+    for _, op in ipairs(allowed_op_types) do
         local v = check_text(op, "op_type")
         if not v then
             return nil, "invalid allowed op_type"
         end
         ops[v] = true
+    end
+    if next(ops) == nil then
+        return nil, "allowed_op_types must be a non-empty list"
     end
     ISSUERS[issuer] = { namespace = ns, op_types = ops }
     return issuer
@@ -93,7 +114,8 @@ function M.issue(issuer, fields)
     if not op_type then
         return nil, err
     end
-    if next(irec.op_types) ~= nil and not irec.op_types[op_type] then
+    -- 双保险：即便 issuer 记录被绕过构造，空白名单也不再表示"全部允许"
+    if next(irec.op_types) == nil or not irec.op_types[op_type] then
         return nil, "op_type is not allowed for this issuer"
     end
     local service_op_id, serr = check_text(fields.service_op_id, "service_op_id")
@@ -188,6 +210,14 @@ end
 
 function M.is_cap(cap)
     return type(cap) == "table" and getmetatable(cap) == CAP_MT and CAPS[cap] ~= nil
+end
+
+-- 供提交内核核对签发来源。只认注册表里的真实 cap，伪造 table 一律返回 nil
+function M.namespace_of(cap)
+    if not M.is_cap(cap) then
+        return nil
+    end
+    return CAPS[cap].namespace
 end
 
 -- 当前协程的受控调用上下文。**不要**改成模块级 current_cap：

@@ -276,6 +276,9 @@ function M.grant(entity, order, handlers, opts)
             source_namespace = "charge_order",
             source_id = M.source_id(order),
             now = opts.now,
+            -- 热账本归档后，同 service_op_id 的历史只存在冷账本；不传就会把
+            -- 已发奖的卡单重新入账一次
+            ledger = opts.ledger,
         }
     )
 

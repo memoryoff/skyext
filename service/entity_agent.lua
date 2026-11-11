@@ -215,6 +215,16 @@ function CMD.deliver_reliable_loaded(entity_id)
     return entitymgr:deliver_pending(entity_id, { loaded_only = true })
 end
 
+-- 关键账本集合来自实体类型配置（critical_ledger / critical_jobs），没配就明确拒绝：
+-- 静默跳过会让维护扫描看起来在跑、实际什么都没做。
+-- 定义在所有 FRAMEWORK 命令之前，避免函数体把同名局部误解析成全局
+local function config_collection(spec)
+    if type(spec) ~= "table" or type(spec.db) ~= "string" or type(spec.coll) ~= "string" then
+        return nil
+    end
+    return require("skyext.mongo_conn").get_collection(spec.db, spec.coll)
+end
+
 -- 框架内部命令（`router.call` 的落点）。都在实体队列内执行，参数是已经解析好的
 -- 业务值，不做任何鉴权——鉴权由调用方（框架模块）负责，它们不会暴露给客户端。
 local function framework_charge_grant(entity, order)
@@ -260,6 +270,8 @@ local function framework_charge_grant(entity, order)
         capability = cap,
         hash_fn = g_charge_hash,
         now = now,
+        -- 归档后同 service_op_id 的历史只在冷账本，提交内核靠它阻断二次发奖
+        ledger = config_collection(type_config.critical_ledger),
     })
 end
 
@@ -269,23 +281,23 @@ FRAMEWORK.outbox_pump = function(entity, limit)
 end
 
 FRAMEWORK.critical_status = function(entity, op_id)
-    return require("skyext.critical").query(entity, op_id, { now = os.time() })
+    local ledger = config_collection(type_config.critical_ledger)
+    if not ledger then
+        -- 热条目会被归档搬走。没有冷账本就不能回答"没执行过"，否则支付对账会把
+        -- 已发奖的订单判成 NOT_STARTED，再用同一个 service_op_id 发第二次
+        return { status = "UNKNOWN", reason = "critical_ledger is not configured" }
+    end
+    return require("skyext.critical").query(entity, op_id, {
+        now = os.time(),
+        ledger = ledger,
+    })
 end
 
 FRAMEWORK.charge_grant = framework_charge_grant
 
 -- 迁移（P15）：导出会话快照。调用方必须先确认网关屏障与实体队列排空，
 -- 否则导出的是一个还在变的 out_buf
--- 关键账本维护：归档与"确保恢复任务存在"。
--- 集合来自实体类型配置（`critical_ledger` / `critical_jobs`），没配就明确拒绝：
--- 静默跳过会让维护扫描看起来在跑、实际什么都没做
-local function config_collection(spec)
-    if type(spec) ~= "table" or type(spec.db) ~= "string" or type(spec.coll) ~= "string" then
-        return nil
-    end
-    return require("skyext.mongo_conn").get_collection(spec.db, spec.coll)
-end
-
+-- 关键账本维护：归档与"确保恢复任务存在"
 FRAMEWORK.critical_archive = function(entity, limit)
     local ledger = config_collection(type_config.critical_ledger)
     if not ledger then
@@ -307,6 +319,36 @@ FRAMEWORK.critical_ensure_job = function(entity, op_id)
         return nil, err
     end
     return { task_id = job.task_id, state = job.state }
+end
+
+-- 恢复任务取证明（P08 §4.4.1 / §4.7）。
+-- 只在实体已加载时被调用，此时 dbmgr.load 已完成 Majority Fence 认领，
+-- 旧 owner 的迟到 CAS 已被屏障挡住；因此这里读到的持久化状态可以当事实用。
+-- 返回值只有三种：COMMITTED / NOT_COMMITTED / UNKNOWN，绝不做人工强解。
+FRAMEWORK.critical_resolve_intent = function(entity, op_id)
+    local critical = require "skyext.critical"
+    local ledger = config_collection(type_config.critical_ledger)
+    if not ledger then
+        -- 没有冷账本就不能排除"热条目已归档"，更不能判定未提交
+        return { status = "UNKNOWN", reason = "critical_ledger is not configured" }
+    end
+    local proof = critical.query(entity, op_id, { now = os.time(), ledger = ledger })
+    if proof.status == "COMMITTED" or proof.status == "BUSINESS_REJECTED" then
+        return { status = "COMMITTED" }
+    end
+    if proof.status == "UNKNOWN" or proof.status == "IN_PROGRESS" then
+        return { status = "UNKNOWN" }
+    end
+    -- 到这里的只有 NOT_STARTED / EXPIRED_NOT_EXECUTED（ABORTED 由 query 映射成 NOT_STARTED）。
+    -- 取消未决意图：一次 CAS 写 ABORTED 终态并清 PREPARED，不产生业务效果
+    local state, detail = critical.abort_intent(entity, { now = os.time() })
+    if state == "CONFIRMED" then
+        return { status = "NOT_COMMITTED" }
+    end
+    if state == "REJECTED" and detail == "no pending intent" then
+        return { status = "NOT_COMMITTED" }
+    end
+    return { status = "UNKNOWN", reason = tostring(detail) }
 end
 
 FRAMEWORK.session_export = function(entity, barrier_id, target_owner_epoch)
@@ -505,6 +547,10 @@ end
 
 -- gate 上的连接断开了
 function CMD.session_closed(conn_id)
+    -- 断连必须中止该连接上所有在途的主动 RPC：否则迟到的响应会按 session 编号
+    -- 误删后来复用同一编号的 pending（B0-05 / T11）。这条路径是 abort_conn
+    -- 唯一的生产调用点，不能只留辅助函数
+    require("skyext.sproto_api").abort_conn(conn_id)
     if not session then
         return
     end

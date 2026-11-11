@@ -110,6 +110,43 @@ mongo_config = {
     },
 }
 
+-- 关键经济链路的可选服务（P08/P09/P13/P15/P17）。
+-- 默认全部关闭：开启前必须确认 Mongo 集合可写、索引能建起来、支付渠道密钥已配好。
+-- launcher 会对每个 enabled 的服务调用 start，服务内部的索引门禁失败会让节点启动失败，
+-- 不会降级成"没有索引还一直全表扫描"的调度器。
+-- 用 `x = x or {...}` 是为了让节点配置在 include 之前写的自定义值不被这里覆盖。
+outbox_worker = outbox_worker
+    or {
+        enabled = false,
+        type_name = "role",
+        interval = 5,
+        scan_limit = 64,
+        batch = 16,
+    }
+critical_maintenance = critical_maintenance
+    or {
+        enabled = false,
+        type_name = "role",
+        interval = 60,
+        scan_limit = 32,
+        archive_limit = 64,
+        retention = 7 * 24 * 3600,
+    }
+pay_callback = pay_callback
+    or {
+        enabled = false,
+        host = "0.0.0.0",
+        port = 8090,
+        role_type = "role",
+        orders = { db = "role", coll = "charge_order" },
+        -- 渠道模块需实现 verify(payload, headers) 与 parse(payload)，密钥放模块自己的配置里
+        providers = {},
+    }
+migration = migration or {
+    enabled = false,
+    type_name = "role",
+}
+
 -- 同一条可靠消息连续投递失败多少次后转入死信队列。
 -- 只有“错在消息本身”的失败才计数（没有对应 handler、handler 抛错）；
 -- 租约失效、落库失败这类环境问题不计，否则一次数据库抖动就会误伤正常消息。
@@ -133,6 +170,11 @@ entity_types = {
         nodes = { "rolenode1", "rolenode2" },
         client_enabled = true,
         modules_path = "modules",
+        -- 关键经济的冷账本与恢复任务集合（与 db_name 同库，避免另开一个没配连接的库）。
+        -- 热条目归档后，同 op_id 的历史只存在 op_ledger；缺这两个配置时
+        -- critical_status 会 fail-closed 返回 UNKNOWN，绝不伪称"没执行过"
+        critical_ledger = { db = "role", coll = "op_ledger" },
+        critical_jobs = { db = "role", coll = "critical_reconcile_jobs" },
     },
     -- 排行榜：每个 game 一份的全局单例，做成常驻实体
     rank = {

@@ -484,15 +484,21 @@ RECEIVER_MT.__index = RECEIVER_MT
 -- opts.namespace 默认 "outbox"；opts.op_types 限定该接收方能处理哪些操作
 function M.new_receiver(opts)
     opts = opts or {}
+    -- 来源命名空间固定为 outbox：调用方不能自报一个受信任来源名，否则
+    -- `_critical_ops_v1` 里的 source_namespace 绑定就失去意义
+    local namespace = "outbox"
+    if opts.namespace ~= nil and opts.namespace ~= namespace then
+        return nil, "receiver namespace must be outbox"
+    end
+    if type(opts.op_types) ~= "table" or #opts.op_types == 0 then
+        return nil, "op_types must be a non-empty list"
+    end
     local capability = require "skyext.capability"
-    local issuer, err = capability.new_issuer(opts.namespace or "outbox", opts.op_types)
+    local issuer, err = capability.new_issuer(namespace, opts.op_types)
     if not issuer then
         return nil, err
     end
-    return setmetatable(
-        { issuer = issuer, hash_fn = opts.hash_fn, namespace = opts.namespace or "outbox" },
-        RECEIVER_MT
-    )
+    return setmetatable({ issuer = issuer, hash_fn = opts.hash_fn, namespace = namespace }, RECEIVER_MT)
 end
 
 -- 返回 handler 应当原样返回的值：

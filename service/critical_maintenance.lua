@@ -15,6 +15,7 @@ local cmd_api = require "skyext.cmd_api"
 local config = require "skyext.config"
 local critical = require "skyext.critical"
 local critical_maintenance = require "skyext.critical_maintenance"
+local critical_reconciler = require "skyext.critical_reconciler"
 local log = require "skyext.log"
 local mongo_conn = require "skyext.mongo_conn"
 local router = require "skyext.entity.router"
@@ -27,6 +28,12 @@ local g_opts
 local g_running = false
 local g_stats = { rounds = 0, archived = 0, intents = 0, failed = 0 }
 
+-- 恢复任务执行器：任务表只做调度，证明与资产事实在 owner 实体里
+local g_reconcile_deps
+local g_reconcile_opts
+local g_reconcile_stats =
+    { rounds = 0, claimed = 0, committed = 0, not_committed = 0, retry = 0, conflict = 0, failed = 0 }
+
 local function settings()
     local conf = config.get_table("critical_maintenance") or {}
     return {
@@ -35,6 +42,8 @@ local function settings()
         scan_limit = conf.scan_limit or critical_maintenance.DEFAULT_SCAN,
         archive_limit = conf.archive_limit or critical.ARCHIVE_LIMIT,
         retention = conf.retention or critical.ARCHIVE_RETENTION,
+        reconcile_scan = conf.reconcile_scan or critical_reconciler.DEFAULT_SCAN,
+        reconcile_lease = conf.reconcile_lease or critical_reconciler.DEFAULT_LEASE,
     }
 end
 
@@ -93,6 +102,30 @@ local function run_loop()
                 )
             end
         end
+
+        local rok, rstats, rerr = pcall(critical_reconciler.run_once, g_reconcile_deps, g_reconcile_opts)
+        if not rok then
+            log.error("critical reconciler raised", "err", tostring(rstats))
+        elseif not rstats then
+            log.error("critical reconciler failed", "err", tostring(rerr))
+        else
+            g_reconcile_stats.rounds = g_reconcile_stats.rounds + 1
+            for _, k in ipairs({ "claimed", "committed", "not_committed", "retry", "conflict", "failed" }) do
+                g_reconcile_stats[k] = g_reconcile_stats[k] + (rstats[k] or 0)
+            end
+            if rstats.claimed > 0 then
+                log.info(
+                    "critical reconcile round",
+                    "claimed",
+                    rstats.claimed,
+                    "retry",
+                    rstats.retry,
+                    "failed",
+                    rstats.failed
+                )
+            end
+        end
+
         skynet.sleep(math.max(1, math.floor(g_opts.interval * 100)))
     end
     log.info("critical maintenance stopped")
@@ -129,6 +162,35 @@ function CMD.start(conf)
         return false, derr
     end
     g_deps = deps
+
+    -- 恢复任务执行器：抢占走 claim_job 的 (job_version, lease_until) CAS；
+    -- 证明必须经 owner 实体队列（critical_resolve_intent），那里已完成 Fence 认领。
+    -- 任务表只负责调度，资产事实永远取角色文档
+    g_reconcile_deps = {
+        jobs_coll = jobs,
+        claim = function(rid, op_id, owner, lease_until, version)
+            return critical.claim_job(jobs, rid, op_id, owner, lease_until, {
+                job_version = version,
+                now = os.time(),
+            })
+        end,
+        resolve = function(rid, op_id)
+            local ok, result = call_owner(g_opts.type_name, rid, "critical_resolve_intent", op_id)
+            if not ok or type(result) ~= "table" then
+                return { status = "UNKNOWN", reason = tostring(result) }
+            end
+            return result
+        end,
+        finish = function(rid, op_id, version, state)
+            return critical.finish_job(jobs, rid, op_id, version, state, { now = os.time() })
+        end,
+    }
+    g_reconcile_opts = {
+        owner = "critical_maintenance:" .. skynet.self(),
+        scan_limit = g_opts.reconcile_scan,
+        lease = g_opts.reconcile_lease,
+    }
+
     g_running = true
     skynet.fork(run_loop)
     log.info(
@@ -150,8 +212,21 @@ function CMD.run_once()
     return pcall(critical_maintenance.run_once, g_deps, g_opts)
 end
 
+-- 手动推进一轮恢复任务，供运维与集成测试使用；不提供强制完成/清除隔离
+function CMD.reconcile_once()
+    if not g_reconcile_deps then
+        return false, "not started"
+    end
+    return pcall(critical_reconciler.run_once, g_reconcile_deps, g_reconcile_opts)
+end
+
 function CMD.stats()
-    return g_stats
+    local out = {}
+    for k, v in pairs(g_stats) do
+        out[k] = v
+    end
+    out.reconcile = g_reconcile_stats
+    return out
 end
 
 function CMD.stop()

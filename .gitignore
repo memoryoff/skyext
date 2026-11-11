@@ -31,6 +31,8 @@ coverage/
 .vscode/
 .aone_copilot/
 .claude/
+# 工作区记忆与本地工具数据，不进版本库
+.workbuddy-ai/
 
 # sdk/ts 的 bun 依赖（bun.lock 提交，node_modules 不提交）
 node_modules/

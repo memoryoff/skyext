@@ -457,6 +457,37 @@ t.describe("critical 内部入口", function()
         return assert(h.capability.issue(iss, fields))
     end
 
+    t.it("refuses a capability that contradicts the trusted dispatch context", function()
+        local h = harness()
+        local op_id = "srv_" .. string.rep("b", 64)
+        local cap_a = issue(h)
+        local cap_b = issue(h)
+        local result
+        h.capability.run_with(cap_a, function()
+            result = internal(h, cap_b, op_id)
+        end)
+        t.expect(result.status).to.equal(h.critical.STATUS.INTERNAL_AUTH_DENIED)
+        t.expect(h.applied).to.equal(0)
+        t.expect(#h.store.updates).to.equal(0)
+    end)
+
+    t.it("accepts a capability supplied only through the dispatch context", function()
+        local h = harness()
+        local op_id = "srv_" .. string.rep("b", 64)
+        local cap = issue(h)
+        local result
+        h.capability.run_with(cap, function()
+            result = h.critical.execute_internal(h.entity, op_id, "pay.grant", { amount = 1 }, h.handlers(), {
+                hmac_fn = HASH,
+                hash_fn = HASH,
+                source_id = "order_1",
+                now = h.now,
+            })
+        end)
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+        t.expect(h.applied).to.equal(1)
+    end)
+
     t.it("requires a capability object, not a source string", function()
         local h = harness()
         local result = h.critical.execute_internal(
@@ -1109,7 +1140,7 @@ t.describe("critical 源侧 Outbox", function()
         opts = opts or {}
         local payload = opts.payload or PAYLOAD
         local hash = assert(h.critical.param_hash_of(opts.op_type or "mail.send", payload, HASH))
-        local issuer = assert(h.capability.new_issuer("outbox", {}))
+        local issuer = assert(h.capability.new_issuer("outbox", { opts.op_type or "mail.send" }))
         local cap = assert(h.capability.issue(issuer, {
             rid = 7,
             service_op_id = OP_ID,
@@ -1319,5 +1350,107 @@ t.describe("critical 归档", function()
         local result = h.critical.query(h.entity, OP_A, { ledger = ledger })
         -- 读失败不等于没有记录
         t.expect(result.status).to.equal("UNKNOWN")
+    end)
+end)
+
+-- PREPARE 写进库的东西，必须能被 dbmgr.load 的 extract 原样读回来。
+-- 曾经生产写 64 位 hex、加载侧只收 32 字符，导致任何残留 PREPARED 的角色
+-- 在崩溃恢复时被拒绝加载；测试桩用假摘要，所以全绿也没能发现
+t.describe("critical 保留字段往返", function()
+    t.it("PREPARE 写入的意图能通过加载侧校验", function()
+        local h = harness()
+        local critical_fields = require "skyext.critical_fields"
+        local result = h.client(1)
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+
+        local prepare = h.store.updates[1]
+        local intent = assert(prepare.update["$set"]["_critical_intent_v1"])
+        t.expect(critical_fields.is_param_hash(intent.param_hash)).to.equal(true)
+        t.expect(h.critical.PARAM_HASH_HEX_LEN).to.equal(critical_fields.PARAM_HASH_HEX_LEN)
+
+        local clean, critical = critical_fields.extract({
+            rid = 7,
+            _version = 1,
+            _critical_intent_v1 = intent,
+        })
+        t.expect(clean ~= nil).to.equal(true)
+        -- 关键字段必须从交给 orm.decode 的那张表里剥离，不能进 dropped
+        t.expect(clean["_critical_intent_v1"] == nil).to.equal(true)
+        t.expect(critical["_critical_intent_v1"].param_hash).to.equal(intent.param_hash)
+    end)
+
+    t.it("拒绝截断的或非十六进制的摘要", function()
+        local critical_fields = require "skyext.critical_fields"
+        local function rejected(hash)
+            local clean = critical_fields.extract({
+                rid = 7,
+                _critical_intent_v1 = {
+                    op_id = string.rep("a", 32) .. "_0001",
+                    op_type = "shop.buy",
+                    param_hash = hash,
+                    state = "PREPARED",
+                },
+            })
+            return clean == nil
+        end
+        t.expect(rejected(string.rep("a", 32))).to.equal(true)
+        t.expect(rejected(string.rep("z", 64))).to.equal(true)
+        t.expect(rejected(string.rep("a", 64))).to.equal(false)
+    end)
+end)
+
+-- 归档把热条目 $unset 之后，同一个 op_id 的历史只剩冷账本。
+-- 提交内核若不回落查询，就会把"已发奖"当成第一次执行，重复扣费/发奖
+t.describe("critical 归档后重放", function()
+    local function call(h, ledger)
+        return h.critical.execute_client(h.entity, h.new_grant(), 1, "shop.buy", { amount = 1 }, h.handlers(), {
+            hmac_fn = HASH,
+            hash_fn = HASH,
+            equal_fn = EQ,
+            now = h.now,
+            ledger = ledger,
+        })
+    end
+
+    t.it("replays an archived commit instead of writing a second one", function()
+        local h = harness()
+        local hash = assert(h.critical.param_hash("shop.buy", { amount = 1 }, HASH))
+        local ledger = {
+            critical_find = function()
+                return {
+                    op_type = "shop.buy",
+                    param_hash = hash,
+                    source_namespace = "grant",
+                    source_id = string.rep("a", 32),
+                    status = "COMMITTED",
+                    response = { gold = 999 },
+                }
+            end,
+        }
+        local result = call(h, ledger)
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+        t.expect(result.response.gold).to.equal(999)
+        t.expect(h.applied).to.equal(0)
+        t.expect(#h.store.updates).to.equal(0)
+    end)
+
+    t.it("returns UNKNOWN instead of committing when the ledger read fails", function()
+        local h = harness()
+        local ledger = {
+            critical_find = function()
+                return nil, "socket closed"
+            end,
+        }
+        local result = call(h, ledger)
+        t.expect(result.status).to.equal(h.critical.STATUS.UNKNOWN)
+        t.expect(h.applied).to.equal(0)
+        t.expect(#h.store.updates).to.equal(0)
+    end)
+
+    t.it("still commits a first-time op when no ledger is configured", function()
+        local h = harness()
+        local result = call(h, nil)
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+        t.expect(h.applied).to.equal(1)
     end)
 end)

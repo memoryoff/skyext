@@ -381,6 +381,27 @@ end)
 -- 续接之后客户端按原 request id 重发在途请求，服务端必须认出来回缓存的响应。
 -- 重新执行一遍扣费、抽卡比丢一个回包危险得多
 t.describe("session upstream idempotency", function()
+    t.it("re-checks the cache inside the entity queue so an interleaved request cannot run twice", function()
+        local h = harness()
+        local _, key = bind(h, 9)
+        local fingerprint = require "skyext.fingerprint"
+        local digest = string.rep("d", 32)
+        local runs = 0
+        local function handler()
+            runs = runs + 1
+            return "RESP"
+        end
+        -- 模拟另一个协程抢先提交并写好 L1，而本请求在排队等待期间才进入队列。
+        -- 查重若发生在队列外，这里就已经 miss 了，进队列后 handler 会执行第二次
+        h.before_handler = function()
+            h.entity.session_io.resp_cache[5] = assert(fingerprint.entry_from_digest(digest, "shop.buy", "CACHED"))
+        end
+        local ok, pack = h.session.with_request(key, handler, 5, "shop.buy", digest)
+        t.expect(ok).to.equal(true)
+        t.expect(pack).to.equal("CACHED")
+        t.expect(runs).to.equal(0)
+    end)
+
     t.it("answers a repeated request id from cache without running the handler again", function()
         local h = harness()
         local _, key = bind(h, 9)

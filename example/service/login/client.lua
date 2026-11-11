@@ -15,6 +15,40 @@ local g_clients = {}
 -- 但那次登录的响应还没发出去，发它还要用网关
 local g_gates = {}
 
+-- 已关闭 conn_id 的短期墓碑。断开与"open 晚于 disconnect"是真实存在的竞态：
+-- 没有墓碑，迟到的 open 会给一条已经关闭的连接重建登录态，留下孤儿会话。
+-- 只用墙钟秒 + 容量上限，惰性清理，不额外起定时器
+local g_tombstones = {} -- conn_id -> 过期时间（os.time 秒）
+local g_tombstone_order = {}
+local TOMBSTONE_TTL = 60
+local TOMBSTONE_MAX = 4096
+
+local function is_tombstoned(conn_id, now)
+    local expire_at = g_tombstones[conn_id]
+    if expire_at == nil then
+        return false
+    end
+    if expire_at <= now then
+        g_tombstones[conn_id] = nil
+        return false
+    end
+    return true
+end
+
+local function add_tombstone(conn_id, now)
+    if g_tombstones[conn_id] ~= nil then
+        g_tombstones[conn_id] = now + TOMBSTONE_TTL
+        return
+    end
+    g_tombstones[conn_id] = now + TOMBSTONE_TTL
+    g_tombstone_order[#g_tombstone_order + 1] = conn_id
+    -- 容量硬上限：突发断线洪峰不能让墓碑无限增长
+    while #g_tombstone_order > TOMBSTONE_MAX do
+        local oldest = table.remove(g_tombstone_order, 1)
+        g_tombstones[oldest] = nil
+    end
+end
+
 function M.new(conf)
     local conn_id = conf.conn_id
     -- 网关的 open 是"可确认 RPC"：超时后它可能重试，ACK 丢失时也可能重发。
@@ -26,6 +60,11 @@ function M.new(conf)
         g_gates[conn_id] = conf.gate
         log.warn("duplicate open for a tracked client", "conn", conn_id)
         return existing
+    end
+    if is_tombstoned(conn_id, os.time()) then
+        -- 连接已经关闭，任何迟到的 open 都不能把它复活
+        log.warn("refuse a late open for a closed connection", "conn", conn_id)
+        return nil
     end
     g_clients[conn_id] = conf
     g_gates[conn_id] = conf.gate
@@ -57,6 +96,7 @@ end
 -- 这个表示 fd 已经没了
 function M.closed(conn_id)
     g_gates[conn_id] = nil
+    add_tombstone(conn_id, os.time())
     M.unbind(conn_id)
 end
 

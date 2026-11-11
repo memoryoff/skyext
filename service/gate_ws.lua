@@ -62,6 +62,29 @@ local m_stale_pushes = metrics.counter(
 local m_stale_binds =
     metrics.counter("skyext_gate_stale_binds_total", "Owner bind RPCs rejected because of a stale epoch", { "gate" })
 local m_connections = metrics.gauge("skyext_gate_connections", "Live connections on this gate", { "gate" })
+local m_handshake_inflight = metrics.gauge(
+    "skyext_ws_handshake_inflight",
+    "WS connections waiting for the synchronous login registration",
+    { "gate" }
+)
+
+-- 握手 inflight：从 handshake 回调进入直到注册确认/失败/连接关闭。
+-- 计数挂在 session 上，close_session 与 handshake 都可能收尾，用标志防重复减
+local g_handshake_inflight = 0
+local function begin_handshake(session)
+    session.handshake_counted = true
+    g_handshake_inflight = g_handshake_inflight + 1
+    m_handshake_inflight:set(g_handshake_inflight, { gate = "ws" })
+end
+
+local function end_handshake(session)
+    if not session or not session.handshake_counted then
+        return
+    end
+    session.handshake_counted = false
+    g_handshake_inflight = math.max(0, g_handshake_inflight - 1)
+    m_handshake_inflight:set(g_handshake_inflight, { gate = "ws" })
+end
 
 local g_self_node
 local function self_node()
@@ -128,6 +151,8 @@ close_session = function(conn_id, reason)
     if g_by_fd[session.fd] == conn_id then
         g_by_fd[session.fd] = nil
     end
+    -- 等待注册确认期间连接被关：inflight 必须在这里归零
+    end_handshake(session)
     session.state = STATE.CLOSED
     g_count = g_count - 1
     m_connections:set(g_count, { gate = "ws" })
@@ -191,6 +216,7 @@ function handler.handshake(conn_id, fd)
     end
     session.state = STATE.HANDSHAKING
     session.state = STATE.REGISTERING
+    begin_handshake(session)
 
     local ok, err = call_with_timeout(g_login, g_handshake_timeout_ms, function()
         -- 迟到的成功：登录端可能已经为这个 conn_id 建了客户端记录，补一次 disconnect。
@@ -201,7 +227,8 @@ function handler.handshake(conn_id, fd)
     end, "open", conn_id, session.addr, GATE_NAME)
 
     if g_sessions[conn_id] ~= session then
-        -- 等待期间连接已经断开，close_session 已经通知过登录端
+        -- 等待期间连接已经断开，close_session 已经通知过登录端并归零 inflight
+        end_handshake(session)
         return
     end
     -- 必须拿到明确的 true 才算注册成功：nil / false 都可能是登录端拒绝或没有实现确认
@@ -210,8 +237,10 @@ function handler.handshake(conn_id, fd)
         session.state = STATE.CLOSING
         pcall(websocket.close, fd, 1011, "register failed")
         close_session(conn_id, "register failed")
+        end_handshake(session)
         return
     end
+    end_handshake(session)
     session.state = STATE.ACTIVE
     log.info("ws session active", "conn", conn_id, "addr", session.addr)
 end

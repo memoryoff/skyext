@@ -692,6 +692,31 @@ function M.critical_update(dbname, dbcoll, key, unique_id, expected_version, upd
             end
         end
 
+        -- 父子/重复路径冲突检查。Mongo 会拒绝 `$set: {a:1, "a.b":2}` 这类更新，
+        -- 但那已是发出去的 CAS：调用方只能把失败归成 UNKNOWN 并隔离玩家资产。
+        -- 合并 ORM 增量与 _critical_* 字段时必须在这里提前拦下
+        local paths = {}
+        for op, fields in pairs(update) do
+            if type(fields) == "table" then
+                for path in pairs(fields) do
+                    if type(path) == "string" then
+                        paths[#paths + 1] = { op = op, path = path }
+                    end
+                end
+            end
+        end
+        for i = 1, #paths do
+            for j = i + 1, #paths do
+                local a, b = paths[i], paths[j]
+                if a.path == b.path then
+                    return "REJECTED", "conflicting update paths"
+                end
+                if b.path:sub(1, #a.path + 1) == a.path .. "." or a.path:sub(1, #b.path + 1) == b.path .. "." then
+                    return "REJECTED", "conflicting parent/child update paths"
+                end
+            end
+        end
+
         -- 浅拷贝，避免把注入的 _version 留在调用方的表里：同一张 update 表复用做
         -- 下一步 CAS 时会因为"_version 必须恰好 +1"被拒
         local write = {}

@@ -25,6 +25,7 @@ local function harness(opts)
         deliveries = 0,
         cluster_calls = 0,
         registered_modules = {},
+        aborted = {},
     }
     local noop = function() end
     local gates = {}
@@ -235,6 +236,10 @@ local function harness(opts)
         ["skynet.cluster"] = fake_cluster,
         ["entity_handler.role"] = h.handler,
         ["skyext.sproto_api"] = {
+            abort_conn = function(conn_id)
+                h.aborted[#h.aborted + 1] = conn_id
+                return 0
+            end,
             dispatch_message = function(conn, data)
                 h.dispatched = { conn = conn, data = data }
             end,
@@ -571,6 +576,13 @@ t.describe("entity_agent serialized ingress", function()
         t.expect(h.events[#h.events]).to.equal("unbind")
     end)
 
+    t.it("aborts in-flight active RPCs when the connection closes", function()
+        local h = harness()
+        h.CMD.session_closed(cid(9))
+        -- abort_conn 必须挂在真实断连路径上，而不是只留一个没人调用的辅助函数
+        t.expect(h.aborted).to.equal({ cid(9) })
+    end)
+
     t.it("propagates unload success or failure to the remote handoff caller", function()
         local h = harness()
         h.unload_ok = false
@@ -677,6 +689,16 @@ t.describe("entity_agent 框架内部命令", function()
         t.expect(ok).to.equal(true)
         -- 测试实体没有 db 坐标：读不到状态时必须回 UNKNOWN，而不是"没执行"
         t.expect(result.status).to.equal("UNKNOWN")
+    end)
+
+    t.it("never claims NOT_STARTED when the cold ledger is not configured", function()
+        local h = harness()
+        local ok, result = h.CMD.entity_call(7, "critical_status", "srv_" .. string.rep("a", 64))
+        t.expect(ok).to.equal(true)
+        -- 热条目可能已被归档搬走；没有冷账本就没有资格判断"从未执行"，
+        -- 否则支付对账会拿同一个 service_op_id 再发一次奖
+        t.expect(result.status).to.equal("UNKNOWN")
+        t.expect(result.reason).to.equal("critical_ledger is not configured")
     end)
 
     t.it("does not let a business handler hijack a framework command", function()

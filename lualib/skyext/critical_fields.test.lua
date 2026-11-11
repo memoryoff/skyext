@@ -27,7 +27,10 @@ function role:fields()
     return { "rid", "_version", "gold" }
 end
 
-local OP_HASH = string.rep("ab", 16) -- 32 字节二进制摘要
+-- 与 critical.param_hash_of 的真实输出一致：HMAC-SHA256 的 32 字节摘要
+-- 经 hex() 展开成 64 个小写十六进制字符。用 32 个字符的假摘要会让
+-- "写得出、加载不回"的缺陷被测试掩盖
+local OP_HASH = string.rep("ab", 32)
 local OP_ID = "0123456789abcdef0123456789abcdef_0001"
 
 local function role_doc(over)

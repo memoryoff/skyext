@@ -1,0 +1,132 @@
+-- 关键链路调度器必须由配置显式开启：索引门禁、实体类型配置、支付密钥都还没配好时
+-- 静默启动，只会得到一个全表扫描或永远拒绝回调的"看起来在跑"的服务。
+local t = require "skytest"
+local fs = require "skyext.util.fs"
+local lfs = require "lfs"
+
+local source = fs.join(fs.absolute(os.getenv("SKYTEST_ROOT") or lfs.currentdir()), "example/lualib/launcher.lua")
+
+local function harness(opts)
+    opts = opts or {}
+    local h = { services = {}, calls = {}, killed = {}, errors = {}, conf = opts.conf or {} }
+    local noop = function() end
+
+    local imports = {
+        skynet = {
+            newservice = function(name)
+                h.services[#h.services + 1] = name
+                return ":" .. name
+            end,
+            uniqueservice = function(name)
+                return ":" .. name
+            end,
+            call = function(addr, proto, cmd, ...)
+                h.calls[#h.calls + 1] = { addr = addr, cmd = cmd, args = table.pack(...) }
+                if cmd == "create_indexes" then
+                    return opts.index_ok ~= false
+                end
+                if cmd == "start" then
+                    return opts.start_ok ~= false, opts.start_err
+                end
+                return true
+            end,
+            kill = function(addr)
+                h.killed[#h.killed + 1] = addr
+            end,
+            send = noop,
+        },
+        ["skyext.config"] = {
+            get = function(k)
+                return h.conf[k]
+            end,
+            get_number = function(k)
+                return h.conf[k]
+            end,
+            get_table = function(k)
+                return h.conf[k]
+            end,
+        },
+        ["skyext.log"] = {
+            info = noop,
+            warn = noop,
+            error = function(...)
+                h.errors[#h.errors + 1] = table.pack(...)
+            end,
+        },
+        ["skyext.node_shutdown_api"] = {
+            start = function()
+                h.shutdown_started = true
+                return ":node_shutdown"
+            end,
+        },
+    }
+    local env = setmetatable({
+        require = function(name)
+            return imports[name] or require(name)
+        end,
+    }, { __index = _G })
+    h.launcher = assert(loadfile(source, "t", env))()
+    return h
+end
+
+local function started_optional(h)
+    local out = {}
+    for _, call in ipairs(h.calls) do
+        if call.cmd == "start" then
+            out[#out + 1] = call.addr
+        end
+    end
+    return out
+end
+
+t.describe("launcher 可选服务接线", function()
+    t.it("starts nothing optional without an explicit enable", function()
+        local h = harness({ conf = { outbox_worker = { interval = 1 }, pay_callback = { port = 8090 } } })
+        h.launcher.launcher_node()
+        t.expect(h.services).to.equal({ "metrics", "gm", "hotfix", "mongo_index" })
+        t.expect(started_optional(h)).to.equal({})
+        t.expect(h.shutdown_started).to.equal(true)
+    end)
+
+    t.it("starts exactly the enabled services, after the base services and index gate", function()
+        local h = harness({
+            conf = {
+                outbox_worker = { enabled = true, interval = 5 },
+                pay_callback = { enabled = false },
+                critical_maintenance = { enabled = true },
+            },
+        })
+        h.launcher.launcher_node()
+        t.expect(h.services).to.equal({
+            "metrics",
+            "gm",
+            "hotfix",
+            "mongo_index",
+            "outbox_worker",
+            "critical_maintenance",
+        })
+        t.expect(started_optional(h)).to.equal({ ":outbox_worker", ":critical_maintenance" })
+        -- 配置表原样交给服务自己的 settings/门禁，不能在 launcher 里丢字段
+        t.expect(h.calls[#h.calls - 1].args[1].interval).to.equal(5)
+    end)
+
+    t.it("refuses to bring the node up when an enabled service fails its index gate", function()
+        local h = harness({
+            conf = { outbox_worker = { enabled = true } },
+            start_ok = false,
+            start_err = "index gate failed",
+        })
+        t.expect(function()
+            h.launcher.launcher_node()
+        end).to
+            .throw("index gate failed")
+        t.expect(#h.errors > 0).to.equal(true)
+    end)
+
+    t.it("can be started on its own without going through launcher_node", function()
+        local h = harness({ conf = { migration = { enabled = true } } })
+        h.launcher.launch_optional_services()
+        t.expect(h.services).to.equal({ "migration_coordinator" })
+        t.expect(started_optional(h)).to.equal({ ":migration_coordinator" })
+    end)
+end)

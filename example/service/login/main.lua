@@ -16,9 +16,17 @@ log.config {
 local CMD = {}
 
 function CMD.open(conn_id, addr, gate_service)
-    client.new({ conn_id = conn_id, addr = addr, gate = assert(gate_service, "gate must identify itself") })
+    local registered = client.new({
+        conn_id = conn_id,
+        addr = addr,
+        gate = assert(gate_service, "gate must identify itself"),
+    })
     -- 网关在 WS 握手回调里同步等这个确认；没有返回值会被当成注册失败并断开连接。
-    -- 重复 open 是允许的：网关超时重试、ACK 丢失都会再发一次，client.new 做幂等处理
+    -- 重复 open 是允许的：网关超时重试、ACK 丢失都会再发一次，client.new 做幂等处理。
+    -- 连接已关闭后的迟到 open 必须明确拒绝，否则会复活一个孤儿登录态
+    if not registered then
+        return false
+    end
     return true
 end
 
