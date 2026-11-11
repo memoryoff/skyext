@@ -49,6 +49,8 @@ local function harness(opts)
 
     local function new_collection(coll_name)
         return {
+            -- 真实驱动对象带 name，关键写入的 runCommand 会用它拼集合名
+            name = coll_name,
             find = function(_, doc, projection)
                 h.last = { op = "find", coll = coll_name, doc = doc, projection = projection }
                 return new_cursor()
@@ -73,6 +75,16 @@ local function harness(opts)
                 h.last = { op = "raw_safe_update", coll = coll_name, bson = bson_str }
                 return "updated"
             end,
+            -- majority 关键写入走 runCommand
+            database = {
+                runCommand = function(_, ...)
+                    h.last = { op = "runCommand", coll = coll_name, args = table.pack(...) }
+                    if h.run_command_error then
+                        error(h.run_command_error)
+                    end
+                    return h.run_command_result
+                end,
+            },
         }
     end
 
@@ -316,5 +328,92 @@ t.describe("mongo_conn 其余命令", function()
         t.expect(h.CMD.raw_safe_update("role", "bson-u")).to.equal("updated")
         t.expect(h.last.op).to.equal("raw_safe_update")
         t.expect(h.last.bson).to.equal("bson-u")
+    end)
+end)
+
+-- P06：关键写入必须 majority + journal，并把 CONFIRMED/REJECTED/UNKNOWN 分开
+t.describe("mongo_conn 关键写入", function()
+    local function with_result(result)
+        local h = started()
+        h.run_command_result = result
+        return h
+    end
+
+    t.it("returns CONFIRMED with matched counts", function()
+        local h = with_result({ ok = 1, n = 1, nModified = 1 })
+        local state, detail = h.CMD.raw_critical_update("role", "BSON")
+        t.expect(state).to.equal("CONFIRMED")
+        t.expect(detail).to.equal({ n = 1, nModified = 1 })
+        t.expect(h.last.args[1]).to.equal("update")
+        t.expect(h.last.args[2]).to.equal("role")
+        -- 最后一个参数对是 majority 写关注
+        t.expect(h.last.args[h.last.args.n - 1]).to.equal("writeConcern")
+        t.expect(h.last.args[h.last.args.n]).to.equal({ w = "majority", j = true })
+    end)
+
+    t.it("returns REJECTED when mongod reports a write error", function()
+        local h = with_result({ ok = 1, writeErrors = { { errmsg = "duplicate key" } } })
+        local state, err = h.CMD.raw_critical_update("role", "BSON")
+        t.expect(state).to.equal("REJECTED")
+        t.expect(err).to.equal("duplicate key")
+    end)
+
+    t.it("returns UNKNOWN for a write concern error or a lost reply", function()
+        local h = with_result({ ok = 1, writeConcernError = { errmsg = "not majority" } })
+        local state, err = h.CMD.raw_critical_update("role", "BSON")
+        t.expect(state).to.equal("UNKNOWN")
+        t.expect(err).to.equal("not majority")
+
+        h.run_command_error = "socket closed"
+        state, err = h.CMD.raw_critical_update("role", "BSON")
+        t.expect(state).to.equal("UNKNOWN")
+        t.expect(err).to.match("socket closed")
+    end)
+
+    t.it("distinguishes a command rejection from an ok=1 reply that still carries errmsg", function()
+        local h = with_result({ ok = 0, errmsg = "unauthorized" })
+        local state, err = h.CMD.raw_critical_update("role", "BSON")
+        t.expect(state).to.equal("REJECTED")
+        t.expect(err).to.equal("unauthorized")
+
+        h.run_command_result = { ok = 1, errmsg = "partial" }
+        state, err = h.CMD.raw_critical_update("role", "BSON")
+        t.expect(state).to.equal("UNKNOWN")
+        t.expect(err).to.equal("partial")
+    end)
+
+    t.it("critical_find reads the first document with majority read concern", function()
+        local h = with_result({ ok = 1, cursor = { firstBatch = { { rid = 7 } } } })
+        local doc = h.CMD.critical_find("role", { rid = 7 }, { _fence = false })
+        t.expect(doc).to.equal({ rid = 7 })
+        t.expect(h.last.args[1]).to.equal("find")
+        t.expect(h.last.args[h.last.args.n - 1]).to.equal("readConcern")
+        t.expect(h.last.args[h.last.args.n]).to.equal({ level = "majority" })
+    end)
+
+    t.it("critical_find returns nil when the cursor is empty", function()
+        local h = with_result({ ok = 1, cursor = { firstBatch = {} } })
+        t.expect(h.CMD.critical_find("role", { rid = 7 })).to.be_nil()
+    end)
+
+    t.it("critical_find_and_modify appends the majority write concern", function()
+        local h = with_result({ ok = 1, value = { rid = 7 }, lastErrorObject = { n = 1 } })
+        local state, ret =
+            h.CMD.critical_find_and_modify("role", { query = { rid = 7 }, update = { ["$set"] = { _fence = 5 } } })
+        t.expect(state).to.equal("CONFIRMED")
+        t.expect(ret.value).to.equal({ rid = 7 })
+        t.expect(h.last.args[1]).to.equal("findAndModify")
+        t.expect(h.last.args[2]).to.equal("role")
+        t.expect(h.last.args[h.last.args.n - 1]).to.equal("writeConcern")
+        t.expect(h.last.args[h.last.args.n]).to.equal({ w = "majority", j = true })
+    end)
+
+    t.it("critical_probe reports a reachable connection", function()
+        local h = with_result({ ok = 1 })
+        t.expect(h.CMD.critical_probe("role")).to.equal(true)
+        h.run_command_result = { ok = 0, errmsg = "unauthorized" }
+        local ok, err = h.CMD.critical_probe("role")
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.equal("unauthorized")
     end)
 end)

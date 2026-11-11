@@ -101,12 +101,16 @@ end
 local function find_and_modify(coll_obj, opts)
     local called, ret = pcall(coll_obj.find_and_modify, coll_obj, opts)
     if not called then
-        return nil, ret
+        return nil, ret, "UNKNOWN"
     end
-    if type(ret) ~= "table" or ret.ok ~= 1 then
-        return nil, (type(ret) == "table" and ret.errmsg) or ret or "no reply"
+    if type(ret) ~= "table" then
+        return nil, ret or "no reply", "UNKNOWN"
     end
-    return ret
+    if ret.ok ~= 1 then
+        -- 命令级拒绝：确定没写，可以安全重试/判定失败
+        return nil, ret.errmsg or "no reply", "REJECTED"
+    end
+    return ret, nil, "CONFIRMED"
 end
 
 -- Skynet Mongo 驱动把 BSON null 解码成单字节字符串 "\0"，
@@ -119,13 +123,26 @@ local function matched_value(ret)
     return nil
 end
 
+-- 认领结果读取。关键路径优先用 majority 读，避免看到会被回滚的旧值
+local function read_claim_doc(coll_obj, query)
+    if coll_obj.critical_find then
+        return pcall(coll_obj.critical_find, coll_obj, query, g_claim_projection)
+    end
+    return pcall(coll_obj.find_one, coll_obj, query, g_claim_projection)
+end
+
 -- 认领没匹配时弄清楚原因：文档不存在、已经属于更高的 fence，还是值得再认领一次。
 -- 返回 value（文档已归我们）| nil, reason, detail；reason 为 nil 表示该重试，detail 是重试原因
 local function resolve_unclaimed(coll_obj, key, unique_id, initial, fence, create)
     if not create then
-        local called, existing = pcall(coll_obj.find_one, coll_obj, { [key] = unique_id }, g_claim_projection)
+        local called, existing, read_err = read_claim_doc(coll_obj, { [key] = unique_id })
         if not called then
             return nil, "fence claim failed", existing
+        end
+        -- majority 读失败不能降级成 "not found"：上层会把它当成"实体不存在"，
+        -- 进而把待投可靠消息整批移进死信
+        if existing == nil and read_err ~= nil then
+            return nil, "fence claim failed", read_err
         end
         if type(existing) ~= "table" then
             return nil, "not found"
@@ -171,10 +188,27 @@ end
 -- upsert 直接插入一条同 key 的重复文档（除非恰好建了唯一索引，而索引是配置可选的）。
 -- 所以“不存在就创建”单独走等值查询 + $setOnInsert，既不会改坏既有文档，
 -- 也不会插出重复 key。create 为假时文档不存在就返回 "not found"，绝不新建。
+-- 关键认领优先走 majority 写关注；老调用方/测试没有这个接口时退回普通 findAndModify，
+-- 但必须把"写结果未知"和"确认未匹配"分开，前者不能继续走 resolve_unclaimed。
+local function claim_find_and_modify(coll_obj, opts)
+    local fn = coll_obj.critical_find_and_modify
+    if not fn then
+        return find_and_modify(coll_obj, opts)
+    end
+    local called, state, detail = pcall(fn, coll_obj, opts)
+    if not called then
+        return nil, state, "UNKNOWN"
+    end
+    if state == "CONFIRMED" then
+        return detail, nil, "CONFIRMED"
+    end
+    return nil, detail, state
+end
+
 local function claim_with_fence(coll_obj, key, unique_id, initial, fence, create)
     local last_err
     for _ = 1, FENCE_CLAIM_ATTEMPTS do
-        local ret, err = find_and_modify(coll_obj, {
+        local ret, err, state = claim_find_and_modify(coll_obj, {
             query = {
                 [key] = unique_id,
                 ["$or"] = {
@@ -190,6 +224,11 @@ local function claim_with_fence(coll_obj, key, unique_id, initial, fence, create
             new = true,
         })
         if not ret then
+            if state == "UNKNOWN" then
+                -- 写可能已经生效，只是没拿到 majority 确认。此时既不能当成未认领继续
+                -- 走 $setOnInsert（可能插出重复文档），也不能当成已认领返回
+                return nil, "fence claim unknown", err
+            end
             return nil, "fence claim failed", err
         end
         local claimed = matched_value(ret)

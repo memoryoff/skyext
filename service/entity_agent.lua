@@ -16,6 +16,8 @@ local handler
 local entitymgr
 local session
 local g_data_modules = {}
+-- 数据模块的声明顺序（来自 conf.modules）：on_load 正序、on_unload 逆序
+local g_module_order = {}
 
 local CMD = {}
 
@@ -343,6 +345,7 @@ function CMD.start(conf)
             local data_mod = require(mod_path)
             if type(data_mod) == "table" and data_mod.new then
                 g_data_modules[mod.name] = data_mod
+                g_module_order[#g_module_order + 1] = mod.name
             end
         end
 
@@ -355,7 +358,7 @@ function CMD.start(conf)
     end
 
     handler = require("entity_handler." .. type_name)
-    entitymgr = entitymgr_mod.new(type_name, type_config, handler, g_data_modules)
+    entitymgr = entitymgr_mod.new(type_name, type_config, handler, g_data_modules, g_module_order)
 
     if session then
         -- 心跳这类传输层协议也注册成 "login.*"：会话绑定之后上行包由网关直接转给实体，

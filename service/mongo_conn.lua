@@ -103,6 +103,119 @@ function CMD.safe_delete(coll, query, single)
     return col_obj:safe_delete(query, single)
 end
 
+-- ---------------------------------------------------------------- 关键写入
+--
+-- 经济操作不能接受 w=1 的"成功"：主节点写完就 ACK，切主后可能回滚。
+-- 这里统一用 majority + journal，并把结果分成三态：
+--   CONFIRMED  多数派已确认，可以继续提交
+--   REJECTED   明确被拒（writeErrors），业务上确定没写进去
+--   UNKNOWN    超时/网络/写关注错误：**可能已经写进去了**，调用方必须按未决处理，
+--              不能当成"没写"重试，也不能当成"已提交"
+local MAJORITY_WRITE_CONCERN = { w = "majority", j = true }
+
+local function classify_write(r)
+    if type(r) ~= "table" then
+        return "UNKNOWN", "no reply", r
+    end
+    if r.writeErrors then
+        local first = r.writeErrors[1]
+        return "REJECTED", (type(first) == "table" and first.errmsg) or "write error", r
+    end
+    if r.writeConcernError then
+        return "UNKNOWN", r.writeConcernError.errmsg or "write concern error", r
+    end
+    if r.ok ~= 1 then
+        -- 命令级拒绝（参数错、权限不足等）：确定没写，可以按业务失败处理
+        return "REJECTED", r.errmsg or "command failed", r
+    end
+    if r.errmsg then
+        -- ok=1 但仍带 errmsg：命令执行过，写入可能已生效，只能按未决处理
+        return "UNKNOWN", r.errmsg, r
+    end
+    return "CONFIRMED", nil, r
+end
+
+local function run_command(col_obj, ...)
+    return pcall(col_obj.database.runCommand, col_obj.database, ...)
+end
+
+function CMD.raw_critical_update(coll, bson_str)
+    local col_obj = g_db[coll]
+    local called, r =
+        run_command(col_obj, "update", col_obj.name, "updates", { bson_str }, "writeConcern", MAJORITY_WRITE_CONCERN)
+    if not called then
+        return "UNKNOWN", r
+    end
+    local state, err, detail = classify_write(r)
+    if state == "CONFIRMED" then
+        return state, { n = detail.n or 0, nModified = detail.nModified or 0 }
+    end
+    return state, err
+end
+
+function CMD.critical_find_and_modify(coll, doc)
+    local col_obj = g_db[coll]
+    local cmd = { "findAndModify", col_obj.name }
+    -- findAndModify 的参数顺序不敏感，但命令名必须在第一位
+    for _, key in ipairs({ "query", "sort", "remove", "update", "new", "fields", "upsert" }) do
+        if doc[key] ~= nil then
+            cmd[#cmd + 1] = key
+            cmd[#cmd + 1] = doc[key]
+        end
+    end
+    cmd[#cmd + 1] = "writeConcern"
+    cmd[#cmd + 1] = MAJORITY_WRITE_CONCERN
+    local called, r = run_command(col_obj, table.unpack(cmd))
+    if not called then
+        return "UNKNOWN", r
+    end
+    local state, err, detail = classify_write(r)
+    if state == "CONFIRMED" then
+        return state, detail
+    end
+    return state, err
+end
+
+function CMD.critical_find(coll, query, projection)
+    local col_obj = g_db[coll]
+    local called, r = run_command(
+        col_obj,
+        "find",
+        col_obj.name,
+        "filter",
+        query,
+        "projection",
+        projection or {},
+        "limit",
+        1,
+        "singleBatch",
+        true,
+        "readConcern",
+        { level = "majority" }
+    )
+    if not called then
+        return nil, r
+    end
+    if type(r) ~= "table" or r.ok ~= 1 then
+        return nil, (type(r) == "table" and r.errmsg) or r or "no reply"
+    end
+    local batch = r.cursor and r.cursor.firstBatch
+    return batch and batch[1] or nil
+end
+
+-- 探针：确认这个连接确实能走 majority 写。返回 true 或 nil, err
+function CMD.critical_probe(coll)
+    local col_obj = g_db[coll]
+    local called, r = run_command(col_obj, "hello")
+    if not called then
+        return nil, r
+    end
+    if type(r) ~= "table" or r.ok ~= 1 then
+        return nil, (type(r) == "table" and r.errmsg) or r or "no reply"
+    end
+    return true
+end
+
 skynet.start(function()
     init_db(g_name)
     cmd_api.dispatch(CMD)

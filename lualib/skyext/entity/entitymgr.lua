@@ -35,16 +35,44 @@ local DIRTY_RECOVERY_MAX_ATTEMPTS = 8
 -- 停服时同时在卸载的实体数。每个卸载都要写一次库、删一次锁，串行做几千个实体会很久
 local SHUTDOWN_CONCURRENCY = 16
 
-function M.new(type_name, type_config, handler, data_modules)
+function M.new(type_name, type_config, handler, data_modules, module_order)
     local self = setmetatable({
         type_name = type_name,
         type_config = type_config,
         handler = handler,
         data_modules = data_modules or {},
+        -- 配置里的声明顺序。on_load 按它跑，on_unload 必须按逆序跑，
+        -- 否则 B 依赖 A 的初始化、卸载时 A 先被拆掉，B 的 on_unload 就会读到空状态
+        module_order = module_order or {},
         entities = {},
         gates = {},
     }, M)
     return self
+end
+
+-- 有声明顺序就按声明顺序；没有（老调用方/测试）就按名字排序，
+-- 至少保证同一进程内每次一致，不能退化成 pairs 的随机顺序
+function M:_module_names()
+    local names, seen = {}, {}
+    -- 先按声明顺序；order 里的重复名只算一次
+    for _, name in ipairs(self.module_order or {}) do
+        if self.data_modules[name] and not seen[name] then
+            seen[name] = true
+            names[#names + 1] = name
+        end
+    end
+    -- order 没列到的模块不能静默丢掉：按名字排序补在后面，保证一定会被初始化/卸载
+    local rest = {}
+    for name in pairs(self.data_modules) do
+        if not seen[name] then
+            rest[#rest + 1] = name
+        end
+    end
+    table.sort(rest)
+    for _, name in ipairs(rest) do
+        names[#names + 1] = name
+    end
+    return names
 end
 
 local function make_lock_key(type_name, entity_id)
@@ -65,7 +93,8 @@ function M:_init_modules(entity)
     entity.modules = {}
     -- on_load 已经跑完的模块；初始化中途失败时只有这些模块需要补 on_unload
     entity.loaded_modules = {}
-    for name, mod in pairs(self.data_modules) do
+    for _, name in ipairs(self:_module_names()) do
+        local mod = self.data_modules[name]
         if entity.data.modules[name] == nil then
             entity.data.modules[name] = {}
         end
@@ -77,7 +106,8 @@ function M:_call_modules_on_load(entity)
     if not entity.modules then
         return true
     end
-    for name, mod_inst in pairs(entity.modules) do
+    for _, name in ipairs(self:_module_names()) do
+        local mod_inst = entity.modules[name]
         if mod_inst.on_load then
             local ok, err = xpcall(mod_inst.on_load, debug.traceback, mod_inst)
             if not ok then
@@ -104,7 +134,11 @@ function M:_call_modules_on_unload(entity, only_loaded)
         entity.unloaded_modules = done
     end
     local loaded = entity.loaded_modules
-    for name, mod_inst in pairs(entity.modules) do
+    local names = self:_module_names()
+    -- 逆序卸载：后初始化的模块先拆
+    for i = #names, 1, -1 do
+        local name = names[i]
+        local mod_inst = entity.modules[name]
         local need_unload = mod_inst.on_unload ~= nil and not done[name]
         if need_unload and only_loaded then
             need_unload = loaded ~= nil and loaded[name] == true

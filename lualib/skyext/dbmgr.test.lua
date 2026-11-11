@@ -142,6 +142,21 @@ local function harness(handle, stored, defer)
     local collection = {}
     h.collection = collection
 
+    -- 打开 majority 认领路径：state 是 CONFIRMED/REJECTED/UNKNOWN
+    function h:enable_critical(state, detail, read_doc)
+        h.critical_state, h.critical_detail, h.critical_doc = state, detail, read_doc
+        function collection:critical_find_and_modify()
+            return h.critical_state, h.critical_detail
+        end
+        function collection:critical_find(query, fields)
+            h.critical_read = { query = query, fields = fields }
+            if h.critical_read_error then
+                return nil, h.critical_read_error
+            end
+            return h.critical_doc
+        end
+    end
+
     local function run_find_and_modify(opts)
         assert(opts.query, "findAndModify requires query")
         assert(opts.update, "findAndModify requires update")
@@ -455,13 +470,14 @@ t.describe("dbmgr persistence", function()
         h.fam_fail = true
         local doc, err = h.db.load("demo", "role", "rid", 7, { fence = 5, valid = true }, { create = true })
         t.expect(doc).to.be_nil()
+        -- ok=0 是命令级拒绝：确定没写，按失败处理
         t.expect(err).to.equal("fence claim failed")
         t.expect(h.store._fence).to.be_nil()
         t.expect(h.entry).to.be_nil()
         h.fam_fail = "exception"
         doc, err = h.db.load("demo", "role", "rid", 7, { fence = 5, valid = true }, { create = true })
         t.expect(doc).to.be_nil()
-        t.expect(err).to.equal("fence claim failed")
+        t.expect(err).to.equal("fence claim unknown")
         h.fam_fail = nil
         local successor = assert(h.db.load("demo", "role", "rid", 7, { fence = 6, valid = true }, { create = true }))
         t.expect(successor).to.be_type("table")
@@ -978,5 +994,52 @@ t.describe("dbmgr load without create", function()
         local doc, err = h.db.load("demo", "role", "rid", 7, { fence = 4, valid = true })
         t.expect(doc).to.be_nil()
         t.expect(err).to.equal("fence claim failed")
+    end)
+end)
+
+-- P06：majority 认领的三态必须严格区分。UNKNOWN 不能当成未匹配继续 $setOnInsert
+t.describe("fence claim majority 结果分类", function()
+    t.it("returns the document on a confirmed claim", function()
+        local h = harness(nil, nil, true)
+        h:enable_critical("CONFIRMED", { value = { rid = 7 }, lastErrorObject = { n = 1 } })
+        local doc = assert(h.db.load("demo", "role", "rid", 7, { fence = 5, valid = true }, { create = true }))
+        t.expect(doc.rid).to.equal(7)
+        t.expect(h.duplicates).to.equal(0)
+    end)
+
+    t.it("does not insert a duplicate when the claim result is unknown", function()
+        local h = harness(nil, false, true)
+        h:enable_critical("UNKNOWN", "write concern timeout")
+        local doc, err = h.db.load("demo", "role", "rid", 7, { fence = 5, valid = true }, { create = true })
+        t.expect(doc).to.be_nil()
+        t.expect(err).to.equal("fence claim unknown")
+        t.expect(h.duplicates).to.equal(0)
+        t.expect(h.entry).to.be_nil()
+    end)
+
+    t.it("treats a rejected claim as a definite failure", function()
+        local h = harness(nil, nil, true)
+        h:enable_critical("REJECTED", "bad query")
+        local doc, err = h.db.load("demo", "role", "rid", 7, { fence = 5, valid = true }, { create = true })
+        t.expect(doc).to.be_nil()
+        t.expect(err).to.equal("fence claim failed")
+    end)
+
+    t.it("does not turn a failed majority read into not-found", function()
+        local h = harness(nil, false, true)
+        h:enable_critical("CONFIRMED", { value = "\0", lastErrorObject = { n = 0 } }, nil)
+        h.critical_read_error = "read timeout"
+        local doc, err = h.db.load("demo", "role", "rid", 7, { fence = 5, valid = true }, { create = false })
+        t.expect(doc).to.be_nil()
+        t.expect(err).to.equal("fence claim failed")
+    end)
+
+    t.it("reads the unclaimed document with majority read when available", function()
+        local h = harness(nil, false, true)
+        h:enable_critical("CONFIRMED", { value = " ", lastErrorObject = { n = 0 } }, nil)
+        local doc, err = h.db.load("demo", "role", "rid", 7, { fence = 5, valid = true }, { create = false })
+        t.expect(doc).to.be_nil()
+        t.expect(err).to.equal("not found")
+        t.expect(h.critical_read.query).to.equal({ rid = 7 })
     end)
 end)

@@ -124,6 +124,40 @@ function coll_mt:safe_delete(query, single)
     return conn_obj:call("safe_delete", self.coll, query, single)
 end
 
+-- 关键写入：majority + journal，返回三态。
+--   "CONFIRMED", { n, nModified }
+--   "REJECTED", err       确定没写进去
+--   "UNKNOWN", err        可能写进去了，调用方必须按未决处理
+function coll_mt:critical_update(query, update, upsert)
+    local conn_obj = self.db:_route()
+    log.debug("critical_update", "coll", self.coll, "query", query, "upsert", upsert)
+    local bson_obj = bson_encode({
+        q = query,
+        u = update,
+        upsert = upsert or false,
+        multi = false,
+    })
+    return conn_obj:call("raw_critical_update", self.coll, to_lightuserdata(bson_obj))
+end
+
+-- 关键读取：readConcern=majority，避免读到尚未被多数派确认的回滚数据
+function coll_mt:critical_find(query, projection)
+    local conn_obj = self.db:_route()
+    return conn_obj:call("critical_find", self.coll, query, projection)
+end
+
+-- 关键认领：findAndModify + majority 写关注，返回 "CONFIRMED", ret / "REJECTED"/"UNKNOWN", err
+function coll_mt:critical_find_and_modify(doc)
+    local conn_obj = self.db:_route()
+    return conn_obj:call("critical_find_and_modify", self.coll, doc)
+end
+
+-- 探针：这个连接能否正常执行命令（真实环境还应在副本集上验证 majority 写）
+function coll_mt:critical_probe()
+    local conn_obj = self.db:_route()
+    return conn_obj:call("critical_probe", self.coll)
+end
+
 -- 建索引，幂等。
 -- 单参数（推荐，支持复合索引）：create_index { { a = 1 }, { b = 1 }, name = "a_b", unique = true }
 -- 兼容写法（单字段）：create_index({ a = 1 }, { unique = true })

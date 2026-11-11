@@ -265,7 +265,7 @@ local function harness(opts)
         }
     h.entitymgr = entitymgr
     local type_config = opts.type_config or { db_name = "demo", db_coll = "role", id_field = "rid" }
-    h.mgr = entitymgr.new("role", type_config, h.handler, modules)
+    h.mgr = entitymgr.new("role", type_config, h.handler, modules, opts.module_order)
     function h:run_jobs()
         while #self.jobs > 0 do
             table.remove(self.jobs, 1)()
@@ -1372,5 +1372,79 @@ t.describe("可靠消息环境故障", function()
         for i = 1, 4 do
             t.expect(h.pending[i].delivered).to.equal(true)
         end
+    end)
+end)
+
+-- P04：数据模块的初始化/卸载顺序来自 conf.modules，不能依赖 pairs 的随机顺序
+t.describe("数据模块生命周期顺序", function()
+    local function ordered_module(name, order, fail_on_load)
+        return {
+            new = function()
+                return {
+                    on_load = function()
+                        order[#order + 1] = "load:" .. name
+                        if name == fail_on_load then
+                            error("module refused")
+                        end
+                    end,
+                    on_unload = function()
+                        order[#order + 1] = "unload:" .. name
+                    end,
+                }
+            end,
+        }
+    end
+
+    t.it("runs on_load in the declared order and on_unload in reverse", function()
+        local order = {}
+        local h = harness({
+            modules = {
+                a = ordered_module("a", order),
+                b = ordered_module("b", order),
+                c = ordered_module("c", order),
+            },
+            module_order = { "a", "b", "c" },
+        })
+        t.expect(h.mgr:ensure_loaded(7)).to.equal(true)
+        t.expect(h.mgr:unload(7)).to.equal(true)
+        t.expect(order).to.equal({ "load:a", "load:b", "load:c", "unload:c", "unload:b", "unload:a" })
+    end)
+
+    t.it("does not drop modules that the declared order forgot", function()
+        local order = {}
+        local h = harness({
+            modules = {
+                a = ordered_module("a", order),
+                z = ordered_module("z", order),
+            },
+            module_order = { "a" },
+        })
+        t.expect(h.mgr:ensure_loaded(7)).to.equal(true)
+        t.expect(order).to.equal({ "load:a", "load:z" })
+    end)
+
+    t.it("initializes a module listed twice in the order only once", function()
+        local order = {}
+        local h = harness({
+            modules = { a = ordered_module("a", order) },
+            module_order = { "a", "a" },
+        })
+        t.expect(h.mgr:ensure_loaded(7)).to.equal(true)
+        t.expect(order).to.equal({ "load:a" })
+    end)
+
+    t.it("stops at the first failed on_load and unloads only the modules that finished loading", function()
+        local order = {}
+        local h = harness({
+            modules = {
+                a = ordered_module("a", order),
+                b = ordered_module("b", order, "b"),
+                c = ordered_module("c", order),
+            },
+            module_order = { "a", "b", "c" },
+        })
+        t.expect(h.mgr:ensure_loaded(7)).to.equal(false)
+        -- b 的 on_load 抛错，不能对它跑 on_unload（它可能只初始化了一半）
+        t.expect(order).to.equal({ "load:a", "load:b", "unload:a" })
     end)
 end)
