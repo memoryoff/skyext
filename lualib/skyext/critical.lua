@@ -23,6 +23,7 @@ local dbmgr = require "skyext.dbmgr"
 local fingerprint = require "skyext.fingerprint"
 local grant = require "skyext.grant"
 local log = require "skyext.log"
+local metrics = require "skyext.metrics"
 local orm = require "orm"
 
 local M = {}
@@ -69,6 +70,13 @@ M.JOB_STATE = {
     RETRY_WAIT = "RETRY_WAIT",
     MANUAL_REVIEW = "MANUAL_REVIEW",
 }
+
+-- 关键路径必须能观测：三态次数、隔离原因、恢复任务状态。
+-- 这些都是本 VM 的本地累加，抓取时由 .metrics 服务合并
+local m_decisions =
+    metrics.counter("skyext_critical_decisions_total", "Critical operation decisions by status", { "status" })
+local m_quarantined =
+    metrics.counter("skyext_critical_quarantined_total", "Critical caches quarantined by reason", { "reason" })
 
 local function hex(bytes)
     return (bytes:gsub(".", function(c)
@@ -165,6 +173,8 @@ local function decision(status, response, cache_policy, extra)
     for k, v in pairs(extra or {}) do
         out[k] = v
     end
+    -- 所有返回路径都经过这里，计数不会漏
+    m_decisions:inc(1, { status = status })
     return out
 end
 M.decision = decision
@@ -432,6 +442,7 @@ local function commit_core(ctx, req, handlers)
     if not ok_apply then
         -- apply 可能已经改了内存但抛错：COMMIT 从未发出，但内存不可信
         dbmgr.quarantine_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, ctx.handle, "apply raised")
+        m_quarantined:inc(1, { reason = "apply_raised" })
         log.error("critical apply raised", "op_id", req.op_id, "err", applied)
         return decision(M.STATUS.UNKNOWN, nil, M.NO_CACHE, {
             reason = "apply raised",
@@ -496,6 +507,7 @@ local function commit_core(ctx, req, handlers)
         if state ~= "UNKNOWN" then
             -- CAS 未命中但内存已经被 apply 改过：这份内存不能回存，也不能继续用
             dbmgr.quarantine_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, ctx.handle, "commit rejected")
+            m_quarantined:inc(1, { reason = "commit_rejected" })
         end
         log.error("critical commit not confirmed", "op_id", req.op_id, "state", state, "detail", tostring(detail))
         return decision(M.STATUS.UNKNOWN, nil, M.NO_CACHE, {

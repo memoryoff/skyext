@@ -27,6 +27,7 @@ local connection_id = require "skyext.connection_id"
 local gate_owner = require "skyext.gate_owner"
 local node_shutdown_api = require "skyext.node_shutdown_api"
 local log = require "skyext.log"
+local metrics = require "skyext.metrics"
 
 -- 注册名。登录服务同时服务于两个网关，必须知道一条未绑定连接是从哪个网关来的，
 -- 否则踢人会踢错进程。
@@ -53,6 +54,14 @@ local g_handshake_timeout_ms = 5000
 -- 迟到旧 epoch 的下行/绑定计数：迁移期间应当有少量，持续增长说明有 owner 没换 epoch
 local g_stale_pushes = 0
 local g_stale_binds = 0
+local m_stale_pushes = metrics.counter(
+    "skyext_gate_stale_pushes_total",
+    "Downlink packets dropped because of a stale owner epoch",
+    { "gate" }
+)
+local m_stale_binds =
+    metrics.counter("skyext_gate_stale_binds_total", "Owner bind RPCs rejected because of a stale epoch", { "gate" })
+local m_connections = metrics.gauge("skyext_gate_connections", "Live connections on this gate", { "gate" })
 
 local g_self_node
 local function self_node()
@@ -104,6 +113,7 @@ local function reserve(fd, addr)
     g_sessions[conn_id] = session
     g_by_fd[fd] = conn_id
     g_count = g_count + 1
+    m_connections:set(g_count, { gate = "ws" })
     return session
 end
 
@@ -120,6 +130,7 @@ close_session = function(conn_id, reason)
     end
     session.state = STATE.CLOSED
     g_count = g_count - 1
+    m_connections:set(g_count, { gate = "ws" })
     if session.owner_node then
         send_owner(session, "session_closed", self_node(), conn_id)
     else
@@ -338,6 +349,7 @@ function CMD.bind(conn_id, owner_node, owner_service, owner_epoch)
     if not ok then
         log.warn("ws bind rejected", "conn", conn_id, "epoch", owner_epoch, "err", err)
         g_stale_binds = g_stale_binds + 1
+        m_stale_binds:inc(1, { gate = "ws" })
         return false
     end
     return true
@@ -353,6 +365,7 @@ function CMD.push(conn_id, pack, owner_epoch)
     local allowed = gate_owner.push_allowed(session, owner_epoch)
     if not allowed then
         g_stale_pushes = g_stale_pushes + 1
+        m_stale_pushes:inc(1, { gate = "ws" })
         return
     end
     session.pushed = (session.pushed or 0) + 1

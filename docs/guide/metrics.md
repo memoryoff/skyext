@@ -87,12 +87,29 @@ curl http://127.0.0.1:9190/metrics
 | `skyext_reliable_msg_pending{type}` | gauge | 本 VM 观察到的可靠消息 pending 条数（满页时是下界） |
 | `skyext_reliable_msg_retryable_total{type}` | counter | handler 返回环境故障的转换次数 |
 | `skyext_reliable_msg_retry_escalated_total{type}` | counter | 同一 `msg_id` 连续 N 次环境故障后升级人工的次数 |
+| `skyext_critical_decisions_total{status}` | counter | 关键操作的决策次数，`status` 取 `COMMITTED`/`BUSINESS_REJECTED`/`PRECHECK_REJECTED`/`OP_CONFLICT`/`UNKNOWN`/`IN_PROGRESS` 等 |
+| `skyext_critical_quarantined_total{reason}` | counter | 关键缓存被隔离的次数，`reason` 取 `apply_raised`/`apply_rejected_after_mutating`/`commit_rejected` |
+| `skyext_channel_members{channel}` | gauge | 本 VM 上每个频道的成员数 |
+| `skyext_channel_broadcast_skipped_total{channel,reason}` | counter | 频道广播被跳过的次数，`reason` 取 `slow`/`deliver_failed` |
+| `skyext_gate_connections{gate}` | gauge | 网关当前连接数 |
+| `skyext_gate_stale_pushes_total{gate}` | counter | 因 owner_epoch 过期被丢弃的下行包数 |
+| `skyext_gate_stale_binds_total{gate}` | counter | 因 epoch 不够新被拒绝的 owner 绑定数 |
 
 服务名取自 `.launcher`，并且会抹掉实例间的差异：`mongo_conn:center:1` 归到 `mongo_conn`，`http_agent_gm_2` 归到 `http_agent_gm`。不这么做的话服务一扩容时间序列就跟着涨。不是由 `.launcher` 拉起的服务（比如 skynet 自己启动的 logger）归到 `unknown`。
 
 `mqlen` 同时给了求和与最大值：100 个服务各积 1 条和 1 个服务积 100 条，求和是一样的，但后者才是故障。
 
 MongoDB 耗时在调用方计时，量到的是业务真正等了多久——既包含 mongo 的响应时间，也包含连接服务自身的排队。只看 mongo 侧耗时会把「连接数不够」这类问题漏掉。
+
+## 关键路径的告警口径
+
+| 指标 | 建议告警 |
+|---|---|
+| `skyext_critical_decisions_total{status="UNKNOWN"}` | 持续 > 0 说明有未决的关键写入，必须对账；配合 `quarantined` 一起看 |
+| `skyext_critical_quarantined_total` | 任意增长都要人工介入，隔离不会自愈 |
+| `skyext_reliable_msg_pending{type}` | 长期不降说明接收侧卡住（见 `delivery.lua` 的升级计数） |
+| `skyext_gate_stale_pushes_total` | 迁移窗口内有少量正常；持续增长说明有 owner 没换 epoch |
+| `skyext_channel_broadcast_skipped_total` | 突增说明大批成员离线或发送队列满，先看网关连接数 |
 
 ## 合并规则
 
