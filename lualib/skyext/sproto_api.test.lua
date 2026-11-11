@@ -76,7 +76,9 @@ local function harness(opts)
     h.client_host = schema:host("base.package")
     h.client_send = h.client_host:attach(schema)
 
-    local proxy = {}
+    -- 生产里 sprotoloader.load 返回真实 sproto 对象；测试代理只实现了 host/default，
+    -- 主动 RPC 需要 encode/queryproto，其余方法委托给真实 schema
+    local proxy = setmetatable({}, { __index = schema })
     function proxy:host(packagename)
         return schema:host(packagename)
     end
@@ -452,5 +454,70 @@ t.describe("sproto_api fingerprint handoff", function()
             return args
         end, 32)
         t.expect(ran).to.equal(false)
+    end)
+end)
+
+-- P05：主动 RPC 必须先登记 pending 再发送，断连时立刻中止而不是等超时。
+t.describe("sproto_api outbound calls", function()
+    t.it("registers the pending call before sending so a fast response is not lost", function()
+        local h = harness()
+        local seen = false
+        h.api.set_sender(function()
+            seen = true
+            t.expect(h.api.has_pending(1)).to.equal(true)
+        end)
+        local result = h.api.call(h.fd, "role_ping", {}, 1, 0.01)
+        t.expect(seen).to.equal(true)
+        t.expect(result).to.be_nil()
+        t.expect(h.api.has_pending(1)).to.equal(false)
+    end)
+
+    t.it("aborts pending calls as soon as the connection goes away", function()
+        local h = harness()
+        h.api.set_sender(function() end)
+        local done = false
+        skynet.fork(function()
+            h.api.call(h.fd, "role_ping", {}, 3, 10)
+            done = true
+        end)
+        skynet.sleep(0)
+        t.expect(h.api.has_pending(3)).to.equal(true)
+        t.expect(h.api.abort_conn(h.fd)).to.equal(1)
+        skynet.sleep(0)
+        t.expect(done).to.equal(true)
+        t.expect(h.api.has_pending(3)).to.equal(false)
+    end)
+
+    t.it("ignores a call without a session id", function()
+        local h = harness()
+        local sent = false
+        h.api.set_sender(function()
+            sent = true
+        end)
+        t.expect(h.api.call(h.fd, "role_ping", {}, nil, 0.01)).to.be_nil()
+        t.expect(sent).to.equal(false)
+    end)
+end)
+
+-- 响应在 send 期间就回来：此时 skynet.wakeup 还是空操作，必须靠 done 短路
+t.describe("sproto_api fast response", function()
+    t.it("returns a response that arrives while the request is still being sent", function()
+        local h = harness()
+        h.api.set_sender(function()
+            h.api.raw_dispatch(h.fd, "RESPONSE", 7, { name = "pong" }, nil)
+        end)
+        local result = h.api.call(h.fd, "role_ping", {}, 7, 0.01)
+        t.expect(result).to.equal({ name = "pong" })
+        t.expect(h.api.has_pending(7)).to.equal(false)
+    end)
+
+    -- abort 落在发送期间：不能让它睡满 timeout，也不能虚报中止数
+    t.it("aborts a call that is still inside the send path", function()
+        local h = harness()
+        h.api.set_sender(function()
+            t.expect(h.api.abort_conn(h.fd)).to.equal(1)
+        end)
+        t.expect(h.api.call(h.fd, "role_ping", {}, 8, 10)).to.be_nil()
+        t.expect(h.api.has_pending(8)).to.equal(false)
     end)
 end)

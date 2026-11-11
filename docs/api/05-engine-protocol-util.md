@@ -31,7 +31,9 @@
 | --- | --- | --- | --- |
 | `M.notify(conn, name, param)` | 258 | 主动推送（无回包） | — |
 | `M.encode_notify(name, param)` | 264 | **只编码不发送**：会话层要先计数、入重放缓冲、再决定写不写网关——离线时它手上根本没有连接标识，走不了 `notify` | 字节串 |
-| `M.call(fd, name, param, session, timeout)` | 268 | 客户端式请求-响应；`timeout` 默认取配置 `sproto_timeout`（10 秒） | 超时返回 `nil`；正常返回响应体 |
+| `M.call(fd, name, param, session, timeout)` | 338 | 客户端式请求-响应；**先登记 pending 再发送**，编码/发送异常返回 `nil`；同一 session 已有等待者时拒绝；`timeout` 默认取配置 `sproto_timeout`（10 秒） | 超时、断连中止、发送失败都返回 `nil`；正常返回响应体 |
+| `M.abort_conn(fd)` | 391 | 连接断开时中止该连接上所有等待中的调用，立刻返回 `nil` 而不是等超时。**当前仓库没有生产调用点**（`M.call` 也尚无业务调用者），属预留 API；接入时必须与 `M.call` 使用同一个连接标识 | 返回被中止的调用数 |
+| `M.has_pending(session)` | 408 | 只读观测：某个 session 是否还有等待者 | 布尔 |
 | `gen_response` / `dispatch`（见 `sproto_host`） | — | 回包闭包，负责按 request id 打头 | — |
 
 ## `sproto_host.lua`（95 行，sproto 打包/解包封装）

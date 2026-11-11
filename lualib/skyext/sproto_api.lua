@@ -279,6 +279,9 @@ local function wakeup_call(pending, response)
     end
     pending.co = nil
     pending.response = response
+    -- 唤醒可能失败：调用方还没走到 skynet.sleep 时 wakeup 是空操作。
+    -- done 让 call 在 sleep 之前就能短路返回，不能只依赖 wakeup 的副作用
+    pending.done = true
     skynet.wakeup(pending)
     return true
 end
@@ -336,28 +339,82 @@ function M.encode_notify(name, param)
 end
 
 function M.call(fd, name, param, session, timeout)
-    send_package(fd, g_send_request(name, param, session))
+    if session == nil then
+        log.error("sproto call needs a session id", "name", name, "fd", fd)
+        return nil
+    end
+    -- 同一个 session 只能有一个等待者：覆盖会让前一个协程永远等不到唤醒
+    if g_sessions[session] then
+        log.error("duplicate sproto call session", "name", name, "fd", fd, "session", session)
+        return nil
+    end
 
     local pending = {
         name = name,
+        fd = fd,
         co = coroutine.running(),
         response = nil,
     }
+    -- **先登记再发送**：响应可能在同一轮调度里就回来，先 send 会丢掉它，
+    -- 调用方只能等到超时
     g_sessions[session] = pending
+
+    -- 编码也可能抛错（协议名拼错、参数类型不符），必须和发送一起包在 pcall 里
+    local ok, err = pcall(function()
+        send_package(fd, g_send_request(name, param, session))
+    end)
+    if not ok then
+        if g_sessions[session] == pending then
+            g_sessions[session] = nil
+        end
+        log.error("sproto call send failed", "name", name, "fd", fd, "session", session, "err", err)
+        return nil
+    end
+
+    -- 响应/中止可能在发送期间就到了（wakeup 那时还是空操作），不能再去睡满超时
+    if pending.done then
+        if g_sessions[session] == pending then
+            g_sessions[session] = nil
+        end
+        return pending.response
+    end
 
     -- 默认超时时间
     if not timeout then
         timeout = config.get_number("sproto_timeout") or 10
     end
-    skynet.sleep(timeout * 100, pending)
-    g_sessions[session] = nil
+    local slept = pcall(skynet.sleep, timeout * 100, pending)
+    -- 超时和 abort_conn 都可能先清掉条目；只清自己那一条，别误删后来者
+    if g_sessions[session] == pending then
+        g_sessions[session] = nil
+    end
 
-    if pending.co then
+    if not slept or pending.co then
         log.error("call timeout", "name", name, "fd", fd, "session", session)
         return nil
     end
 
     return pending.response
+end
+
+-- 连接断开时调用：所有还在等这条连接响应的调用立刻返回 nil，而不是等到超时。
+-- 返回被中止的调用数
+function M.abort_conn(fd)
+    local aborted = 0
+    for session, pending in pairs(g_sessions) do
+        if pending.fd == fd then
+            g_sessions[session] = nil
+            if wakeup_call(pending, nil) then
+                aborted = aborted + 1
+            end
+        end
+    end
+    return aborted
+end
+
+-- 只读观测：测试与排障用，不参与业务逻辑
+function M.has_pending(session)
+    return g_sessions[session] ~= nil
 end
 
 function M.get_sproto_info()
