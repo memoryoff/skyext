@@ -139,17 +139,17 @@ t.describe("entity.router", function()
             t.expect(c[3]).to.equal("entity_call_loaded")
         end)
 
-        t.it("send_loaded 走 entity_send_loaded，本节点与跨节点都一样", function()
+        t.it("send_loaded 是单向投递，本节点与跨节点都走 send", function()
             local h = harness()
             h.router.send_loaded("role", 2, "peek", "x")
             local c = h.calls[1]
-            t.expect(c.tag).to.equal("skynet.call")
+            t.expect(c.tag).to.equal("skynet.send")
             t.expect(c[3]).to.equal("entity_send_loaded")
             t.expect(c[5]).to.equal("peek")
 
             h.router.send_loaded("role", 1, "peek")
             c = h.calls[2]
-            t.expect(c.tag).to.equal("cluster.call")
+            t.expect(c.tag).to.equal("cluster.send")
             t.expect(c[3]).to.equal("entity_send_loaded")
         end)
     end)

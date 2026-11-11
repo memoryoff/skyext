@@ -11,7 +11,7 @@
 | --- | --- | --- | --- |
 | `CMD.register(services)` | 628 | 把本节点登记为若干服务的提供者 | — |
 | `CMD.unregister(services)` | 640 | 摘掉 | — |
-| `CMD.query_service(service)` | 665 | 返回该服务当前在线节点列表（按节点名排序） | — |
+| `CMD.query_service(service)`（返回 `nodes, state, last_verified_at`；`state` 为 `UNCONFIRMED`/`EMPTY_CONFIRMED`/`VERIFIED`） | 665 | 返回该服务当前在线节点列表（按节点名排序） | — |
 | `CMD.shutdown()` | 656 | 停心跳，之后不再注册。**不撤租约**：租约是节点级的，本节点别的服务还挂在上面；真正的键消失发生在 `node_shutdown` 最后撤销节点租约时 | — |
 | `leaseid()` | 58 | 取当前租约；`g_closed` 或租约无效时返回 `nil` | — |
 | `etcd_register_node` / `etcd_do_register_node` | 138 / 88 | `setnx` 写节点键（带租约），成功记 `mod_revision` | 返回 `revision` |
@@ -40,8 +40,8 @@
 | `CMD.unload_entity(entity_id)` | 193 | 卸载 | — |
 | `CMD.bind_session(entity_id, conn_id, session_mode)` | 211 | 登录：绑定会话并返回续接凭据 `nonce`、`session_epoch`、模式。`conn_id` 必须是合法的 ConnectionIdentity v1，非法值返回 `PARAM_ERROR` | 实体被别的节点持有时**向它要一次**（`unload_entity` 顺带踢掉旧连接）；错误码区分 `ENTITY_NOT_FOUND` / `LOCK_FAILED` / `IN_OTHER_NODE` / `SESSION_CLOSED` |
 | `CMD.resume_session(entity_id, conn_id, nonce, recv, session_mode, session_epoch)` | 253 | 断线续接 | **绝不加载实体**：续接不验 token、不查库，能触发加载就等于开放一个无认证接口。返回 `RESUME_UNAVAILABLE` 表示状态已不存在 |
-| `CMD.entity_send_loaded(entity_id, cmd, ...)` | 144 | 只对已加载实体发消息，不加载不转发；实体不在返回 `false` | — |
-| `CMD.client_msg(conn_id, data)` | 288 | gate 转来的上行包；`conn_id` 非法时丢弃 | — |
+| `CMD.entity_send_loaded(entity_id, cmd, ...)` | 145 | 只对已加载实体发消息，不加载不转发；实体不在丢弃 | — |
+| `CMD.client_msg(conn_id, data)` | 311 | gate 转来的上行包；`conn_id` 非法时丢弃 | — |
 | `CMD.session_closed(conn_id)` | 289 | gate 上的连接断开；`conn_id` 非法时丢弃 | — |
 | `CMD.shutdown()` | 200 | 停服：不再加载、卸载全部；返回没卸掉的数量（可再调一次） | 卸干净后本服务不再加锁；锁键消失同样推迟到撤节点租约 |
 | `CMD.start(conf)` | 308 | 起服务、注册名字、按 `client_enabled` 装协议模块 | 模块 `request` 必须返回表，否则断言失败 |

@@ -53,13 +53,16 @@ function M.send(type_name, entity_id, cmd, ...)
     end
 end
 
--- 只对已经在内存里的实体发消息；实体不在就返回 false，不加载
+-- 只对已经在内存里的实体发消息；实体不在就丢弃，不加载。
+-- 和 M.send 一样是单向投递：不等 handler 返回，也不能从实体 handler 里对同一实体
+-- 调用后等待自己（call_loaded 才有返回值，也只用于不会重入的调用方）
 function M.send_loaded(type_name, entity_id, cmd, ...)
     local node, service_name = get_target(type_name, entity_id)
     if node == self_node() then
-        return skynet.call(service_name, "lua", "entity_send_loaded", entity_id, cmd, ...)
+        skynet.send(service_name, "lua", "entity_send_loaded", entity_id, cmd, ...)
+    else
+        cluster.send(node, service_name, "entity_send_loaded", entity_id, cmd, ...)
     end
-    return cluster.call(node, service_name, "entity_send_loaded", entity_id, cmd, ...)
 end
 
 -- 唤醒目标实体去读取自己的 pending 消息。

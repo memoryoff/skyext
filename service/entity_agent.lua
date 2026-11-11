@@ -149,11 +149,10 @@ function CMD.entity_send_loaded(entity_id, cmd, ...)
         return false
     end
     local args = table.pack(...)
-    local ok, result = entitymgr:with_loaded_entity(entity_id, function(entity)
+    local ok = entitymgr:with_loaded_entity(entity_id, function(entity)
         handler_func(entity, table.unpack(args, 1, args.n))
-        return true
     end)
-    return ok and result == true
+    return ok == true
 end
 
 function CMD.entity_send(entity_id, cmd, ...)

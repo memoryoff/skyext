@@ -460,13 +460,24 @@ function service_mt:init()
     if self.inited then
         return
     end
-    self.inited = true -- 必须置位,否则每次 ensure_init(query_service_info)都重复 fork watch 循环,每条循环持有 1 条 etcd watch 长连接不释放
 
-    local ok, err = xpcall(self.first_query, debug.traceback, self)
+    local ok, ret = xpcall(self.first_query, debug.traceback, self)
+    -- first_query 失败时返回 false 而不是抛错。这里既不置 inited，也不把空表当成
+    -- "确认没有节点"：query_service 会带出 UNCONFIRMED，客户端据此拒绝把它当权威。
+    -- 下一次 ensure_init 会重新尝试首次查询。
     if not ok then
+        -- 真正的异常（数据损坏、assert 失败）继续抛，不能被静默降级成"没有节点"
         self.inited = false
-        error(err)
+        error(ret, 0)
     end
+    if ret == false then
+        -- etcd 读失败：保留 UNCONFIRMED，允许下一次重试，但不把空表当权威
+        self.state = nil
+        self.inited = false
+        log.warn("cluster_discovery first query failed, state stays unconfirmed", "service", self.service)
+        return false
+    end
+    self.inited = true
     skynet.fork(function()
         while true do
             local ok, err = xpcall(self.watch, debug.traceback, self)
@@ -664,7 +675,10 @@ end
 
 function CMD.query_service(service)
     local s = get_service_obj(service)
-    return s:get_nodes()
+    -- 第二、三个返回值给需要区分"确认没有节点"与"还没查成功"的调用方；
+    -- 只取第一个返回值的旧调用方行为不变
+    local state = (s.inited and s.state) or "UNCONFIRMED"
+    return s:get_nodes(), state, s.last_verified_at
 end
 
 skynet.start(function()

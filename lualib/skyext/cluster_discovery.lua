@@ -25,6 +25,18 @@ function M.shutdown()
     return skynet.call(g_cluster_discovery_service, "lua", "shutdown")
 end
 
+-- 发现结果的可信状态。空列表有两种完全不同的含义：
+--   UNCONFIRMED      还没有成功查过 etcd，空表不代表"没有节点"
+--   EMPTY_CONFIRMED  etcd 明确答复没有这个服务的节点
+--   VERIFIED         有节点，且这份列表是最近一次确认过的
+-- 调用方（例如按节点列表决定是否接管资源）必须看状态，不能只看 #nodes == 0。
+local STATE = {
+    UNCONFIRMED = "UNCONFIRMED",
+    EMPTY_CONFIRMED = "EMPTY_CONFIRMED",
+    VERIFIED = "VERIFIED",
+}
+M.STATE = STATE
+
 local g_services_cache = {} -- service -> service_obj
 local service_mt = {}
 service_mt.__index = service_mt
@@ -54,14 +66,54 @@ function service_mt:init()
         return
     end
 
-    local nodes = skynet.call(g_cluster_discovery_service, "lua", "query_service", self.service)
+    local nodes, state, verified_at = skynet.call(g_cluster_discovery_service, "lua", "query_service", self.service)
+    if state == STATE.UNCONFIRMED then
+        -- 服务端首次查询没成功：保留 UNCONFIRMED，不能把空表当成"确认没有节点"
+        self.nodes = {}
+        self.state = STATE.UNCONFIRMED
+        self.last_verified_at = nil
+        self.inited = false
+        return false
+    end
+    self.nodes = nodes
+    self.last_verified_at = verified_at or os.time()
+    self.state = (#nodes > 0) and STATE.VERIFIED or STATE.EMPTY_CONFIRMED
     self.inited = true
-    self:update(nodes)
     log.info("cluster_discovery service init", "service", self.service, "nodes", self.nodes)
 end
 
 function service_mt:update(nodes)
     self.nodes = nodes
+    self.last_verified_at = os.time()
+    self.state = (#nodes > 0) and STATE.VERIFIED or STATE.EMPTY_CONFIRMED
+end
+
+-- 阻塞版本：必要时先完成首次查询。返回的 state 一定是确认过的
+function M.state(service)
+    local service_obj = get_service_obj(service)
+    return {
+        state = service_obj.state,
+        nodes = service_obj.nodes,
+        last_verified_at = service_obj.last_verified_at,
+    }
+end
+
+-- 非阻塞版本：不触发首次查询。还没查过时明确返回 UNCONFIRMED，
+-- 调用方不能把 nodes={} 当成"确认没有节点"
+function M.peek(service)
+    local service_obj = g_services_cache[service]
+    if not service_obj or not service_obj.inited or not service_obj.state then
+        return {
+            state = STATE.UNCONFIRMED,
+            nodes = {},
+            last_verified_at = nil,
+        }
+    end
+    return {
+        state = service_obj.state,
+        nodes = service_obj.nodes,
+        last_verified_at = service_obj.last_verified_at,
+    }
 end
 
 -- 随机一个节点

@@ -28,7 +28,7 @@ local function harness()
             end,
             call = function(addr, proto, cmd, arg)
                 h.calls[#h.calls + 1] = { addr = addr, proto = proto, cmd = cmd, arg = arg }
-                return h.nodes_reply[arg] or {}
+                return h.nodes_reply[arg] or {}, h.state_reply[arg], h.verified_reply[arg]
             end,
         }, { __index = skynet }),
         ["skyext.event_channel_api"] = {
@@ -58,6 +58,8 @@ local function harness()
     }, { __index = _G })
 
     h.nodes_reply = {}
+    h.state_reply = {}
+    h.verified_reply = {}
 
     h.load = function()
         h.M = assert(loadfile(source, "t", env))()
@@ -198,5 +200,57 @@ t.describe("cluster_discovery client change subscription", function()
         -- 事件先于首查到达时若直接建缓存，这份没经过发现服务校验的列表会一直被当真
         t.expect(M.nodes("entity:guild")).to.equal({ "guildnode1" })
         t.expect(#h.calls).to.equal(1)
+    end)
+end)
+
+t.describe("cluster_discovery 发现状态", function()
+    t.it("首次查询之前是 UNCONFIRMED，不能把空列表当成没有节点", function()
+        local h = harness()
+        local M = h.start()
+        local peek = M.peek("entity:role")
+        t.expect(peek.state).to.equal(M.STATE.UNCONFIRMED)
+        t.expect(peek.nodes).to.equal({})
+        t.expect(peek.last_verified_at).to.be_nil()
+    end)
+
+    t.it("查询到节点后是 VERIFIED 并记录确认时间", function()
+        local h = harness()
+        h.nodes_reply["entity:role"] = { "node1", "node2" }
+        local M = h.start()
+        local st = M.state("entity:role")
+        t.expect(st.state).to.equal(M.STATE.VERIFIED)
+        t.expect(st.nodes).to.equal({ "node1", "node2" })
+        t.expect(type(st.last_verified_at)).to.equal("number")
+    end)
+
+    t.it("etcd 明确答复没有节点时是 EMPTY_CONFIRMED", function()
+        local h = harness()
+        h.nodes_reply["entity:role"] = {}
+        local M = h.start()
+        local st = M.state("entity:role")
+        t.expect(st.state).to.equal(M.STATE.EMPTY_CONFIRMED)
+        t.expect(st.nodes).to.equal({})
+        t.expect(type(st.last_verified_at)).to.equal("number")
+    end)
+
+    t.it("服务端首查失败时保持 UNCONFIRMED，不把空表当权威", function()
+        local h = harness()
+        h.state_reply["entity:role"] = "UNCONFIRMED"
+        local M = h.start()
+        local st = M.state("entity:role")
+        t.expect(st.state).to.equal(M.STATE.UNCONFIRMED)
+        t.expect(st.nodes).to.equal({})
+        t.expect(st.last_verified_at).to.be_nil()
+    end)
+
+    t.it("服务变更推送会同时刷新状态和确认时间", function()
+        local h = harness()
+        h.nodes_reply["entity:role"] = { "node1" }
+        local M = h.start()
+        t.expect(M.state("entity:role").state).to.equal(M.STATE.VERIFIED)
+        h.on_change("entity:role", {})
+        local st = M.peek("entity:role")
+        t.expect(st.state).to.equal(M.STATE.EMPTY_CONFIRMED)
+        t.expect(type(st.last_verified_at)).to.equal("number")
     end)
 end)
