@@ -97,8 +97,8 @@ ping.response { sent, acked, session_epoch }
 |---|---|---|
 | `bind(conn_id, owner_node, owner_service, owner_epoch)` | 绑定所有权；`epoch <= 当前` 一律拒绝（相等是重复投递，小于是迟到 RPC） | `false` |
 | `push(conn_id, pack, owner_epoch)` | 只写 `epoch == 当前 owner_epoch` 且未越过屏障的包 | 静默丢弃 + `stale_pushes` 计数 |
-| `freeze_owner(conn_id, owner_epoch, barrier_id)` | 从这一刻起丢弃 `epoch <= owner_epoch` 的下行；返回已写出的包数 | `nil, reason` |
-| `resume_owner(conn_id, new_epoch, owner_node, owner_service)` | 解冻并交出所有权；`new_epoch` 必须**严格更大** | `false` |
+| `freeze_owner(conn_id, owner_epoch, barrier_id)` | 从这一刻起丢弃 `epoch <= owner_epoch` 的下行；返回**网关本次所有权期间受理的下行数**（含写失败尝试），**不是**客户端已收包数 | `nil, reason` |
+| `resume_owner(conn_id, new_epoch, owner_node, owner_service)` | 解冻并交出所有权；`new_epoch` 必须**严格更大**；受理计数归零 | `false` |
 | `owner_state(conn_id)` / `stats()` | 只读观测 | — |
 
 `owner_epoch` 的推进点：

@@ -42,6 +42,9 @@ function M.bind(session, epoch, owner_node, owner_service)
     session.owner_service = owner_service
     session.frozen_epoch = nil
     session.barrier_id = nil
+    -- 每次换 owner 重新计数：这个数字只描述"本次所有权期间网关受理了多少下行"，
+    -- 不是客户端已收包数，不能与 Role 的 io_.acked 直接比对
+    session.pushed = 0
     return true
 end
 
@@ -69,7 +72,10 @@ function M.push_allowed(session, epoch)
 end
 
 -- 屏障：从这一刻起，epoch <= frozen_epoch 的下行全部丢弃。
--- 返回已经写出的包数，供迁移方确认"屏障之前的东西客户端都收到了"。
+--
+-- 返回的 `sent` 是**网关本次所有权期间受理的下行数**（含写失败的尝试），
+-- 只用来判断"屏障前有没有包被漏在队列里"。**客户端实际收到多少，只有 Role 的
+-- `io_.sent` / `io_.acked` 说了算**——那两个才是重放与 ACK 的权威计数。
 function M.freeze(session, epoch, barrier_id)
     local e, err = check_epoch(epoch)
     if not e then
@@ -98,6 +104,7 @@ function M.resume(session, new_epoch, owner_node, owner_service)
     session.owner_service = owner_service
     session.frozen_epoch = nil
     session.barrier_id = nil
+    session.pushed = 0
     return true
 end
 

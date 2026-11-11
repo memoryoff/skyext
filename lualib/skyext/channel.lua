@@ -119,10 +119,14 @@ function channel_mt:leave(rid)
     return true
 end
 
--- 广播。deliver(rid, payload) 返回 true 表示投递成功。
--- 返回 { delivered, skipped, slow_skipped, batches }；payload 由调用方决定，
--- 通常是已编码好的包，这样一次广播只编码一次。
-function channel_mt:broadcast(payload, deliver)
+-- 广播。deliver(rid, payload) 必须返回布尔 true 才算投递成功（truthy 非 true 按失败处理，
+-- 避免 deliver 忘了 return 却被当成成功）。payload 由调用方决定，通常是已编码好的包，
+-- 这样一次广播只编码一次。
+--
+-- on_batch 在每批结束时调用一次，**调用方必须在这里 yield**（例如 `skynet.sleep(0)`）：
+-- 本模块是纯 Lua，不能自己 yield。不分批的话一次大 fanout 会长时间占住实体队列。
+-- 返回 { delivered, skipped, slow_skipped, batches }
+function channel_mt:broadcast(payload, deliver, on_batch)
     if type(deliver) ~= "function" then
         return nil, "deliver must be a function"
     end
@@ -158,11 +162,17 @@ function channel_mt:broadcast(payload, deliver)
             if batch >= self.batch_size then
                 stats.batches = stats.batches + 1
                 batch = 0
+                if on_batch then
+                    on_batch(stats.batches)
+                end
             end
         end
     end
     if batch > 0 then
         stats.batches = stats.batches + 1
+        if on_batch then
+            on_batch(stats.batches)
+        end
     end
     return stats
 end

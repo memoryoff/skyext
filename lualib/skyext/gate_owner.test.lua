@@ -98,6 +98,21 @@ t.describe("gate_owner", function()
         t.expect(gate_owner.push_allowed(s, 2)).to.be_nil()
     end)
 
+    -- 屏障返回的计数只描述"本次所有权期间网关受理了多少下行"，
+    -- 换 owner 必须归零，否则迁移方会把它当成客户端已收包数
+    t.it("resets the accepted-push counter whenever ownership moves", function()
+        local s = session()
+        gate_owner.bind(s, 1, "node1", ".entity_agent:role:1")
+        s.pushed = 9
+        gate_owner.bind(s, 2, "node2", ".entity_agent:role:1")
+        t.expect(s.pushed).to.equal(0)
+
+        s.pushed = 4
+        gate_owner.freeze(s, 2, "barrier-1")
+        gate_owner.resume(s, 3, "node3", ".entity_agent:role:1")
+        t.expect(s.pushed).to.equal(0)
+    end)
+
     t.it("reports its state without exposing the whole session", function()
         local s = session()
         gate_owner.bind(s, 5, "node1", ".entity_agent:role:1")

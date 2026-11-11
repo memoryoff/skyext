@@ -156,13 +156,12 @@ function M.record(orders_coll, opts)
         return nil, "order not readable"
     end
 
-    -- 用驱动给的 updatedExisting 判断是否新建；没有这个字段时退回"创建时间等于本次 now"
+    -- 用驱动给的 updatedExisting 判断是否新建。没有这个字段时返回 nil 而不是猜：
+    -- 用"创建时间等于本次 now"兜底，同一秒内的重复回调会误报 created=true
     local leo = type(ret.lastErrorObject) == "table" and ret.lastErrorObject or nil
     local created
     if leo and leo.updatedExisting ~= nil then
         created = leo.updatedExisting == false
-    else
-        created = order.created_at == now and order.status == M.STATUS.VERIFIED_RECEIVED
     end
     -- 重复回调必须与首次回调完全一致：金额/币种/账号任一不同都是串单或伪造
     if order.amount ~= opts.amount or order.currency ~= currency or order.rid ~= opts.rid then
@@ -257,11 +256,13 @@ function M.grant(entity, order, handlers, opts)
 
     if result.status == critical.STATUS.COMMITTED then
         if opts.orders_coll then
+            -- from 必须取订单当前状态：grant 允许从 VERIFIED_RECEIVED 直接进来
+            -- （回调同步发奖），写死 GRANTING 会让 CAS 不命中、订单永远停在原状态
             M.transition(
                 opts.orders_coll,
                 order.provider,
                 order.order_id,
-                M.STATUS.GRANTING,
+                order.status,
                 M.STATUS.GRANTED,
                 { granted_at = opts.now or os.time() },
                 opts.now

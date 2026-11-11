@@ -172,6 +172,15 @@ end
 -- message_fault 为 true 表示错在消息本身（没有对应 handler、handler 抛错），
 -- 重投多少次结果都一样，要计入毒消息次数；为 false 表示环境问题
 -- （租约失效、落库失败、ack 写库失败），换个时间重投就能成功，不计数。
+-- 实体是否仍然可写。临时实体不持有 etcd 锁，`is_valid(nil)` 恒为 false，
+-- 直接用它会把这个实体当成"租约过期"：每个请求执行完就被标 invalid、踢客户端、卸载。
+local function entity_lease_ok(entity)
+    if entity.persistent == false then
+        return true
+    end
+    return distributed_lock.is_valid(entity.handle)
+end
+
 function M:_deliver_one(entity, msg)
     local handler_func = self.handler.handlers and self.handler.handlers[msg.cmd]
     if not handler_func then
@@ -191,14 +200,14 @@ function M:_deliver_one(entity, msg)
         -- 环境故障：不 save、不 mark_delivered、不计 attempts、不进 DLQ
         return false, result.reason, false, true
     end
-    if entity.invalid or not distributed_lock.is_valid(entity.handle) then
+    if entity.invalid or not entity_lease_ok(entity) then
         return false, "lease expired during handler", false
     end
     local tc = self.type_config
     if not dbmgr.save(tc.db_name, tc.db_coll, tc.id_field, entity.id) then
         return false, "entity persistence failed", false
     end
-    if entity.invalid or not distributed_lock.is_valid(entity.handle) then
+    if entity.invalid or not entity_lease_ok(entity) then
         return false, "lease expired during persistence", false
     end
     local acked, reason = reliable_msg().mark_delivered(msg.msg_id)
@@ -278,7 +287,7 @@ function M:_deliver_pending_msgs(entity)
     local quarantined = 0
     local delivered = 0
     for _, msg in ipairs(msgs) do
-        if entity.invalid or not distributed_lock.is_valid(entity.handle) then
+        if entity.invalid or not entity_lease_ok(entity) then
             return false, "lease expired"
         end
         local ok, reason, message_fault, retryable = self:_deliver_one(entity, msg)
@@ -486,7 +495,7 @@ function M:_cancel_delivery_retry(entity)
 end
 
 function M:_schedule_delivery_retry(entity)
-    if entity.delivery_retry or entity.invalid or entity.unloading or not distributed_lock.is_valid(entity.handle) then
+    if entity.delivery_retry or entity.invalid or entity.unloading or not entity_lease_ok(entity) then
         return
     end
     entity.delivery_retry = timer.timeout("reliable_retry:" .. tostring(entity.id), 5, function()
@@ -716,7 +725,7 @@ function M:with_entity(entity_id, f)
             return false, entity, owner
         end
         local result = table.pack(pcall(f, entity))
-        if entity.invalid or not distributed_lock.is_valid(entity.handle) then
+        if entity.invalid or not entity_lease_ok(entity) then
             self:_on_lock_expired(entity_id, entity.handle)
             return false, "entity lease expired during handler"
         end
@@ -734,7 +743,7 @@ function M:with_loaded_entity(entity_id, f)
             return false, M.NOT_LOADED
         end
         local result = table.pack(pcall(f, entity))
-        if not distributed_lock.is_valid(entity.handle) then
+        if not entity_lease_ok(entity) then
             self:_on_lock_expired(entity_id, entity.handle)
             return false, "entity lease expired during handler"
         end
@@ -783,9 +792,11 @@ end
 -- 锁在别的节点手里时 reason 为 "lock held"，owner 是持锁节点，调用方可以把唤醒转给它。
 -- opts.loaded_only 为真时只投给本地已加载的实体，不会为了投递去加载
 function M:deliver_pending(entity_id, opts)
-    -- 临时实体没有持久化消息队列：既不该为它去加载实体，也没有 pending 可投
+    -- 临时实体没有持久化消息队列：既不该为它去加载实体，也没有 pending 可投。
+    -- 返回 false 而不是 true：调用方（router.reliable_send 的唤醒路径）会据此知道
+    -- 消息并没有被处理，而不是以为已经投递成功、任由它永远留在 PENDING
     if self.type_config.persistent == false then
-        return true
+        return false, "ephemeral entity has no reliable queue"
     end
     local run = (opts and opts.loaded_only) and self.with_loaded_entity or self.with_entity
     local result = table.pack(pcall(run, self, entity_id, function(entity)
@@ -969,6 +980,9 @@ function M:_unload_entity(entity)
             end
             entity.unload_hooks_run = true
         end
+        -- 持久路径在 _release_lock 里踢；临时实体没有那一步，必须自己踢，
+        -- 否则会话会挂在已经销毁的实体上，后续下行全部落空
+        self:_kick_client(entity, "ephemeral entity unloaded")
         self:_forget_entity(entity)
         log.info("ephemeral entity unloaded", "type", self.type_name, "id", entity_id)
         return true
@@ -979,7 +993,7 @@ function M:_unload_entity(entity)
         return self:_release_lock(entity)
     end
 
-    if entity.invalid or not distributed_lock.is_valid(entity.handle) then
+    if entity.invalid or not entity_lease_ok(entity) then
         entity.invalid = true
         self:_kick_client(entity, "lease lost")
         -- 干净的缓存直接丢掉就行，库里已经是最新的
@@ -1076,20 +1090,14 @@ end
 
 function M:touch(entity_id)
     local entity = self.entities[entity_id]
-    if
-        entity
-        and not entity.invalid
-        and not entity.unloading
-        and distributed_lock.is_valid(entity.handle)
-        and not entity.session
-    then
+    if entity and not entity.invalid and not entity.unloading and entity_lease_ok(entity) and not entity.session then
         self:_start_unload_timer(entity)
     end
 end
 
 function M:get(entity_id)
     local entity = self.entities[entity_id]
-    if entity and not entity.invalid and not entity.unloading and distributed_lock.is_valid(entity.handle) then
+    if entity and not entity.invalid and not entity.unloading and entity_lease_ok(entity) then
         return entity
     end
 end

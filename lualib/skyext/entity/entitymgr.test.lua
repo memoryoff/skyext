@@ -1536,11 +1536,40 @@ t.describe("临时实体", function()
         t.expect(#h.handles).to.equal(0)
     end)
 
-    t.it("does not load an entity just to look for pending messages", function()
+    -- 临时实体没有队列：必须明确回报"没有投递"，不能让调用方以为消息已被处理
+    t.it("reports that an ephemeral entity has no reliable queue", function()
         local h = ephemeral()
-        t.expect(h.mgr:deliver_pending(7)).to.equal(true)
+        local ok, reason = h.mgr:deliver_pending(7)
+        t.expect(ok).to.equal(false)
+        t.expect(reason).to.equal("ephemeral entity has no reliable queue")
         t.expect(h.mgr:count()).to.equal(0)
         t.expect(index_of(h.events, "load")).to.be_nil()
+    end)
+
+    -- 主路径：临时实体没有 etcd 锁，with_entity 不能把 is_valid(nil) 当成租约过期，
+    -- 否则每个请求"执行了但报失败"，实体还会被标 invalid 并卸载
+    t.it("serves requests through with_entity without a lease", function()
+        local h = ephemeral()
+        local ran = 0
+        local ok, value = h.mgr:with_entity(7, function(entity)
+            ran = ran + 1
+            return entity.id
+        end)
+        t.expect(ok).to.equal(true)
+        t.expect(value).to.equal(7)
+        t.expect(ran).to.equal(1)
+        t.expect(h.mgr:count()).to.equal(1)
+        t.expect(h.mgr:get(7)).to.exist()
+    end)
+
+    t.it("serves loaded-only calls without a lease", function()
+        local h = ephemeral()
+        assert(h.mgr:ensure_loaded(7))
+        local ok, value = h.mgr:with_loaded_entity(7, function(entity)
+            return entity.id
+        end)
+        t.expect(ok).to.equal(true)
+        t.expect(value).to.equal(7)
     end)
 
     -- 持久实体不受影响：仍然要拿锁、读库

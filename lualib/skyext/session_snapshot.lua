@@ -310,6 +310,9 @@ function M.restore(snapshot, expected_epoch, opts)
         end
         io_.out_buf[seq] = pack
         io_.out_bytes = io_.out_bytes + #pack
+        if io_.out_bytes > M.MAX_OUT_BYTES then
+            return nil, M.ERR.TOO_LARGE
+        end
     end
     for req_id, entry in pairs(snapshot.resp_cache or {}) do
         io_.resp_cache[req_id] = { name = entry.name, pack = entry.pack }

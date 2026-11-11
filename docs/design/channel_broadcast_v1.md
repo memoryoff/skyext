@@ -21,7 +21,7 @@ local c = channel.new({ name = "world", max_members = 5000, batch_size = 256, ma
                         authorize = function(rid, name) return true end })
 c:join(rid)      -- 幂等；已订阅会清掉 slow 标记（成员主动回来就算恢复）
 c:leave(rid)
-c:broadcast(payload, deliver)  -- deliver(rid, payload) -> true 表示投递成功
+c:broadcast(payload, deliver, on_batch)  -- deliver 必须返回布尔 true；on_batch 用来 yield
 c:size() / c:has(rid) / c:stats()
 ```
 
@@ -32,7 +32,7 @@ c:size() / c:has(rid) / c:stats()
 
 | 策略 | 原因 |
 |---|---|
-| 单次广播按 `batch_size` 分批 | 一次 fanout 不能长时间占住实体队列 |
+| 单次广播按 `batch_size` 分批，每批结束回调 `on_batch` | 本模块是纯 Lua，不能自己 yield；调用方必须在 `on_batch` 里让出，否则一次 fanout 会长时间占住实体队列 |
 | 投递失败只计 `skipped`，不重试 | 频道消息**可丢**；重试会把慢消费者拖成雪崩 |
 | 连续 `max_failures` 次失败标记 `slow`，后续广播跳过 | 保护大多数，而不是保证每个都收到 |
 | 成员重新 `join` 清除 `slow` | 没有额外的心跳机制，join 就是"我回来了"的信号 |

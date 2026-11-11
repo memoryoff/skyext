@@ -123,6 +123,32 @@ t.describe("channel", function()
         t.expect(stats.batches).to.equal(3)
     end)
 
+    -- 分批的意义是让调用方有机会 yield；本模块是纯 Lua，不能自己让出
+    t.it("invokes the batch callback so the caller can yield", function()
+        local c = assert(channel.new({ name = "world", batch_size = 2 }))
+        for rid = 1, 5 do
+            c:join(rid)
+        end
+        local batches = {}
+        assert(c:broadcast("PACK", function()
+            return true
+        end, function(n)
+            batches[#batches + 1] = n
+        end))
+        t.expect(batches).to.equal({ 1, 2, 3 })
+    end)
+
+    -- deliver 忘了 return 时不能被当成成功
+    t.it("treats a non-boolean deliver result as a failure", function()
+        local c = assert(channel.new({ name = "world", max_failures = 1 }))
+        c:join(1)
+        local stats = assert(c:broadcast("PACK", function()
+            return 1
+        end))
+        t.expect(stats.delivered).to.equal(0)
+        t.expect(stats.skipped).to.equal(1)
+    end)
+
     t.it("survives a deliver function that raises", function()
         local c = assert(channel.new({ name = "world", max_failures = 1 }))
         c:join(1)

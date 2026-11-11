@@ -233,6 +233,20 @@ t.describe("charge_order 发奖", function()
         return h
     end
 
+    -- 回调可以直接从 VERIFIED_RECEIVED 发奖，不必先手动推到 GRANTING
+    t.it("marks the order granted from the state it is actually in", function()
+        local h = harness_with_critical({ status = "COMMITTED" })
+        local order = assert(h.record())
+        local result = h.charge.grant({ rid = 7 }, order, {}, {
+            capability = {},
+            hash_fn = HASH,
+            orders_coll = h.orders,
+            now = 110,
+        })
+        t.expect(result.status).to.equal("COMMITTED")
+        t.expect(h.orders.store["wechat:ORDER-1"].status).to.equal("GRANTED")
+    end)
+
     t.it("marks the order granted only after the critical commit is confirmed", function()
         local h = harness_with_critical({ status = "COMMITTED" })
         local order = assert(h.record())
