@@ -689,6 +689,28 @@ mongo_config.entity = {
 
 ---
 
+## 临时实体（`persistent = false`）
+
+配置里 `persistent = false` 的实体类型走另一条加载路径：
+
+| 项目 | 持久实体 | 临时实体 |
+|---|---|---|
+| etcd 租约 / fence | 必须持有 | **不占锁**，`handle = nil` |
+| `dbmgr.load / unload / recover` | 必走 | **完全跳过**，不读写 Mongo |
+| 可靠消息队列 | 有 pending 表 | 没有；`deliver_pending` 直接返回 |
+| 数据来源 | 库里的文档 | `type_config.default` 的**深拷贝** |
+| 模块 on_load / on_unload 顺序 | 按 `conf.modules` 正序/逆序 | 完全一致 |
+| 实例代际 | — | `entity.generation`，每次创建递增 |
+| 节点崩溃 | 落库恢复 | 状态丢失，玩法层负责重建 |
+
+`generation` 是给玩法层用的：同一个 ID 卸载后重建会拿到新的代际，旧实例上迟到的
+消息或定时器回调可以据此丢弃，避免上一局的残留事件打到新一局。
+
+**边界**：临时实体不参与 `unload_all` 的落库阶段（没有库可落），但会正常跑
+`on_unload` 钩子并释放内存；`dbmgr` 的关键写入状态机对它们不适用。
+
+---
+
 ## 验证方法
 
 1. **启动测试**：配置实体类型，启动 entity_agentmgr，验证 N 个 entity_agent 正常注册到 cluster_discovery

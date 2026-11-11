@@ -1448,3 +1448,106 @@ t.describe("数据模块生命周期顺序", function()
         t.expect(order).to.equal({ "load:a", "load:b", "unload:a" })
     end)
 end)
+
+-- P11：临时实体（persistent = false）不占锁、不读写 Mongo、没有可靠消息队列
+t.describe("临时实体", function()
+    local function ephemeral(opts)
+        opts = opts or {}
+        local type_config = {
+            db_name = "demo",
+            db_coll = "role",
+            id_field = "rid",
+            persistent = false,
+            default = { hp = 100, bag = { { id = 1 } } },
+        }
+        return harness({
+            type_config = type_config,
+            modules = opts.modules,
+            module_order = opts.module_order,
+        })
+    end
+
+    t.it("loads without taking a lock or reading the database", function()
+        local h = ephemeral()
+        local ok, entity = h.mgr:ensure_loaded(7)
+        t.expect(ok).to.equal(true)
+        t.expect(entity.persistent).to.equal(false)
+        t.expect(entity.handle).to.be_nil()
+        t.expect(#h.handles).to.equal(0)
+        t.expect(index_of(h.events, "load")).to.be_nil()
+        t.expect(entity.data.hp).to.equal(100)
+    end)
+
+    t.it("gives every instance a fresh generation", function()
+        local h = ephemeral()
+        local _, first = h.mgr:ensure_loaded(7)
+        local gen1 = first.generation
+        t.expect(h.mgr:unload(7)).to.equal(true)
+        t.expect(h.mgr:generation_of(7)).to.be_nil()
+
+        local _, second = h.mgr:ensure_loaded(7)
+        t.expect(second.generation > gen1).to.equal(true)
+    end)
+
+    -- 同一份 type_config.default 被多个实例共用，共享引用会让一个实例的改动
+    -- 出现在另一个实例里
+    t.it("deep copies the default data per instance", function()
+        local h = ephemeral()
+        local _, a = h.mgr:ensure_loaded(1)
+        local _, b = h.mgr:ensure_loaded(2)
+        a.data.bag[1].id = 99
+        a.data.hp = 1
+        t.expect(b.data.bag[1].id).to.equal(1)
+        t.expect(b.data.hp).to.equal(100)
+        t.expect(h.mgr.type_config.default.bag[1].id).to.equal(1)
+    end)
+
+    t.it("runs module hooks in the same order as persistent entities", function()
+        local order = {}
+        local function mod(name)
+            return {
+                new = function()
+                    return {
+                        on_load = function()
+                            order[#order + 1] = "load:" .. name
+                        end,
+                        on_unload = function()
+                            order[#order + 1] = "unload:" .. name
+                        end,
+                    }
+                end,
+            }
+        end
+        local h = ephemeral({ modules = { a = mod("a"), b = mod("b") }, module_order = { "a", "b" } })
+        t.expect(h.mgr:ensure_loaded(7)).to.equal(true)
+        t.expect(h.mgr:unload(7)).to.equal(true)
+        t.expect(order).to.equal({ "load:a", "load:b", "unload:b", "unload:a" })
+    end)
+
+    t.it("never touches the database on unload", function()
+        local h = ephemeral()
+        h.mgr:ensure_loaded(7)
+        t.expect(h.mgr:unload(7)).to.equal(true)
+        t.expect(h.mgr:count()).to.equal(0)
+        -- 落库、丢弃缓存、释放锁都不该发生
+        t.expect(index_of(h.events, "save")).to.be_nil()
+        t.expect(index_of(h.events, "persist")).to.be_nil()
+        t.expect(index_of(h.events, "discard")).to.be_nil()
+        t.expect(#h.handles).to.equal(0)
+    end)
+
+    t.it("does not load an entity just to look for pending messages", function()
+        local h = ephemeral()
+        t.expect(h.mgr:deliver_pending(7)).to.equal(true)
+        t.expect(h.mgr:count()).to.equal(0)
+        t.expect(index_of(h.events, "load")).to.be_nil()
+    end)
+
+    -- 持久实体不受影响：仍然要拿锁、读库
+    t.it("keeps the persistent path unchanged", function()
+        local h = harness()
+        t.expect(h.mgr:ensure_loaded(7)).to.equal(true)
+        t.expect(#h.handles).to.equal(1)
+        t.expect(h.loads).to.equal(1)
+    end)
+end)

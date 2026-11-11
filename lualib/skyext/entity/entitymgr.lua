@@ -46,6 +46,9 @@ function M.new(type_name, type_config, handler, data_modules, module_order)
         module_order = module_order or {},
         entities = {},
         gates = {},
+        -- 临时实体的实例代际：同一个 ID 卸载后重新创建会拿到新的 generation，
+        -- 旧实例上迟到的消息/定时器回调可以据此丢弃
+        generation = 0,
     }, M)
     return self
 end
@@ -530,10 +533,73 @@ function M:_on_lock_expired(entity_id, handle)
     end)
 end
 
+-- 临时实体的默认数据是深拷贝：同一份 type_config.default 会被多个实例共用，
+-- 共享引用会让一个实例的改动出现在另一个实例里
+local function deep_copy(value)
+    if type(value) ~= "table" then
+        return value
+    end
+    local out = {}
+    for k, v in pairs(value) do
+        out[k] = deep_copy(v)
+    end
+    return out
+end
+
+-- 临时实体（type_config.persistent = false）：
+--   * 不占 etcd 锁、不读写 Mongo、没有可靠消息队列；
+--   * 模块初始化/卸载顺序与持久实体完全一致；
+--   * 节点崩溃即丢状态，玩法层负责重建或结束活动。
+-- 每次创建都会推进 generation：旧实例上迟到的消息或定时器回调可以据此丢弃，
+-- 否则同一个 ID 重建后会被上一局的残留事件打到。
+function M:_create_ephemeral(entity_id)
+    if self.closing then
+        return false, "node shutting down"
+    end
+    self.generation = self.generation + 1
+    local entity = setmetatable({
+        type_name = self.type_name,
+        id = entity_id,
+        data = deep_copy(self.type_config.default) or {},
+        entity_mgr = self,
+        handle = nil,
+        persistent = false,
+        generation = self.generation,
+        timers = {},
+    }, entity_mt)
+    self.entities[entity_id] = entity
+
+    local initialized, init_err = xpcall(function()
+        self:_init_modules(entity)
+        local hooks_ok, hook_err = self:_call_modules_on_load(entity)
+        assert(hooks_ok, hook_err)
+        if self.handler.on_load then
+            self.handler.on_load(entity)
+        end
+    end, debug.traceback)
+    if not initialized then
+        log.error("ephemeral entity initialization failed", "type", self.type_name, "id", entity_id, "err", init_err)
+        entity.init_failed = true
+        self:_unload_entity(entity)
+        return false, init_err
+    end
+
+    self:_start_unload_timer(entity)
+    log.info("ephemeral entity loaded", "type", self.type_name, "id", entity_id, "generation", entity.generation)
+    return true, entity
+end
+
+-- 临时实体的实例代际；不在内存里返回 nil
+function M:generation_of(entity_id)
+    local entity = self.entities[entity_id]
+    return entity and entity.generation or nil
+end
+
 function M:_ensure_loaded(entity_id)
     local entity = self.entities[entity_id]
     if entity then
-        if entity.invalid or not distributed_lock.is_valid(entity.handle) then
+        -- 临时实体不持有 etcd 锁，lease 判定对它不成立
+        if entity.persistent ~= false and (entity.invalid or not distributed_lock.is_valid(entity.handle)) then
             self:_on_lock_expired(entity_id, entity.handle)
             return false, "entity lease expired"
         end
@@ -549,6 +615,10 @@ function M:_ensure_loaded(entity_id)
     end
 
     local tc = self.type_config
+    if tc.persistent == false then
+        return self:_create_ephemeral(entity_id)
+    end
+
     local lock_key = make_lock_key(self.type_name, entity_id)
     local ok, handle, owner = distributed_lock.try_lock(lock_key, make_lock_value(), function(expired)
         self:_on_lock_expired(entity_id, expired)
@@ -713,6 +783,10 @@ end
 -- 锁在别的节点手里时 reason 为 "lock held"，owner 是持锁节点，调用方可以把唤醒转给它。
 -- opts.loaded_only 为真时只投给本地已加载的实体，不会为了投递去加载
 function M:deliver_pending(entity_id, opts)
+    -- 临时实体没有持久化消息队列：既不该为它去加载实体，也没有 pending 可投
+    if self.type_config.persistent == false then
+        return true
+    end
     local run = (opts and opts.loaded_only) and self.with_loaded_entity or self.with_entity
     local result = table.pack(pcall(run, self, entity_id, function(entity)
         return self:_deliver_pending_msgs(entity)
@@ -875,6 +949,30 @@ function M:_unload_entity(entity)
     self:_cancel_delivery_retry(entity)
     self:_cancel_unload_retry(entity)
     entity.unloading = true
+
+    if entity.persistent == false then
+        -- 临时实体没有库、没有锁：钩子跑完直接丢。持久实体的落库/释放锁分支对它不成立
+        if not entity.unload_hooks_run then
+            local init_failed = entity.init_failed
+            local hooks_ok, hooks_err = xpcall(function()
+                if not init_failed and self.handler.on_unload and not entity.handler_unloaded then
+                    self.handler.on_unload(entity)
+                    entity.handler_unloaded = true
+                end
+                local modules_ok, module_err = self:_call_modules_on_unload(entity, init_failed)
+                assert(modules_ok, module_err)
+            end, debug.traceback)
+            if not hooks_ok then
+                log.error("ephemeral unload hook failed", "type", self.type_name, "id", entity_id, "err", hooks_err)
+                self:_abort_unload(entity, "unload hook failed")
+                return false
+            end
+            entity.unload_hooks_run = true
+        end
+        self:_forget_entity(entity)
+        log.info("ephemeral entity unloaded", "type", self.type_name, "id", entity_id)
+        return true
+    end
 
     if entity.persisted then
         -- 上一次卸载已经落库，只需要补上释放锁这一步，不能重复跑钩子和落库
