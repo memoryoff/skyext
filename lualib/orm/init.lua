@@ -403,6 +403,44 @@ function orm.ack_mongo(doc, revision, version)
     return unchanged
 end
 
+-- 只推进"已持久化版本"，**不清 dirty、不动 revision/changed_keys**。
+--
+-- PREPARE 阶段只写 `_critical_intent_v1` 与 `_version`，不能顺手把普通 ORM 脏字段
+-- 一起提交；而 `ack_mongo` 在 revision 未变时会清掉全部 dirty，用在这里会把玩家
+-- 尚未落库的资产改动悄悄丢掉。两个动作必须分开。
+--
+-- `expected` 非 nil 时做一次本地 CAS：与当前 `_version` 不符就拒绝，避免调用方
+-- 拿着过期版本继续写。Mongo 侧的 CAS 仍由 dbmgr 的 query 条件负责。
+function orm.advance_persisted_version(doc, expected, next_version)
+    assert(getmetatable(doc) == ormdoc_type, "only support orm")
+    if math.type(next_version) ~= "integer" or next_version < 0 then
+        return false, "next_version must be a non-negative integer"
+    end
+    local current = rawget(doc.__stage, "_version")
+    if math.type(current) ~= "integer" then
+        return false, "document has no integer _version"
+    end
+    -- 版本只能前进。回退会让 Mongo 的 CAS query 命中旧文档，等于放弃并发保护
+    if next_version <= current then
+        return false, "next_version must advance"
+    end
+    if expected ~= nil then
+        if math.type(expected) ~= "integer" then
+            return false, "expected must be an integer"
+        end
+        if current ~= expected then
+            return false, "version mismatch"
+        end
+    end
+    rawset(doc.__stage, "_version", next_version)
+    -- 如果调用方之前通过 ORM 接口改过 `_version`，它会被记进待写集合；版本是 CAS 的
+    -- query 条件，不能被顺手写回文档
+    if doc.__changed_keys then
+        doc.__changed_keys._version = nil
+    end
+    return true
+end
+
 function orm.is_dirty(doc)
     return doc.__dirty
 end

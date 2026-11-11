@@ -17,13 +17,22 @@ local g_gates = {}
 
 function M.new(conf)
     local fd = conf.fd
-    assert(not g_clients[fd], fd .. " exists")
+    -- 网关的 open 是"可确认 RPC"：超时后它可能重试，ACK 丢失时也可能重发。
+    -- 同一个 fd 的重复 open 必须当成同一条连接，而不是 assert 把登录服务打挂
+    local existing = g_clients[fd]
+    if existing then
+        existing.addr = conf.addr
+        existing.gate = conf.gate
+        g_gates[fd] = conf.gate
+        log.warn("duplicate open for a tracked client", "fd", fd)
+        return existing
+    end
     g_clients[fd] = conf
     g_gates[fd] = conf.gate
     log.info("new client created", "fd", fd, "addr", conf.addr)
     -- 超时仍未完成登录就踢掉，避免半开连接长期占用 gate
     local login_timeout_sec = config.get_number("login_timeout_sec") or 60
-    timer.timeout("login_timeout", login_timeout_sec, function()
+    conf.login_timer = timer.timeout("login_timeout", login_timeout_sec, function()
         if not g_clients[fd] then
             return
         end
@@ -35,6 +44,11 @@ end
 
 -- 登录成功（会话已移交实体）或连接断开后，停止跟踪该客户端
 function M.unbind(fd)
+    local conf = g_clients[fd]
+    if conf and conf.login_timer then
+        conf.login_timer:cancel()
+        conf.login_timer = nil
+    end
     g_clients[fd] = nil
     log.info("login client unbound", "fd", fd)
 end

@@ -11,7 +11,15 @@ local LISTEN_FD = 100
 
 local function harness(opts)
     opts = opts or {}
-    local h = { sent = {}, writes = {}, closes = {}, env = opts.env or {}, conn_co = {} }
+    local h = {
+        sent = {},
+        writes = {},
+        closes = {},
+        env = opts.env or {},
+        conn_co = {},
+        calls = {},
+        timers = {},
+    }
     local noop = function() end
 
     local function record(target, cmd, ...)
@@ -35,6 +43,27 @@ local function harness(opts)
         send = function(addr, proto, cmd, ...)
             t.expect(proto).to.equal("lua")
             record(addr, cmd, ...)
+        end,
+        -- 登录 open 走可确认 RPC。默认立即成功；h.call_block 时挂起，
+        -- 由测试决定是超时先到还是迟到成功先到
+        call = function(addr, proto, cmd, ...)
+            t.expect(proto).to.equal("lua")
+            h.calls[#h.calls + 1] = { addr, cmd, ... }
+            if h.call_error then
+                error(h.call_error)
+            end
+            if h.call_block then
+                h.call_co = coroutine.running()
+                skynet.wait()
+            end
+            if h.call_result == nil then
+                return true
+            end
+            return h.call_result
+        end,
+        timeout = function(cs, fn)
+            h.timers[#h.timers + 1] = { cs = cs, fn = fn }
+            return #h.timers
         end,
     }, { __index = skynet })
 
@@ -64,7 +93,8 @@ local function harness(opts)
         end,
     }
 
-    -- websocket.accept 阻塞到连接关闭，这里用协程挂起模拟；测试用 h.disconnect 放行
+    -- websocket.accept 阻塞到连接关闭，这里用协程挂起模拟；握手成功后调用 handshake，
+    -- 与 http.websocket 的 resolve_accept 顺序一致（101 响应之后、读帧循环之前）
     local fake_websocket = {
         accept = function(fd, handler, protocol, addr)
             h.handler = handler
@@ -73,6 +103,9 @@ local function harness(opts)
                 return false, "handshake failed"
             end
             h.conn_co[fd] = coroutine.running()
+            if handler.handshake then
+                handler.handshake(fd)
+            end
             skynet.wait()
             return true
         end,
@@ -120,10 +153,16 @@ local function harness(opts)
     -- 停服钩子是在 skynet.fork 里注册的，让它跑起来
     skynet.sleep(0)
 
-    -- 接一条连接：跑 accept 回调，等连接协程挂进 websocket.accept
+    function h.tick(n)
+        for _ = 1, n or 3 do
+            skynet.sleep(0)
+        end
+    end
+
+    -- 接一条连接：跑 accept 回调，等连接协程走完握手/注册
     function h.connect(fd, addr)
         h.accept_cb(fd, addr or "127.0.0.1:1234")
-        skynet.sleep(0)
+        h.tick()
     end
 
     -- 连接真的断了：唤醒连接协程，让它跑完 serve 的收尾
@@ -133,7 +172,25 @@ local function harness(opts)
         if co then
             skynet.wakeup(co)
         end
-        skynet.sleep(0)
+        h.tick()
+    end
+
+    -- 注册超时：跑 timeout 回调
+    function h.fire_timeout()
+        local timer = h.timers[#h.timers]
+        t.expect(timer).to.exist()
+        timer.fn()
+        h.tick()
+    end
+
+    -- 迟到的 open 响应：唤醒被超时放弃的 RPC
+    function h.resolve_call(value)
+        h.call_result = value
+        local co = h.call_co
+        h.call_co = nil
+        t.expect(co).to.exist()
+        skynet.wakeup(co)
+        h.tick()
     end
 
     if not opts.no_open then
@@ -145,6 +202,7 @@ local function harness(opts)
             protocol = opts.protocol,
             certfile = opts.certfile,
             keyfile = opts.keyfile,
+            handshake_timeout_ms = opts.handshake_timeout_ms,
         })
     end
     return h
@@ -226,13 +284,25 @@ t.describe("gate_ws startup", function()
     end)
 end)
 
-t.describe("gate_ws connections", function()
-    t.it("tells the login service which gate a new connection came from", function()
+t.describe("gate_ws registration lifecycle", function()
+    t.it("reserves the slot before forking so a burst cannot overshoot maxclient", function()
+        local h = harness({ maxclient = 1 })
+        -- 两次 accept 回调都不让出：第二次必须在预占阶段就被拒绝
+        h.accept_cb(9, "a")
+        h.accept_cb(10, "b")
+        t.expect(h.dropped).to.equal(10)
+        t.expect(h.CMD.count()).to.equal(1)
+        h.tick()
+    end)
+
+    t.it("confirms registration with the login service before reading frames", function()
         local h = harness()
         h.connect(9, "1.2.3.4:5678")
-        t.expect(h.sent).to.equal({ { LOGIN, "open", 9, "1.2.3.4:5678", ".gate_ws" } })
-        t.expect(h.accepted).to.equal({ fd = 9, protocol = "ws", addr = "1.2.3.4:5678" })
+        t.expect(h.calls).to.equal({ { LOGIN, "open", 9, "1.2.3.4:5678", ".gate_ws" } })
+        t.expect(h.CMD.state(9)).to.equal("ACTIVE")
         t.expect(h.CMD.count()).to.equal(1)
+        -- 5000ms 必须换成 skynet.timeout 的 1/100 秒单位
+        t.expect(h.timers[1].cs).to.equal(500)
     end)
 
     t.it("drops a new connection once it is full rather than degrade everyone", function()
@@ -243,24 +313,94 @@ t.describe("gate_ws connections", function()
         t.expect(h.CMD.count()).to.equal(1)
     end)
 
+    t.it("closes the socket and tells login when registration times out", function()
+        local h = harness({ handshake_timeout_ms = 50 })
+        h.call_block = true
+        h.connect(9)
+        t.expect(h.CMD.state(9)).to.equal("REGISTERING")
+        t.expect(h.CMD.count()).to.equal(1)
+        -- 超时前不通知登录端，避免它先建记录又收不到后续
+        t.expect(h.sent).to.equal({})
+
+        h.fire_timeout()
+        t.expect(h.CMD.state(9)).to.equal("CLOSED")
+        t.expect(h.CMD.count()).to.equal(0)
+        t.expect(h.closes[1]).to.equal({ fd = 9, code = 1011, reason = "register failed" })
+        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", 9 } })
+    end)
+
+    t.it("compensates a late ACK after the timeout already closed the connection", function()
+        local h = harness({ handshake_timeout_ms = 50 })
+        h.call_block = true
+        h.connect(9)
+        h.fire_timeout()
+        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", 9 } })
+
+        -- 登录端其实已经登记成功，只是响应来晚了：必须补一次 disconnect
+        h.resolve_call(true)
+        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", 9 }, { LOGIN, "disconnect", 9 } })
+    end)
+
+    t.it("does not compensate into an fd that has already been reused", function()
+        local h = harness({ handshake_timeout_ms = 50 })
+        h.call_block = true
+        h.connect(9)
+        h.fire_timeout()
+
+        -- fd 复用：新连接已经 ACTIVE，迟到的旧 ACK 不能再按 fd 踢人
+        h.call_block = false
+        h.connect(9)
+        t.expect(h.CMD.state(9)).to.equal("ACTIVE")
+        local before = #h.sent
+        h.resolve_call(true)
+        t.expect(#h.sent).to.equal(before)
+    end)
+
+    t.it("treats an explicit false acknowledgement as a failed registration", function()
+        local h = harness()
+        h.call_result = false
+        h.connect(9)
+        t.expect(h.CMD.state(9)).to.equal("CLOSED")
+        t.expect(h.CMD.count()).to.equal(0)
+        t.expect(h.closes[1].code).to.equal(1011)
+    end)
+
+    t.it("closes the connection when login reports an error instead of leaving it half-open", function()
+        local h = harness()
+        h.call_error = "login is down"
+        h.connect(9)
+        t.expect(h.CMD.state(9)).to.equal("CLOSED")
+        t.expect(h.CMD.count()).to.equal(0)
+        t.expect(h.closes[1].code).to.equal(1011)
+    end)
+
+    t.it("refuses a frame that arrives before the session is ACTIVE", function()
+        local h = harness({ handshake_timeout_ms = 50 })
+        h.call_block = true
+        h.connect(9)
+        h.handler.message(9, "BYTES", "binary")
+        t.expect(h.sent).to.equal({})
+        t.expect(h.closes[1].code).to.equal(1011)
+    end)
+
     t.it("cleans up a connection whose handshake never completed", function()
         local h = harness()
         h.accept_fail = true
         h.connect(9)
         t.expect(h.CMD.count()).to.equal(0)
         -- 没握成手的连接也要让登录服务知道，否则它的 fd 表会漏
-        t.expect(h.sent[2]).to.equal({ LOGIN, "disconnect", 9 })
+        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", 9 } })
     end)
 
     t.it("frees the slot when the connection closes", function()
         local h = harness()
         h.connect(9)
         h.handler.close(9)
-        t.expect(h.sent[2]).to.equal({ LOGIN, "disconnect", 9 })
+        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", 9 } })
         t.expect(h.CMD.count()).to.equal(0)
         -- serve 收尾时不能再报一次
         h.disconnect(9)
-        t.expect(#h.sent).to.equal(2)
+        t.expect(#h.sent).to.equal(1)
     end)
 end)
 
@@ -269,6 +409,7 @@ t.describe("gate_ws forwarding", function()
         local h = harness(opts)
         h.connect(9)
         h.sent = {}
+        h.calls = {}
         return h
     end
 
@@ -315,7 +456,7 @@ t.describe("gate_ws forwarding", function()
         t.expect(h.CMD.count()).to.equal(0)
     end)
 
-    -- 协议是二进制 sproto。文本帧多半是接错端口或客户端发了 JSON，早断早清楚
+    -- 协议是二进制 sproto。文本帧多半是接错了端口或者客户端发了 JSON，早断早清楚
     t.it("closes a connection that sends text frames", function()
         local h = connected()
         h.handler.message(9, '{"cmd":"login"}', "text")

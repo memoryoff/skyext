@@ -394,3 +394,64 @@ t.describe("orm.decode", function()
         t.expect(doc.next).to.be_nil()
     end)
 end)
+
+-- P00-D：PREPARE 只推进 `_version`，普通 ORM 脏字段必须原样留着。
+-- 用 ack_mongo 代替会清 dirty，玩家的资产改动就静默丢了。
+t.describe("ORM persisted version advance", function()
+    t.it("advances _version without clearing dirty fields", function()
+        local doc = new_doc()
+        doc.items[1].count = 5
+        t.expect(orm.is_dirty(doc)).to.equal(true)
+
+        t.expect(orm.advance_persisted_version(doc, 0, 1)).to.equal(true)
+        t.expect(doc._version).to.equal(1)
+        t.expect(orm.is_dirty(doc)).to.equal(true)
+
+        local dirty, update = orm.snapshot_mongo(doc)
+        t.expect(dirty).to.equal(true)
+        t.expect(update["$set"].items["1"].count).to.equal(5)
+        -- 只推进版本不能顺手把 _version 也写进 $set，那是 CAS 的 query 条件
+        t.expect(update["$set"]._version).to.be_nil()
+    end)
+
+    t.it("rejects a stale expected version and leaves the document untouched", function()
+        local doc = new_doc()
+        t.expect(orm.advance_persisted_version(doc, 3, 4)).to.equal(false)
+        t.expect(doc._version).to.equal(0)
+        t.expect(orm.is_dirty(doc)).to.equal(false)
+    end)
+
+    t.it("rejects non-integer or non-advancing versions instead of truncating", function()
+        local doc = new_doc()
+        t.expect(orm.advance_persisted_version(doc, 0, 1.5)).to.equal(false)
+        t.expect(orm.advance_persisted_version(doc, 0, -1)).to.equal(false)
+        t.expect(orm.advance_persisted_version(doc, 0.5, 1)).to.equal(false)
+        t.expect(orm.advance_persisted_version(doc, 0, 0)).to.equal(false)
+        t.expect(doc._version).to.equal(0)
+    end)
+
+    t.it("drops a pending _version write so the CAS condition is not persisted", function()
+        local doc = new_doc()
+        doc._version = 5
+        t.expect(orm.is_dirty(doc)).to.equal(true)
+        t.expect(orm.advance_persisted_version(doc, 5, 6)).to.equal(true)
+        t.expect(doc._version).to.equal(6)
+        local dirty, update = orm.snapshot_mongo(doc)
+        t.expect(dirty).to.equal(false)
+        t.expect(update["$set"]).to.be_nil()
+    end)
+
+    t.it("keeps a later snapshot able to submit the original dirty fields", function()
+        local doc = new_doc()
+        doc.items[1].count = 7
+        doc.list[1] = 30
+        t.expect(orm.advance_persisted_version(doc, 0, 1)).to.equal(true)
+
+        local _, update, revision = orm.snapshot_mongo(doc)
+        t.expect(update["$set"].items["1"].count).to.equal(7)
+        t.expect(update["$set"].list[1]).to.equal(30)
+        t.expect(orm.ack_mongo(doc, revision, 2)).to.equal(true)
+        t.expect(doc._version).to.equal(2)
+        t.expect(orm.is_dirty(doc)).to.equal(false)
+    end)
+end)
