@@ -710,6 +710,17 @@ function M.critical_update(dbname, dbcoll, key, unique_id, expected_version, upd
         write["$set"]._version = next_version
 
         local query = { [key] = unique_id, _version = expected_version }
+        -- 调用方可以追加条件（例如 Outbox 的 "该事件仍是 PENDING"）。
+        -- 只允许等值条件：范围/正则会把 CAS 变成不可预测的匹配
+        for k, v in pairs(opts.extra_query or {}) do
+            if query[k] ~= nil then
+                return "REJECTED", "extra_query must not override the CAS conditions"
+            end
+            if type(v) == "table" then
+                return "REJECTED", "extra_query only supports equality"
+            end
+            query[k] = v
+        end
         local handle = opts.handle or entry.handle
         if handle then
             -- 锁已经释放（或换了持有者）时不能再发多数派写：fence 条件挡不住
