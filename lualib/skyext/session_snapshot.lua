@@ -4,20 +4,26 @@
 -- 否则客户端按 `(session_epoch, seq)` 去重就会错位。因此快照不做任何"重新编码"：
 -- `out_buf` 里已经是完整的 DownlinkV2 字节，直接搬运。
 --
--- 格式（小端）：
---   "SKXS" | version u8 | mode u8 | epoch[32] ascii
+-- 格式（小端，v2）：
+--   "SKXS" | version u8 | mode u8 | flags u8 | epoch[32] ascii
 --   | sent u64 | acked u64
 --   | nonce_len u16 | nonce
 --   | out_count u32 | (seq u64 | len u32 | bytes)*
---   | resp_count u32 | (req_id u32 | name_len u16 | name | len u32 | pack)*
+--   | resp_count u32 | (req_id u32 | name_len u16 | name | fp_ver u8 | hash[32] | len u32 | pack)*
 --   | min_cached_req_id u32 | checksum u32
+--
+-- v2 相对 v1 只加了两处：flags（保真 `unresumable`）与每条 L1 条目的
+-- `fingerprint_version + 32 字节摘要`。少了摘要，迁移后重传的在途请求无法证明
+-- "参数相同"，`matches_digest` 会判 INVALID_HASH，非幂等操作就会被重新执行一遍。
+-- 版本不匹配一律拒绝（fail-closed 降级重登）：快照只在一次迁移里活着，
+-- 猜一个不认识的老格式，比让客户端重登危险得多。
 --
 -- 校验失败一律拒绝迁移：宁可让客户端重连重新登录，也不能带着断掉的 `out_buf`
 -- 宣称"无感迁移"——那会把缺口变成客户端的永久失同步。
 local M = {}
 
 M.MAGIC = "SKXS"
-M.VERSION = 1
+M.VERSION = 2
 M.EPOCH_HEX_LEN = 32
 M.MAX_NONCE = 64
 M.MAX_OUT_PACKETS = 4096
@@ -26,6 +32,8 @@ M.MAX_RESP_ENTRIES = 4096
 M.MAX_NAME = 128
 
 M.MODE = { LEGACY = 0, V2 = 1 }
+
+M.FLAG = { UNRESUMABLE = 1 }
 
 M.ERR = {
     BAD_MAGIC = "bad_magic",
@@ -101,8 +109,17 @@ function M.encode(io_)
             if #entry.name > M.MAX_NAME then
                 return nil, M.ERR.TOO_LARGE
             end
+            -- 摘要缺失说明这条缓存本来就不该存在（`cache_response` 拒绝无摘要写入）。
+            -- 迁移时丢掉它比留一条无法证明参数相同的条目更安全
+            local hash = entry.hash
+            local fp_version = entry.fingerprint_version
+            if type(hash) ~= "string" or #hash ~= 32 or math.type(fp_version) ~= "integer" then
+                return nil, "resp cache entry has no fingerprint"
+            end
             resp_parts[#resp_parts + 1] = string.pack("<I4I2", req_id, #entry.name)
                 .. entry.name
+                .. string.pack("<B", fp_version)
+                .. hash
                 .. string.pack("<I4", #entry.pack)
                 .. entry.pack
             resp_count = resp_count + 1
@@ -112,7 +129,11 @@ function M.encode(io_)
         end
     end
 
-    local body = string.pack("<c4BBI8I8", M.MAGIC, M.VERSION, mode, sent, acked)
+    local flags = 0
+    if io_.unresumable then
+        flags = flags | M.FLAG.UNRESUMABLE
+    end
+    local body = string.pack("<c4BBBI8I8", M.MAGIC, M.VERSION, mode, flags, sent, acked)
         .. io_.session_epoch
         .. string.pack("<I2", #nonce)
         .. nonce
@@ -151,8 +172,8 @@ function M.decode(bytes)
     end
 
     local pos = 1
-    local magic, version, mode, sent, acked
-    magic, version, mode, sent, acked, pos = string.unpack("<c4BBI8I8", body, pos)
+    local magic, version, mode
+    magic, version, mode, pos = string.unpack("<c4BB", body, pos)
     if magic ~= M.MAGIC then
         return nil, M.ERR.BAD_MAGIC
     end
@@ -162,6 +183,10 @@ function M.decode(bytes)
     if mode ~= M.MODE.LEGACY and mode ~= M.MODE.V2 then
         return nil, M.ERR.BAD_MODE
     end
+    local flags
+    flags, pos = string.unpack("<B", body, pos)
+    local sent, acked
+    sent, acked, pos = string.unpack("<I8I8", body, pos)
     if acked > sent then
         return nil, M.ERR.BAD_COUNTERS
     end
@@ -241,12 +266,27 @@ function M.decode(bytes)
         end
         local name = body:sub(pos, pos + name_len - 1)
         pos = pos + name_len
+        local fp_version
+        fp_version, pos = read(body, pos, "<B")
+        if not fp_version then
+            return nil, M.ERR.TRUNCATED
+        end
+        if pos + 31 > #body then
+            return nil, M.ERR.TRUNCATED
+        end
+        local hash = body:sub(pos, pos + 31)
+        pos = pos + 32
         local len
         len, pos = read(body, pos, "<I4")
         if not len or pos + len - 1 > #body then
             return nil, M.ERR.TRUNCATED
         end
-        resp_cache[req_id] = { name = name, pack = body:sub(pos, pos + len - 1) }
+        resp_cache[req_id] = {
+            name = name,
+            pack = body:sub(pos, pos + len - 1),
+            fingerprint_version = fp_version,
+            hash = hash,
+        }
         pos = pos + len
     end
 
@@ -270,6 +310,7 @@ function M.decode(bytes)
         out_buf = out_buf,
         resp_cache = resp_cache,
         min_cached_req_id = min_cached,
+        unresumable = (flags & M.FLAG.UNRESUMABLE) ~= 0,
     }
 end
 
@@ -297,8 +338,12 @@ function M.restore(snapshot, expected_epoch, opts)
         resp_order = { head = 1, tail = 0 },
         resp_bytes = 0,
         min_cached_req_id = snapshot.min_cached_req_id or 0,
+        -- last_seen 用 skynet 的厘秒时钟（session.lua 的 sweep_idle 也用它）。
+        -- 写成 os.time() 会让新 owner 的空闲回收永远不触发
         last_seen = (opts and opts.now) or os.time(),
-        unresumable = false,
+        -- 源已经丢弃重放缓冲时，目标也不能假装可续接：客户端存在永久缺口，
+        -- 必须让它走完整重登，而不是静默失同步
+        unresumable = snapshot.unresumable == true,
         replaying = false,
         -- 迁移是一次所有权切换：网关据此拒绝旧 owner 的迟到下行
         owner_epoch = (opts and opts.owner_epoch) or 1,
@@ -314,9 +359,25 @@ function M.restore(snapshot, expected_epoch, opts)
             return nil, M.ERR.TOO_LARGE
         end
     end
+    -- L1 缓存必须连摘要一起搬：没有摘要，重传的在途请求无法证明参数相同，
+    -- matches_digest 会判 INVALID_HASH，非幂等操作就被重新执行一遍
+    local ids = {}
     for req_id, entry in pairs(snapshot.resp_cache or {}) do
-        io_.resp_cache[req_id] = { name = entry.name, pack = entry.pack }
+        io_.resp_cache[req_id] = {
+            name = entry.name,
+            pack = entry.pack,
+            fingerprint_version = entry.fingerprint_version,
+            hash = entry.hash,
+        }
+        io_.resp_bytes = io_.resp_bytes + #entry.pack
+        ids[#ids + 1] = req_id
     end
+    -- 淘汰队列必须重建：空队列会让这些条目永不淘汰，count/bytes 上限对它们失效
+    table.sort(ids)
+    for i, req_id in ipairs(ids) do
+        io_.resp_order[i] = req_id
+    end
+    io_.resp_order.tail = #ids
     return io_
 end
 

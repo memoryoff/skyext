@@ -201,3 +201,24 @@ t.describe("node_shutdown", function()
         t.expect(table.pack(h.GM.shutdown.handler({ timeout = "5" }))).to.equal({ true, "shutdown started", n = 2 })
     end)
 end)
+
+t.describe("node_shutdown 计划内迁移", function()
+    -- 迁移必须在卸载之前：卸载会把玩家踢下线，先迁移才能做到无感
+    t.it("runs the migrate hook before unloading entities", function()
+        local h = harness({ local_names = { [".entity_agentmgr:role"] = ":mgr" } })
+        h.CMD.add_hook("migrate", ":migration", "run")
+        h.CMD.shutdown()
+        t.expect(h.calls[1]).to.equal(":migration run")
+        t.expect(h.calls[2]).to.equal(":mgr shutdown")
+    end)
+
+    -- 迁移失败不能把进程卡在"半死不活"：实体照常卸载，玩家重登即可
+    t.it("keeps going when the migration hook fails", function()
+        local h = harness({ local_names = { [".entity_agentmgr:role"] = ":mgr" } })
+        h.CMD.add_hook("migrate", ":migration", "run")
+        h.fail[":migration"] = "cluster unreachable"
+        h.CMD.shutdown()
+        t.expect(h.aborted).to.equal(true)
+        t.expect(logged(h, "warn:shutdown hook failed")).to.equal(true)
+    end)
+end)

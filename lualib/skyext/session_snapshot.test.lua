@@ -12,7 +12,13 @@ local function session_io(over)
         acked = 1,
         out_buf = { [2] = "PACK-2", [3] = "PACK-3" },
         resp_cache = {
-            [7] = { name = "shop.buy", pack = "RESP-7" },
+            -- 真实条目由 fingerprint.entry_from_digest 生成：name + 版本 + 32 字节摘要 + pack
+            [7] = {
+                name = "shop.buy",
+                pack = "RESP-7",
+                fingerprint_version = 1,
+                hash = string.rep("\7", 32),
+            },
         },
         min_cached_req_id = 5,
     }
@@ -37,6 +43,9 @@ t.describe("session_snapshot 编码", function()
         t.expect(decoded.out_buf[3]).to.equal("PACK-3")
         t.expect(decoded.resp_cache[7].name).to.equal("shop.buy")
         t.expect(decoded.resp_cache[7].pack).to.equal("RESP-7")
+        -- 摘要必须跟着搬：否则迁移后重传的在途请求无法证明参数相同
+        t.expect(decoded.resp_cache[7].hash).to.equal(string.rep("\7", 32))
+        t.expect(decoded.resp_cache[7].fingerprint_version).to.equal(1)
         t.expect(decoded.min_cached_req_id).to.equal(5)
     end)
 
@@ -96,8 +105,9 @@ t.describe("session_snapshot 校验", function()
         local _, err = snapshot.decode(replaced)
         t.expect(err).to.equal(snapshot.ERR.BAD_MAGIC)
 
-        local v2 = body:sub(1, 4) .. string.char(2) .. body:sub(6)
-        local _, verr = snapshot.decode(v2 .. string.pack("<I4", snapshot.checksum(v2)))
+        -- 不认识的版本必须 fail-closed：快照只活一次迁移，猜格式比让客户端重登危险
+        local future = body:sub(1, 4) .. string.char(99) .. body:sub(6)
+        local _, verr = snapshot.decode(future .. string.pack("<I4", snapshot.checksum(future)))
         t.expect(verr).to.equal(snapshot.ERR.BAD_VERSION)
     end)
 

@@ -274,6 +274,84 @@ end
 
 FRAMEWORK.charge_grant = framework_charge_grant
 
+-- 迁移（P15）：导出会话快照。调用方必须先确认网关屏障与实体队列排空，
+-- 否则导出的是一个还在变的 out_buf
+FRAMEWORK.session_export = function(entity, barrier_id, target_owner_epoch)
+    if not session then
+        return nil, "no session layer"
+    end
+    local io_ = entity.session_io
+    if not io_ then
+        return nil, "no session io"
+    end
+    local current = io_.owner_epoch or 1
+    -- 新 owner 的 epoch 必须严格前进：网关用严格大于来拒绝旧 owner 的迟到下行
+    local target = math.tointeger(target_owner_epoch) or (current + 1)
+    if target <= current then
+        return nil, "target owner epoch must advance"
+    end
+    -- 冻结源：导出之后不再追加 out_buf，否则目标拿到的是一份会过期的快照
+    io_.migrating = true
+    local bytes, err = require("skyext.session_snapshot").encode(io_)
+    if not bytes then
+        io_.migrating = false
+        return nil, err
+    end
+    return {
+        bytes = bytes,
+        session_epoch = io_.session_epoch,
+        owner_epoch = target,
+        sent = io_.sent,
+        acked = io_.acked,
+        barrier_id = barrier_id,
+    }
+end
+
+-- 迁移（P15）：在目标节点安装快照。`session_epoch` 必须原样保留——
+-- 客户端按 (session_epoch, seq) 去重，换了 epoch 就变成一次新的登录
+FRAMEWORK.session_import = function(entity, payload)
+    if not session then
+        return nil, "no session layer"
+    end
+    if type(payload) ~= "table" or type(payload.bytes) ~= "string" then
+        return nil, "snapshot is required"
+    end
+    local snapshot_mod = require "skyext.session_snapshot"
+    local snapshot, derr = snapshot_mod.decode(payload.bytes)
+    if not snapshot then
+        return nil, derr
+    end
+    -- 新 owner_epoch 必须严格前进：等于或小于当前值都意味着所有权没有真正切换
+    local current = entity.session_io and entity.session_io.owner_epoch or 0
+    local target = math.tointeger(payload.owner_epoch)
+    if not target then
+        return nil, "target owner epoch is required"
+    end
+    if target <= current then
+        return nil, "owner epoch would go backwards"
+    end
+    -- 目标已经用另一条会话重新登录过：旧 out_buf 装上去会覆盖新会话，
+    -- 客户端从此按错误的序号去重
+    if entity.session_io and entity.session and entity.session_io.session_epoch ~= snapshot.session_epoch then
+        return nil, "target already has a different live session"
+    end
+    local io_, rerr = snapshot_mod.restore(snapshot, payload.session_epoch, {
+        owner_epoch = target,
+        -- 与 session.lua 的空闲回收同一条时钟（厘秒），不是 os.time()
+        now = skynet.now(),
+    })
+    if not io_ then
+        return nil, rerr
+    end
+    entity.session_io = io_
+    return {
+        session_epoch = io_.session_epoch,
+        owner_epoch = io_.owner_epoch,
+        sent = io_.sent,
+        acked = io_.acked,
+    }
+end
+
 -- 主动加载一个实体（常驻实体的预加载用）。返回 true，或 false, reason
 function CMD.activate(entity_id)
     local ok, reason = entitymgr:ensure_loaded(entity_id)

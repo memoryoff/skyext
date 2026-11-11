@@ -698,3 +698,80 @@ t.describe("entity_agent 框架内部命令", function()
         t.expect(ok).to.equal(false)
     end)
 end)
+
+t.describe("entity_agent 会话迁移命令", function()
+    local function session_io()
+        return {
+            session_epoch = string.rep("a", 32),
+            session_mode = 1,
+            nonce = "nonce-bytes",
+            sent = 2,
+            acked = 1,
+            out_buf = { [2] = "PACK-2" },
+            out_bytes = 6,
+            resp_cache = {},
+            resp_order = { head = 1, tail = 0 },
+            resp_bytes = 0,
+            min_cached_req_id = 0,
+            owner_epoch = 3,
+            unresumable = false,
+            replaying = false,
+        }
+    end
+
+    -- 快照只搬字节：out_buf 里的包是已经编码好的，重包装会让客户端按
+    -- (session_epoch, seq) 去重时错位
+    t.it("exports and imports the same session bytes", function()
+        local source = harness()
+        source.entity.session_io = session_io()
+        local ok, exported = source.CMD.entity_call(7, "session_export", "b1")
+        t.expect(ok).to.equal(true)
+        t.expect(exported.session_epoch).to.equal(string.rep("a", 32))
+        -- 新 owner 的 epoch 必须严格前进，否则网关会继续放行旧 owner 的下行
+        t.expect(exported.owner_epoch).to.equal(4)
+        t.expect(exported.sent).to.equal(2)
+        -- 导出即冻结源：之后不再追加 out_buf，否则目标拿到的是过期快照
+        t.expect(source.entity.session_io.migrating).to.equal(true)
+
+        local target = harness()
+        local imported_ok, result = target.CMD.entity_call(7, "session_import", exported)
+        t.expect(imported_ok).to.equal(true)
+        t.expect(result.sent).to.equal(2)
+        t.expect(result.owner_epoch).to.equal(4)
+        t.expect(target.entity.session_io.out_buf[2]).to.equal("PACK-2")
+        -- wire 上的会话身份必须保持不变
+        t.expect(target.entity.session_io.session_epoch).to.equal(string.rep("a", 32))
+    end)
+
+    t.it("refuses to export without a session io", function()
+        local h = harness()
+        local ok, result = h.CMD.entity_call(7, "session_export", "b1")
+        t.expect(ok).to.equal(true)
+        t.expect(result).to.be_nil()
+    end)
+
+    t.it("refuses a snapshot that would move the owner epoch backwards", function()
+        local h = harness()
+        h.entity.session_io = session_io()
+        local payload = { bytes = "", session_epoch = string.rep("a", 32), owner_epoch = 1 }
+        local ok, result, err = h.CMD.entity_call(7, "session_import", payload)
+        t.expect(ok).to.equal(true)
+        t.expect(result).to.be_nil()
+        t.expect(err).to_not.be_nil()
+        -- 失败时不能改动目标上已有的会话
+        t.expect(h.entity.session_io.owner_epoch).to.equal(3)
+    end)
+
+    t.it("refuses a corrupted snapshot", function()
+        local h = harness()
+        local ok, result, err = h.CMD.entity_call(7, "session_import", {
+            bytes = "SKXS" .. string.rep("\0", 60),
+            session_epoch = string.rep("a", 32),
+            owner_epoch = 1,
+        })
+        t.expect(ok).to.equal(true)
+        t.expect(result).to.be_nil()
+        t.expect(err).to_not.be_nil()
+        t.expect(h.entity.session_io).to.be_nil()
+    end)
+end)

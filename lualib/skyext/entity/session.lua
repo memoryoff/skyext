@@ -191,6 +191,12 @@ local function record_and_send(entity, pack)
         log.warn("drop a package for an entity without a session", "type", entity.type_name, "id", entity.id)
         return false
     end
+    if io_.migrating then
+        -- 迁移导出后源端不再追加 out_buf：继续写会让目标拿到一份过期的 sent/out_buf，
+        -- 客户端 ACK 一旦超过目标的 sent，整个会话就只能重登
+        log.warn("drop a package while the session is migrating", "type", entity.type_name, "id", entity.id)
+        return false
+    end
     io_.sent = io_.sent + 1
     if io_.session_mode == M.MODE_V2 then
         -- out_buf 里存的是完整的 DownlinkV2 原始字节：迁移时原样重放，不再 decode→换 epoch→

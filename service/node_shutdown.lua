@@ -1,11 +1,14 @@
 -- 节点停服编排。顺序：
 --   1. stop_accepting 钩子：关掉对外入口（gate、HTTP 端口），不再放新请求进来
---   2. 卸载本节点所有实体类型的全部实体：落库、释放锁、踢下在线玩家
---   3. release 钩子：实体都落库之后释放其余资源（snowflake 归还机器号之类）
---   4. 停掉服务注册，再撤销节点级 etcd 租约：节点键、服务键、残留的实体锁一并消失，
+--   2. migrate 钩子：计划内迁移（P15）。游戏层在这里调 `skyext.migration`，
+--      把在线玩家的会话搬到别的节点，避免整节点重启变成全员掉线。
+--      不注册就跳过，退化成第 3 步的"卸载 + 重登"
+--   3. 卸载本节点所有实体类型的全部实体：落库、释放锁、踢下在线玩家
+--   4. release 钩子：实体都落库之后释放其余资源（snowflake 归还机器号之类）
+--   5. 停掉服务注册，再撤销节点级 etcd 租约：节点键、服务键、残留的实体锁一并消失，
 --      别的节点立刻看到本节点下线，不用等 TTL 过期
---   5. 让 logger 写完缓冲，退出进程
--- 第 2 步有实体卸不掉时停在这里、进程不退出：那些实体还有没落库的改动，退出就丢了。
+--   6. 让 logger 写完缓冲，退出进程
+-- 第 3 步有实体卸不掉时停在这里、进程不退出：那些实体还有没落库的改动，退出就丢了。
 -- 排查后可以再发一次 shutdown。游戏层用 skyext.node_shutdown_api 挂钩子。
 local skynet = require "skynet"
 local cmd_api = require "skyext.cmd_api"
@@ -18,6 +21,7 @@ local DEFAULT_TIMEOUT = 60
 
 local g_hooks = {
     stop_accepting = {},
+    migrate = {},
     release = {},
 }
 local g_running = false
@@ -28,6 +32,34 @@ local function run_hooks(phase)
         if not ok then
             log.warn("shutdown hook failed", "phase", phase, "addr", hook.addr, "cmd", hook.cmd, "err", err)
         end
+    end
+end
+
+-- 带截止时间的钩子。迁移要跨节点 RPC，卡住的话停服会永久停在卸载之前，
+-- 而 g_running 已置位、再发一次 shutdown 只会得到 "already shutting down"。
+-- 超时后只记错误并继续：迁移失败退化成"卸载 + 重登"，不能拖死进程。
+local function run_hooks_with_deadline(phase, timeout_sec)
+    local hooks = g_hooks[phase]
+    if #hooks == 0 then
+        return
+    end
+    local pending = #hooks
+    for _, hook in ipairs(hooks) do
+        skynet.fork(function()
+            local ok, err = pcall(skynet.call, hook.addr, "lua", hook.cmd)
+            if not ok then
+                log.warn("shutdown hook failed", "phase", phase, "addr", hook.addr, "cmd", hook.cmd, "err", err)
+            end
+            pending = pending - 1
+        end)
+    end
+    local waited = 0
+    while pending > 0 and waited < timeout_sec * 100 do
+        skynet.sleep(100)
+        waited = waited + 100
+    end
+    if pending > 0 then
+        log.error("shutdown hook timed out", "phase", phase, "pending", pending, "timeout", timeout_sec)
     end
 end
 
@@ -79,6 +111,10 @@ end
 local function shutdown(timeout_sec)
     log.info("node shutdown begin", "timeout", timeout_sec)
     run_hooks("stop_accepting")
+    -- 计划内迁移：必须在卸载之前。迁移不成功时实体照常卸载，玩家重登即可，
+    -- 不能因为迁移失败就把进程留在半死不活的状态。超时用整个停服预算的一半，
+    -- 剩下的时间要留给卸载
+    run_hooks_with_deadline("migrate", math.max(1, math.floor(timeout_sec / 2)))
     local remaining = unload_entities(timeout_sec)
     if remaining ~= 0 then
         log.error("node shutdown incomplete, process kept alive", "remaining", remaining)
