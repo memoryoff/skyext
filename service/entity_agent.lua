@@ -276,6 +276,39 @@ FRAMEWORK.charge_grant = framework_charge_grant
 
 -- 迁移（P15）：导出会话快照。调用方必须先确认网关屏障与实体队列排空，
 -- 否则导出的是一个还在变的 out_buf
+-- 关键账本维护：归档与"确保恢复任务存在"。
+-- 集合来自实体类型配置（`critical_ledger` / `critical_jobs`），没配就明确拒绝：
+-- 静默跳过会让维护扫描看起来在跑、实际什么都没做
+local function config_collection(spec)
+    if type(spec) ~= "table" or type(spec.db) ~= "string" or type(spec.coll) ~= "string" then
+        return nil
+    end
+    return require("skyext.mongo_conn").get_collection(spec.db, spec.coll)
+end
+
+FRAMEWORK.critical_archive = function(entity, limit)
+    local ledger = config_collection(type_config.critical_ledger)
+    if not ledger then
+        return nil, "critical_ledger is not configured"
+    end
+    return require("skyext.critical").archive_ops(entity, { ledger = ledger }, { limit = limit })
+end
+
+FRAMEWORK.critical_ensure_job = function(entity, op_id)
+    local jobs = config_collection(type_config.critical_jobs)
+    if not jobs then
+        return nil, "critical_jobs is not configured"
+    end
+    local job, err = require("skyext.critical").reconcile(jobs, entity.id, op_id, {
+        now = os.time(),
+        last_error = "maintenance scan",
+    })
+    if not job then
+        return nil, err
+    end
+    return { task_id = job.task_id, state = job.state }
+end
+
 FRAMEWORK.session_export = function(entity, barrier_id, target_owner_epoch)
     if not session then
         return nil, "no session layer"

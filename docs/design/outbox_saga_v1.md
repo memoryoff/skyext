@@ -161,8 +161,8 @@ CREATED --业务拒绝--> FAILED
 
 ## 9. 未覆盖
 
-- 归档 worker 与 `op_ledger` 冷账本写入属于同一批后续工作（`critical` 已有索引与
-  `MAX_OPS`/`MAX_OUTBOX` 上限，但异步归档吞吐还没实现）。
+- 归档 worker 已实现（`critical.archive_ops` + `service/critical_maintenance`），
+  但**归档吞吐**还没有压测数据；`MAX_OPS` 触顶时的受控拒绝行为只有单测覆盖。
 - `skyext_outbox_*` / `skyext_saga_*` 指标目前只在本 VM 累加，跨节点汇总依赖
   `.metrics` 抓取。
 - 接收方的 `DELIVERED` 回写（接收端 ACK 后清理源角色 Outbox 条目）尚未实现：

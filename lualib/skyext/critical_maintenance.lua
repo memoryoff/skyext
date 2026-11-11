@@ -1,0 +1,163 @@
+-- 关键账本的维护扫描（P17 / P08 恢复扫描）。
+--
+-- 两件事：
+--   1. **归档**：把超过保留期的已结算操作从角色文档搬到 `op_ledger`，
+--      否则 `_critical_ops_v1` 会一直涨到撞上 512 KiB 的关键字段预算；
+--   2. **补建恢复任务**：扫出还挂着 `_critical_intent_v1.state = PREPARED` 的角色，
+--      确保 `critical_reconcile_jobs` 里有对应任务。角色文档仍是资产事实，
+--      任务表只负责"别让它被忘掉"。
+--
+-- 两条扫描都走索引（`critical_ops_oldest` / `critical_intent_state`）。没有索引时
+-- 每轮都是全表扫描，所以 `ensure_indexes` 是启用门禁。
+--
+-- 与 `critical` 的分工：本模块只负责"找到谁需要维护"，真正的搬运与 CAS 在
+-- `critical.archive_ops` 里，并且必须经 owner 的实体队列执行。
+local critical = require "skyext.critical"
+local log = require "skyext.log"
+local metrics = require "skyext.metrics"
+
+local M = {}
+
+M.DEFAULT_SCAN = 32
+M.DEFAULT_INTERVAL = 60
+
+local m_archive = metrics.counter("skyext_critical_maintenance_total", "Maintenance rounds by task", { "task" })
+local m_candidates =
+    metrics.gauge("skyext_critical_maintenance_candidates", "Candidates found by the last maintenance scan", { "task" })
+
+-- 归档候选：热账本最老条目已经超过保留期
+function M.scan_archive(role_coll, opts)
+    opts = opts or {}
+    if type(role_coll) ~= "table" then
+        return nil, "role collection is required"
+    end
+    local key = opts.key or "rid"
+    local called, docs, err = pcall(role_coll.find_many, role_coll, critical.archive_query(opts.now, opts.retention), {
+        projection = { [key] = 1, [critical.OPS_OLDEST_FIELD] = 1, _id = 0 },
+        limit = opts.limit or M.DEFAULT_SCAN,
+    })
+    if not called then
+        return nil, "scan failed: " .. tostring(docs)
+    end
+    if type(docs) ~= "table" then
+        return nil, tostring(err or "scan failed")
+    end
+    local list = {}
+    for _, doc in ipairs(docs) do
+        if type(doc) == "table" and doc[key] ~= nil then
+            list[#list + 1] = { rid = doc[key], oldest = doc[critical.OPS_OLDEST_FIELD] }
+        end
+    end
+    return list
+end
+
+-- 未决意图候选：PREPARED 但可能没有对应任务
+function M.scan_intents(role_coll, opts)
+    opts = opts or {}
+    if type(role_coll) ~= "table" then
+        return nil, "role collection is required"
+    end
+    local key = opts.key or "rid"
+    local called, docs, err = pcall(role_coll.find_many, role_coll, {
+        [critical.INTENT_FIELD .. ".state"] = "PREPARED",
+    }, {
+        projection = {
+            [key] = 1,
+            [critical.INTENT_FIELD .. ".op_id"] = 1,
+            [critical.INTENT_FIELD .. ".prepared_at"] = 1,
+            _id = 0,
+        },
+        limit = opts.limit or M.DEFAULT_SCAN,
+    })
+    if not called then
+        return nil, "scan failed: " .. tostring(docs)
+    end
+    if type(docs) ~= "table" then
+        return nil, tostring(err or "scan failed")
+    end
+    local list = {}
+    for _, doc in ipairs(docs) do
+        local intent = type(doc) == "table" and doc[critical.INTENT_FIELD] or nil
+        if type(intent) == "table" and type(intent.op_id) == "string" then
+            list[#list + 1] = { rid = doc[key], op_id = intent.op_id, prepared_at = intent.prepared_at }
+        end
+    end
+    return list
+end
+
+-- 跑一轮。
+--
+-- deps:
+--   role_coll                    角色集合
+--   archive(rid, limit)          经 owner 队列执行归档，返回 ok, stats|reason
+--   ensure_job(rid, op_id)       确保恢复任务存在，返回 ok, job|reason
+--   now / retention / limit
+function M.run_once(deps, opts)
+    opts = opts or {}
+    if type(deps) ~= "table" or type(deps.role_coll) ~= "table" then
+        return nil, "deps.role_coll is required"
+    end
+    local stats = { archived = 0, intents = 0, skipped = 0, failed = 0 }
+
+    local candidates, aerr = M.scan_archive(deps.role_coll, opts)
+    if not candidates then
+        return nil, aerr
+    end
+    m_candidates:set(#candidates, { task = "archive" })
+    for _, entry in ipairs(candidates) do
+        if type(deps.archive) ~= "function" then
+            stats.skipped = stats.skipped + 1
+        else
+            -- deps 的契约是 (ok, stats|reason)；pcall 会在前面多插一个 true，
+            -- 只取两个返回值会把 `true` 当成 stats
+            local called, ok, result = pcall(deps.archive, entry.rid, opts.limit)
+            if not called then
+                stats.failed = stats.failed + 1
+                log.error("critical archive raised", "rid", tostring(entry.rid), "err", tostring(ok))
+            elseif ok == true and type(result) == "table" then
+                stats.archived = stats.archived + (result.archived or 0)
+            else
+                stats.skipped = stats.skipped + 1
+            end
+        end
+    end
+    m_archive:inc(1, { task = "archive" })
+
+    local intents, ierr = M.scan_intents(deps.role_coll, opts)
+    if not intents then
+        return nil, ierr
+    end
+    m_candidates:set(#intents, { task = "intent" })
+    for _, entry in ipairs(intents) do
+        if type(deps.ensure_job) ~= "function" then
+            stats.skipped = stats.skipped + 1
+        else
+            local called, ok = pcall(deps.ensure_job, entry.rid, entry.op_id)
+            if not called then
+                stats.failed = stats.failed + 1
+                log.error(
+                    "critical intent job ensure raised",
+                    "rid",
+                    tostring(entry.rid),
+                    "op_id",
+                    tostring(entry.op_id),
+                    "err",
+                    tostring(ok)
+                )
+            elseif ok == true then
+                stats.intents = stats.intents + 1
+            else
+                stats.skipped = stats.skipped + 1
+            end
+        end
+    end
+    m_archive:inc(1, { task = "intent" })
+    return stats
+end
+
+function M.ensure_indexes(colls)
+    -- 复用 critical 的索引口径：同一份定义，避免两处漂移
+    return critical.ensure_indexes(colls)
+end
+
+return M

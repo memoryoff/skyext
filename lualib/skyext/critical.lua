@@ -46,6 +46,16 @@ M.STATUS = {
 -- 单文档 16 MB 上限之前的安全阈值。超过就受控拒绝新的关键操作并告警，
 -- 靠归档吞吐保证平时不触达；不能等 Mongo 报文档过大再处理
 M.MAX_OPS = 512
+-- 归档保留期与单次搬运上限
+M.ARCHIVE_RETENTION = 7 * 24 * 3600
+M.ARCHIVE_LIMIT = 64
+-- 只有已结算的状态才能离开热账本：PREPARED/中间态搬走等于丢掉未决证据
+M.ARCHIVE_SETTLED = {
+    [M.STATUS.COMMITTED] = true,
+    [M.STATUS.BUSINESS_REJECTED] = true,
+    ["ABORTED"] = true,
+}
+
 -- 单角色未清理的 Outbox 条目上限。超过就拒绝新事件：`_critical_outbox_v1`
 -- 和 `_critical_ops_v1` 共享 512 KiB 的关键字段预算，无上限增长会让角色
 -- 在下次加载时直接 fail-closed
@@ -61,6 +71,8 @@ M.OPS_FIELD = "_critical_ops_v1"
 M.OUTBOX_FIELD = "_critical_outbox_v1"
 -- 待发事件计数：既是索引字段，也是"离开 PENDING 时恰减一次"的凭据
 M.OUTBOX_PENDING_FIELD = "_critical_outbox_pending_count"
+-- 热账本最老一条操作的 `at`：归档扫描的索引字段
+M.OPS_OLDEST_FIELD = "_critical_ops_oldest_at"
 
 M.EVENT_PREFIX = "evt_"
 M.SERVICE_PREFIX = "srv_"
@@ -83,6 +95,7 @@ local m_decisions =
     metrics.counter("skyext_critical_decisions_total", "Critical operation decisions by status", { "status" })
 local m_quarantined =
     metrics.counter("skyext_critical_quarantined_total", "Critical caches quarantined by reason", { "reason" })
+local m_archive = metrics.counter("skyext_critical_archive_total", "Critical op archive attempts", { "result" })
 local m_same_owner_resume = metrics.counter(
     "skyext_critical_same_owner_resume_total",
     "Critical operations resumed by the same owner after a PREPARE",
@@ -565,6 +578,12 @@ local function commit_core(ctx, req, handlers)
             end
             write["$set"][M.OUTBOX_PENDING_FIELD] = (critical[M.OUTBOX_PENDING_FIELD] or 0) + #new_events
         end
+        -- 归档扫描的索引字段：只增不减的最小值。归档自己会重算，
+        -- 这里只需要保证"还有一条老操作没归档"时它不会被漏掉
+        local oldest = critical[M.OPS_OLDEST_FIELD]
+        if math.type(oldest) ~= "integer" or (math.type(req.now) == "integer" and req.now < oldest) then
+            write["$set"][M.OPS_OLDEST_FIELD] = req.now
+        end
     else
         -- 业务拒绝：ORM 必须原样不动。改了就不能继续——这份内存再也说不清
         -- 到底哪些改动属于被拒绝的操作，只能隔离重载
@@ -633,6 +652,12 @@ local function commit_core(ctx, req, handlers)
     critical[M.INTENT_FIELD] = nil
     critical[M.OPS_FIELD] = critical[M.OPS_FIELD] or {}
     critical[M.OPS_FIELD][req.op_id] = op_doc
+    if applied == true then
+        local oldest = critical[M.OPS_OLDEST_FIELD]
+        if math.type(oldest) ~= "integer" or (math.type(req.now) == "integer" and req.now < oldest) then
+            critical[M.OPS_OLDEST_FIELD] = req.now
+        end
+    end
     if applied == true and new_events and #new_events > 0 then
         critical[M.OUTBOX_FIELD] = critical[M.OUTBOX_FIELD] or {}
         for _, ev in ipairs(new_events) do
@@ -806,6 +831,18 @@ function M.query(entity, op_id, opts)
         return { status = M.STATUS.UNKNOWN, reason = "document not loaded" }
     end
     local op = lookup_op(critical, op_id)
+    if not op and opts.ledger then
+        -- 热条目已经被归档：不查冷账本就会把"已提交"报成"没执行"，
+        -- 那会让调用方重放一次本该只执行一次的操作
+        local archived, aerr = opts.ledger:critical_find({ rid = ctx.rid, op_id = op_id }, { _id = false })
+        if archived == nil and aerr ~= nil then
+            -- 读失败不等于没有记录
+            return { status = M.STATUS.UNKNOWN, reason = "ledger read failed: " .. tostring(aerr) }
+        end
+        if type(archived) == "table" then
+            return { status = archived.status, response = archived.response, archived = true }
+        end
+    end
     if op then
         if op.status == M.STATUS.COMMITTED or op.status == M.STATUS.BUSINESS_REJECTED then
             return { status = op.status, response = op.response }
@@ -992,6 +1029,152 @@ function M.finish_job(jobs_coll, rid, op_id, job_version, state_name, opts)
 end
 
 -- ---------------------------------------------------------------------------
+-- 归档（热 _critical_ops_v1 -> 冷 op_ledger）
+-- ---------------------------------------------------------------------------
+--
+-- 顺序是硬约束：**先多数派 upsert 到冷账本，确认后才 CAS 删除热字段**。
+-- 反过来会留下"热里没有、冷里也没有"的窗口，那个操作记录就永久消失了。
+--
+-- 必须在该角色 owner 的实体队列内调用：删除热字段是一次 `_version` CAS，
+-- 绕过 owner 会和业务请求抢同一个版本。
+
+-- 扫描口径：热账本里有超过保留期的条目
+function M.archive_query(now, retention)
+    return { [M.OPS_OLDEST_FIELD] = { ["$lte"] = (now or os.time()) - (retention or M.ARCHIVE_RETENTION) } }
+end
+
+function M.archive_ops(ctx_or_entity, deps, opts)
+    opts = opts or {}
+    local ctx = ctx_or_entity.dbname and ctx_or_entity or coords_of(ctx_or_entity)
+    if not ctx then
+        return nil, "invalid context"
+    end
+    local ledger = deps and deps.ledger
+    if type(ledger) ~= "table" then
+        return nil, "ledger collection is required"
+    end
+    local now = opts.now or os.time()
+    local retention = opts.retention or M.ARCHIVE_RETENTION
+    local limit = opts.limit or M.ARCHIVE_LIMIT
+
+    local critical = critical_of(ctx)
+    if not critical then
+        return nil, "document not loaded"
+    end
+    local ops = critical[M.OPS_FIELD] or {}
+
+    local victims = {}
+    for op_id, op in pairs(ops) do
+        if
+            type(op) == "table"
+            and M.ARCHIVE_SETTLED[op.status]
+            and math.type(op.at) == "integer"
+            and op.at <= now - retention
+        then
+            victims[#victims + 1] = { op_id = op_id, op = op }
+        end
+    end
+    if #victims == 0 then
+        return { archived = 0 }
+    end
+    table.sort(victims, function(a, b)
+        return a.op.at < b.op.at
+    end)
+    while #victims > limit do
+        victims[#victims] = nil
+    end
+
+    local moved = {}
+    for _, v in ipairs(victims) do
+        local state = ledger:critical_find_and_modify({
+            query = { rid = ctx.rid, op_id = v.op_id },
+            update = {
+                ["$setOnInsert"] = {
+                    rid = ctx.rid,
+                    op_id = v.op_id,
+                    status = v.op.status,
+                    op_type = v.op.op_type,
+                    param_hash = v.op.param_hash,
+                    source_namespace = v.op.source_namespace,
+                    source_id = v.op.source_id,
+                    response = v.op.response,
+                    at = v.op.at,
+                    archived_at = now,
+                },
+            },
+            upsert = true,
+            new = true,
+        })
+        if state ~= "CONFIRMED" then
+            -- 冷账本没确认就绝不删热条目：宁可两边都留一份，也不能两边都没有
+            m_archive:inc(1, { result = tostring(state):lower() })
+            return { archived = #moved, pending = #victims - #moved }, "ledger " .. tostring(state):lower()
+        end
+        moved[#moved + 1] = v.op_id
+    end
+
+    local unset = {}
+    for _, op_id in ipairs(moved) do
+        unset[M.OPS_FIELD .. "." .. op_id] = true
+    end
+    -- 重算最老时间：剩下的条目可能都比保留期新
+    local moved_set = {}
+    for _, op_id in ipairs(moved) do
+        moved_set[op_id] = true
+    end
+    local remaining_oldest
+    for op_id, op in pairs(ops) do
+        if not moved_set[op_id] and type(op) == "table" and math.type(op.at) == "integer" then
+            if not remaining_oldest or op.at < remaining_oldest then
+                remaining_oldest = op.at
+            end
+        end
+    end
+    local update = { ["$unset"] = unset }
+    if remaining_oldest then
+        update["$set"] = { [M.OPS_OLDEST_FIELD] = remaining_oldest }
+    else
+        unset[M.OPS_OLDEST_FIELD] = true
+    end
+
+    local state, detail = dbmgr.critical_update(
+        ctx.dbname,
+        ctx.dbcoll,
+        ctx.key,
+        ctx.unique_id,
+        ctx.doc._version,
+        update,
+        { handle = ctx.handle, metadata_only = true }
+    )
+    if state ~= "CONFIRMED" then
+        -- 热条目还在、冷账本多一份副本：重复归档是幂等的（$setOnInsert）
+        m_archive:inc(1, { result = tostring(state):lower() })
+        return { archived = 0, retry = true }, state
+    end
+
+    local copy = copy_critical(critical)
+    copy[M.OPS_FIELD] = copy[M.OPS_FIELD] or {}
+    for _, op_id in ipairs(moved) do
+        copy[M.OPS_FIELD][op_id] = nil
+    end
+    copy[M.OPS_OLDEST_FIELD] = remaining_oldest
+    dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, copy, ctx.handle)
+    m_archive:inc(1, { result = "ok" })
+    log.info(
+        "critical ops archived",
+        "rid",
+        tostring(ctx.rid),
+        "moved",
+        #moved,
+        "remaining_oldest",
+        tostring(remaining_oldest),
+        "version",
+        tostring(detail and detail.version)
+    )
+    return { archived = #moved, remaining = remaining_oldest }
+end
+
+-- ---------------------------------------------------------------------------
 -- 索引
 -- ---------------------------------------------------------------------------
 --
@@ -1008,6 +1191,14 @@ function M.index_specs(colls)
                 { rid = 1 },
                 name = "critical_intent_state",
                 partialFilterExpression = { ["_critical_intent_v1.state"] = "PREPARED" },
+            },
+        },
+        {
+            colls.role,
+            {
+                { [M.OPS_OLDEST_FIELD] = 1 },
+                name = "critical_ops_oldest",
+                partialFilterExpression = { [M.OPS_OLDEST_FIELD] = { ["$exists"] = true } },
             },
         },
         { colls.jobs, { { rid = 1 }, { op_id = 1 }, name = "rid_op_id", unique = true } },

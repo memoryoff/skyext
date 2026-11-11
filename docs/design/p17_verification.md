@@ -38,6 +38,9 @@
 | I24 | 快照损坏/超限/epoch 不符 | 拒绝导入，目标会话不变 | `session_snapshot.test.lua`、`entity_agent.test.lua` |
 | I25 | 索引建不起来 | 调度器/回调服务拒绝启动 | `outbox_worker.test.lua`、`charge_reconcile.test.lua`、`saga.test.lua` |
 | I26 | 停服时实体卸不掉 | 进程不退出，可重试 | `node_shutdown.test.lua` |
+| I28 | 冷账本写入未确认 | 热条目原样保留，不出现"两边都没有" | `critical.test.lua` |
+| I29 | 热条目已归档后查询 | 回落冷账本；读失败报 UNKNOWN 而非"没执行" | `critical.test.lua` |
+| I30 | PREPARED 但没有恢复任务 | 维护扫描补建任务 | `critical_maintenance.test.lua` |
 | I27 | 迁移钩子卡住 | 截止时间到后继续卸载，不永久阻塞 | `node_shutdown.test.lua` |
 
 **未覆盖的注入**（需要真实依赖，见 §3）：真实副本集 `stepDown`、Mongo 网络分区、
@@ -112,4 +115,6 @@ etcd 租约抖动、网关进程 kill、跨节点 RPC 超时。
 - 压测脚本不在仓库里：仓库只提供指标与注入点，压测工具（wrk/自研 bot）属于部署侧。
 - 故障注入是依赖替身，不是运行期开关：生产环境**没有**可以打开"注入故障"的入口，
   这是刻意设计。
+- 归档的**吞吐**没有压测数据：保留期 7 天、单角色单次 64 条是初值，需要按
+  `skyext_critical_archive_total` 与 `_critical_ops_v1` 体积实测校准。
 - 迁移的 `activate` 需要游戏层接上网关 `bind_owner`，框架只提供原语与失败语义。

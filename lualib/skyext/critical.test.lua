@@ -1201,3 +1201,123 @@ t.describe("critical 源侧 Outbox", function()
         t.expect(h.applied).to.equal(0)
     end)
 end)
+
+-- 归档：热 _critical_ops_v1 -> 冷 op_ledger
+t.describe("critical 归档", function()
+    local OP_A = "srv_" .. string.rep("a", 64)
+    local OP_B = "srv_" .. string.rep("b", 64)
+
+    local function fake_ledger(over)
+        local l = { upserts = {}, state = "CONFIRMED" }
+        for k, v in pairs(over or {}) do
+            l[k] = v
+        end
+        function l:critical_find_and_modify(opts)
+            l.upserts[#l.upserts + 1] = opts
+            return l.state, { value = opts.update["$setOnInsert"] }
+        end
+        function l:critical_find(query)
+            l.find = query
+            return l.archived_doc
+        end
+        return l
+    end
+
+    local function with_ops(h, ops, oldest)
+        h.store.critical = {
+            _critical_ops_v1 = ops,
+            _critical_ops_oldest_at = oldest,
+        }
+        return h
+    end
+
+    t.it("moves settled and expired ops to the ledger, then removes them", function()
+        local h = harness()
+        with_ops(h, {
+            [OP_A] = { status = "COMMITTED", op_type = "shop.buy", at = 100, param_hash = string.rep("1", 64) },
+            [OP_B] = { status = "COMMITTED", op_type = "shop.buy", at = 900, param_hash = string.rep("2", 64) },
+        }, 100)
+        local ledger = fake_ledger()
+
+        local stats = assert(h.critical.archive_ops(h.entity, { ledger = ledger }, { now = 1000, retention = 500 }))
+        t.expect(stats.archived).to.equal(1)
+        -- 先写冷账本、确认后才删热条目
+        t.expect(#ledger.upserts).to.equal(1)
+        t.expect(ledger.upserts[1].query.op_id).to.equal(OP_A)
+        t.expect(ledger.upserts[1].upsert).to.equal(true)
+        t.expect(h.store.critical._critical_ops_v1[OP_A]).to.be_nil()
+        t.expect(h.store.critical._critical_ops_v1[OP_B]).to_not.be_nil()
+        -- 剩下的最老一条要重算，否则扫描会一直命中
+        t.expect(h.store.critical._critical_ops_oldest_at).to.equal(900)
+    end)
+
+    t.it("keeps the hot record when the ledger write is not confirmed", function()
+        local h = harness()
+        with_ops(h, {
+            [OP_A] = { status = "COMMITTED", op_type = "shop.buy", at = 100 },
+        }, 100)
+        local ledger = fake_ledger({ state = "UNKNOWN" })
+
+        local stats, err = h.critical.archive_ops(h.entity, { ledger = ledger }, { now = 1000, retention = 500 })
+        t.expect(stats.archived).to.equal(0)
+        t.expect(err).to.match("ledger")
+        -- 冷账本没确认就删热条目 = 两边都没有，那个操作记录就永久消失了
+        t.expect(h.store.critical._critical_ops_v1[OP_A]).to_not.be_nil()
+    end)
+
+    t.it("never archives an unsettled op", function()
+        local h = harness()
+        with_ops(h, {
+            [OP_A] = { status = "ABORTED", op_type = "shop.buy", at = 100 },
+            [OP_B] = { status = "IN_PROGRESS", op_type = "shop.buy", at = 100 },
+        }, 100)
+        local ledger = fake_ledger()
+        local stats = assert(h.critical.archive_ops(h.entity, { ledger = ledger }, { now = 1000, retention = 500 }))
+        t.expect(stats.archived).to.equal(1)
+        t.expect(h.store.critical._critical_ops_v1[OP_A]).to.be_nil()
+        t.expect(h.store.critical._critical_ops_v1[OP_B]).to_not.be_nil()
+    end)
+
+    t.it("does nothing when nothing is old enough", function()
+        local h = harness()
+        with_ops(h, {
+            [OP_A] = { status = "COMMITTED", op_type = "shop.buy", at = 990 },
+        }, 990)
+        local ledger = fake_ledger()
+        local stats = assert(h.critical.archive_ops(h.entity, { ledger = ledger }, { now = 1000, retention = 500 }))
+        t.expect(stats.archived).to.equal(0)
+        t.expect(#ledger.upserts).to.equal(0)
+    end)
+
+    t.it("requires a ledger collection", function()
+        local h = harness()
+        with_ops(h, {}, nil)
+        local stats, err = h.critical.archive_ops(h.entity, {}, {})
+        t.expect(stats).to.be_nil()
+        t.expect(err).to.match("ledger")
+    end)
+
+    -- 热条目已归档时，查询必须回落到冷账本；否则会把"已提交"报成"没执行"
+    t.it("falls back to the ledger when the hot record is gone", function()
+        local h = harness()
+        with_ops(h, {}, nil)
+        local ledger = fake_ledger({ archived_doc = { status = "COMMITTED", response = { gold = 1 } } })
+
+        local result = h.critical.query(h.entity, OP_A, { ledger = ledger })
+        t.expect(result.status).to.equal("COMMITTED")
+        t.expect(result.archived).to.equal(true)
+        t.expect(ledger.find.op_id).to.equal(OP_A)
+    end)
+
+    t.it("reports UNKNOWN when the ledger read fails", function()
+        local h = harness()
+        with_ops(h, {}, nil)
+        local ledger = fake_ledger()
+        function ledger:critical_find()
+            return nil, "socket closed"
+        end
+        local result = h.critical.query(h.entity, OP_A, { ledger = ledger })
+        -- 读失败不等于没有记录
+        t.expect(result.status).to.equal("UNKNOWN")
+    end)
+end)

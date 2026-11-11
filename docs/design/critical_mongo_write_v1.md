@@ -54,3 +54,27 @@ Skynet Mongo 驱动的 `safe_update` / `findAndModify` 只带默认写关注（`
   分支，UNKNOWN 不产生重复文档。
 - **未覆盖**：真实副本集的多数派写、切主回滚、`writeConcernError` 的真实形态。
   这些需要 `*.integration.test.lua` + 真实 Mongo 副本集，属于 P17 的故障注入范围。
+
+## 5. 热账本归档（P17）
+
+`_critical_ops_v1` 会随操作次数一直涨，最终撞上 512 KiB 的关键字段预算。
+归档把它搬到冷账本 `op_ledger`：
+
+```text
+扫 _critical_ops_oldest_at <= now - retention
+  -> 经 owner 实体队列：critical.archive_ops
+     1) 每条已结算操作 majority upsert 到 op_ledger（唯一索引 rid+op_id）
+     2) **全部确认后**，一次 CAS 从热账本 $unset，并重算 _critical_ops_oldest_at
+```
+
+- **顺序是硬约束**：先删后写会留下"热里没有、冷里也没有"的窗口，那个操作记录
+  永久消失。冷账本写没确认时，热条目原样保留（重复归档靠 `$setOnInsert` 幂等）。
+- 只有 `COMMITTED / BUSINESS_REJECTED / ABORTED` 能被归档。`PREPARED` 或中间态
+  搬走等于丢掉未决证据。
+- `critical.query(entity, op_id, { ledger = coll })` 在热条目缺失时回落到冷账本；
+  读失败返回 `UNKNOWN`，**不**报"没执行"——那会让调用方重放一次本该只执行一次的操作。
+- 扫描字段 `_critical_ops_oldest_at` 在每次提交时取最小值维护，归档后按剩余条目
+  重算（或 `$unset`）。偏索引 `critical_ops_oldest` 是启用门禁。
+- 调度：`service/critical_maintenance.lua`（同时负责补建 PREPARED 的恢复任务），
+  实体侧命令是 `critical_archive` / `critical_ensure_job`，集合来自实体类型配置的
+  `critical_ledger` / `critical_jobs`。

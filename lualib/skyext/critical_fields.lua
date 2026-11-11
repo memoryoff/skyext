@@ -19,8 +19,11 @@ M.OUTBOX = "_critical_outbox_v1"
 -- 待发事件的**可索引标志**。它必须和白名单里的结构字段一起提取，否则会命中
 -- "unknown critical field" 分支，让写了 Outbox 的角色直接加载失败
 M.OUTBOX_PENDING = "_critical_outbox_pending_count"
+-- 热账本里最老一条操作的 `at`：归档扫描的索引字段。
+-- 没有它，归档只能全表扫描，或者根本不扫
+M.OPS_OLDEST = "_critical_ops_oldest_at"
 
-M.FIELDS = { M.INTENT, M.OPS, M.OUTBOX, M.OUTBOX_PENDING }
+M.FIELDS = { M.INTENT, M.OPS, M.OUTBOX, M.OUTBOX_PENDING, M.OPS_OLDEST }
 
 local WHITELIST = {}
 for _, name in ipairs(M.FIELDS) do
@@ -209,6 +212,12 @@ function M.extract(raw)
         local ok, err = check_entry_table(M.OUTBOX, critical[M.OUTBOX])
         if not ok then
             return nil, err
+        end
+    end
+    if critical[M.OPS_OLDEST] ~= nil then
+        local oldest = critical[M.OPS_OLDEST]
+        if math.type(oldest) ~= "integer" or oldest < 0 then
+            return nil, M.OPS_OLDEST .. " must be a non-negative integer"
         end
     end
     if critical[M.OUTBOX_PENDING] ~= nil then
