@@ -543,6 +543,13 @@ local function get_entry(dbname, dbcoll, unique_id)
     return get_cache_collection(dbname, dbcoll)[unique_id]
 end
 
+-- 缓存里的关键元数据副本。**只读**：调用方不得就地修改，
+-- 需要更新时走 set_critical（DB 是权威，内存只是跟随）
+function M.cached_critical(dbname, dbcoll, unique_id)
+    local entry = get_entry(dbname, dbcoll, unique_id)
+    return entry and entry.critical or nil
+end
+
 -- 只读观测：测试与排障用
 function M.state_of(dbname, dbcoll, unique_id)
     local entry = get_entry(dbname, dbcoll, unique_id)
