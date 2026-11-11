@@ -124,7 +124,7 @@ ping.response { sent, acked, session_epoch }
 
 - 服务端、Lua SDK、TypeScript SDK 的 V2 解码与 ACK 已实现；TS 侧只跑了 `tsc --noEmit`，
   bun 测试与真机 E2E 仍需在 P14 的 CI 里执行。
-- `SessionSnapshotV1` 的编码/校验尚未交付（P15），
+- `SessionSnapshotV1` 的编码/校验与恢复已交付（见 `session_snapshot_v1.md`），但六阶段迁移编排尚未接线，
   属于 P15/P14 的后续工作。
 - 登录链路新增了 `session_mode` / `session_epoch` 参数与返回值，属于跨服务内部 RPC
   变更：部署时登录服务、网关与实体节点必须同版本；旧客户端不填新字段，仍按 LEGACY 工作。
