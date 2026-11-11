@@ -178,7 +178,7 @@ function M.encode_request(protocol_name, value)
         return nil, "protocol name is too long"
     end
     -- 协议名来自 proto.name（字母、数字、点、下划线、连字符）；出现别的字节一定是上游拼错了
-    if not protocol_name:match("^[%w%._%-]+$") then
+    if not protocol_name:match("^[A-Za-z0-9%._%-]+$") then
         return nil, "protocol name has invalid characters"
     end
 

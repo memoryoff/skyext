@@ -1,6 +1,7 @@
 # request_fingerprint_v1（请求指纹输入契约）
 
-> **状态：§1 规范化编码已实现（`lualib/skyext/canonical_lua.lua`）；§2 指纹计算待实现，须先过 P00-A 探针。**
+> **状态：§1 规范化编码与 §2 指纹接口均已实现；真实 HMAC 与解码等价性仍须过 P00-A 探针；
+> 会话层接入（P03）与 `resp_cache` 条目格式变更尚未实现。**
 > 本文件定义服务器内部如何把一个**已解码**的请求表变成确定性字节流，供会话层做
 > `req_id` 参数摘要比对。它不改变客户端 wire 格式，客户端 SDK 不参与计算。
 
@@ -108,20 +109,51 @@ canonical.encode_request(protocol_name, value)
 摘要域；两者任一变化都要整体提升，旧缓存按 `REQUEST_EXPIRED` 处理，否则新旧输入会混在一起。
 协议名限定为 `[A-Za-z0-9._-]+`，最多 128 字节：它来自 `proto.name`，出现别的字节一定是上游拼错了。
 
-## 2. 指纹计算（待实现，P00-A 阻断）
+## 2. 指纹计算（接口已实现，真实 HMAC 待 P00-A 验证）
 
-计划实现：
+`lualib/skyext/fingerprint.lua` 提供：
 
+```lua
+fingerprint.compute(protocol_name, request, hash_fn)   -- -> 32 字节 digest | nil, err
+fingerprint.entry_from_digest(digest, protocol_name, pack)
+fingerprint.new_entry(protocol_name, request, pack, hash_fn)
+fingerprint.matches(entry, protocol_name, request, hash_fn, equal_fn)
 ```
-local input, err = encode_request(protocol, request)
-if not input then return nil, err end   -- 编码失败整体拒绝，不能把 nil 传给 HMAC
-local fingerprint = crypto.hmac_sha256("skyext:fingerprint:v1", input)
-```
 
-- 固定字符串是**非保密的用途分离键**，HMAC 在这里只作抗碰撞摘要，不用于验签；
-  Grant 使用独立的服务端保密密钥。
-- 输出 32 字节二进制串；`resp_cache` 条目保存 `{fingerprint_version=1, name, hash, pack}`，
-  快照传输时按 `SessionSnapshotV1` 用 base64url 编码。
+`hash_fn(domain, framed_bytes)` 由调用方注入，**两个参数**。生产直接把
+`crypto.hmac_sha256` 当 `hash_fn` 传入（key 第一、msg 第二、输出 32 字节二进制），
+或写成 `function(domain, input) return crypto.hmac_sha256(domain, input) end`。
+**禁止预绑定第一个参数**（例如 `function(input) return crypto.hmac_sha256(DOMAIN, input) end`）：
+那样 `domain` 会占住形参、真实输入被丢掉，摘要与请求无关，`matches` 会对同协议任意请求恒真。
+固定域串是**非保密的用途分离键**，HMAC 在这里只作抗碰撞摘要，不用于验签；
+Grant 使用独立的服务端保密密钥与 `G1` 域，两者不能互换。`equal_fn` 生产必须传
+`crypto.const_equals`，默认的 `==` 仅供测试。
+
+- 编码失败整体拒绝，不能把 `nil` 传给 HMAC。
+- **摘要必须在业务 handler 执行之前、对解码后的请求表计算**。handler 可能修改入参，
+  执行后再算会与重传请求对不上，全部落到 `REQUEST_CONFLICT`。`entry_from_digest`
+  用于"先算摘要、执行完拿到 pack 再组装条目"。
+- `new_entry` / `entry_from_digest` 要求 `pack` 是 string：`resp_cache` 的淘汰路径会取
+  `#entry.pack`，`nil` 会让会话服务报错。
+- `matches` 返回 `true` 或 `false, reason, kind`。调用方按 `kind` 映射错误码，
+  **不要比较 reason 文案**：
+
+  | kind | 含义 | 建议处理 |
+  | --- | --- | --- |
+  | `stale_version` | 条目缺版本或版本不符 | `REQUEST_EXPIRED` |
+  | `protocol_mismatch` | 同 req_id 换了协议 | `REQUEST_CONFLICT` |
+  | `invalid_hash` | 条目缺 hash 或长度不对 | `REQUEST_EXPIRED` |
+  | `mismatch` | 参数不同 | `REQUEST_CONFLICT` |
+  | `internal` | 编码/摘要/比较函数故障 | 整体失败，不回业务错误码 |
+
+- `matches` 为 true **只说明参数相同，不代表业务已提交**；条目只能在 handler 产出 pack
+  之后写入，不能为了"预热"提前写。
+- `resp_cache` 条目目标格式是 `{fingerprint_version=1, name, hash, pack}`（P03 落地；当前仍是
+  `{pack, name}`）；缺版本或 hash 的旧条目一律按不可用处理，调用方应返回 `REQUEST_EXPIRED`，
+  不能猜测重放。
+- 快照传输时 `hash` 用 `crypto.base64urlencode` 编码、安装时 `base64urldecode` 还原；
+  `matches` 收的是**解码后的 32 字节原始值**，漏解码会让续接后的所有重传变成
+  `invalid_hash`。`SessionSnapshotV1` 是方案中拟新增的契约，当前仓库尚未实现。
 - 日志只打印指纹前 8 字节的 hex 与编码后长度；**禁止打印编码字节本身**——
   编码里的 `S` 帧就是请求明文，打印它等于绕过脱敏。
 
@@ -131,7 +163,10 @@ P00-A 探针必须先固定并验证：
    输出 32 字节二进制）；
 2. 同一语义、不同插入顺序的表在 1000 次规范化后输出完全一致；
 3. 不同语义（含混合键、64-bit 边界、空容器、缺省字段）产生不同摘要；
-4. 环、非法类型、超限输入 fail-closed。
+4. 环、非法类型、超限输入 fail-closed；
+5. **接线正确**：同一协议下两个不同 request 经 `fingerprint.compute` 的 digest 必须不同；
+   改 `fingerprint.DOMAIN` 后同一请求的 digest 必须变化。这条专门拦截"预绑定第一个参数"
+   或忽略输入的实现——它们仍会返回合法的 32 字节长度。
 
 **探针未通过前，P03 不得接入指纹比对。**
 

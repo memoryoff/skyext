@@ -80,8 +80,12 @@ grant.sign(fields, hmac_fn)          -- hmac_fn(key_id, canonical_bytes) -> mac
 grant.verify(fields, mac, hmac_fn, equal_fn)
 ```
 
-- `hmac_fn` 默认不存在，必须显式传入；服务端用 `crypto.hmac_sha256(key, input)` 包装，
-  密钥从配置/密钥设施按 `key_id` 取。
+- `hmac_fn` 默认不存在，必须显式传入；服务端直接把 `crypto.hmac_sha256` 当 `hmac_fn`
+  （key 第一、msg 第二），或写成
+  `function(key_id, input) return crypto.hmac_sha256(resolve(key_id), input) end`。
+  **禁止预绑定第一个参数**（例如 `function(input) return crypto.hmac_sha256("k1", input) end`）：
+  那样 `key_id` 会占住形参、真实签名输入被丢弃，mac 与字段无关，篡改任意字段都能验签通过。
+  这与请求指纹 `hash_fn` 的约束是同一条，P08 接入时必须用真实 crypto 跑一次"篡改必失败"的探针。
 - `verify` 的 `equal_fn` 生产必须传 `crypto.const_equals`；默认的 `==` 仅供测试。
   这一点写在接口注释里，不靠调用方自觉。
 - 密钥轮换：旧 `key_id` 在所有未到期 grant 的最大有效期 + 时钟偏差窗口内仍可验签；

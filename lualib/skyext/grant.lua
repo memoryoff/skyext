@@ -1,7 +1,9 @@
 -- 关键经济操作的授权批次与稳定操作键。
 --
 -- 客户端不自签：grant 只能由服务端签发，mac 用 key_id 指向的对称密钥计算。
--- 本模块不持有密钥，签名/验签由调用方注入 hmac_fn（见 docs/design/critical_grant_v1.md）。
+-- 本模块不持有密钥，签名/验签由调用方注入 hmac_fn(key_id, canonical_bytes)（两参）。
+-- **禁止预绑定第一个参数**：那样 key_id 会占住形参、真实输入被丢弃，mac 与字段无关。
+-- 详见 docs/design/critical_grant_v1.md。
 --
 -- 验签只证明"服务端签发、字段未被篡改"：expires_at、seq <= max_seq、rid 与会话一致，
 -- 都必须由调用方校验。签名不等于"该操作已消费"，去重必须落库。
