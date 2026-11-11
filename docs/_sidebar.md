@@ -1,6 +1,7 @@
 - [首页](/)
 - [快速上手](getting-started.md)
 - [架构概览](overview.md)
+- [架构与目录索引](architecture.md)
 - [不做的事](non-goals.md)
 
 - **使用指南**

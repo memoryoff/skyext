@@ -6,7 +6,8 @@ skyext 是基于 [skynet](https://github.com/cloudwu/skynet) 的分布式游戏�
 
 1. [快速上手](getting-started.md)：准备依赖，构建并启动示例，运行测试。
 2. [架构概览](overview.md)：理解引擎/游戏分层、节点职责与配置加载。
-3. [不做的事](non-goals.md)：做过又删掉的设计，以及删它们的理由。
+3. [架构与目录索引](architecture.md)：按目录、按文件查每个模块的职责。
+4. [不做的事](non-goals.md)：做过又删掉的设计，以及删它们的理由。
 4. 根据需要进入下面的操作指南。
 
 | 使用指南 | 内容 |
