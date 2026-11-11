@@ -1098,3 +1098,106 @@ t.describe("critical 任务抢占边界", function()
         t.expect(err).to.match("not authorized")
     end)
 end)
+
+-- P13 源侧：Outbox 事件必须和资产增量进同一次 CAS
+t.describe("critical 源侧 Outbox", function()
+    local OP_ID = "srv_" .. string.rep("a", 64)
+    local EVENT_ID = "evt_" .. string.rep("a", 64)
+    local PAYLOAD = { item = 1 }
+
+    local function internal(h, opts)
+        opts = opts or {}
+        local payload = opts.payload or PAYLOAD
+        local hash = assert(h.critical.param_hash_of(opts.op_type or "mail.send", payload, HASH))
+        local issuer = assert(h.capability.new_issuer("outbox", {}))
+        local cap = assert(h.capability.issue(issuer, {
+            rid = 7,
+            service_op_id = OP_ID,
+            op_type = opts.op_type or "mail.send",
+            payload_hash = hash,
+            source_id = "role:9",
+            now = h.now,
+        }))
+        local event = {
+            event_id = EVENT_ID,
+            target_type = "role",
+            target_id = 9,
+            op_type = opts.op_type or "mail.send",
+            param_hash = hash,
+            payload = payload,
+            status = "PENDING",
+            attempt = 0,
+            created_at = h.now,
+        }
+        local outbox = opts.outbox
+        if outbox == nil then
+            outbox = { event }
+        end
+        return h.critical.execute_internal(
+            h.entity,
+            OP_ID,
+            opts.op_type or "mail.send",
+            payload,
+            h.handlers(opts.handlers),
+            {
+                capability = cap,
+                hash_fn = HASH,
+                source_namespace = "outbox",
+                source_id = "role:9",
+                now = h.now,
+                outbox = outbox,
+            }
+        ),
+            event
+    end
+
+    t.it("persists the event and the pending counter in the commit CAS", function()
+        local h = harness()
+        local result, event = internal(h)
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+
+        local commit = h.store.updates[#h.store.updates].update
+        t.expect(commit["$set"]["_critical_outbox_v1." .. event.event_id]).to.equal(event)
+        t.expect(commit["$set"]["_critical_outbox_pending_count"]).to.equal(1)
+        -- 内存副本必须跟上，否则下一轮 worker 读不到这条事件
+        t.expect(h.store.critical._critical_outbox_pending_count).to.equal(1)
+        t.expect(h.store.critical._critical_outbox_v1[event.event_id].status).to.equal("PENDING")
+    end)
+
+    t.it("does not enqueue events when the business rejects", function()
+        local h = harness()
+        local result = internal(h, {
+            handlers = {
+                apply = function()
+                    return false, "not enough gold"
+                end,
+            },
+        })
+        t.expect(result.status).to.equal(h.critical.STATUS.BUSINESS_REJECTED)
+        local commit = h.store.updates[#h.store.updates].update
+        t.expect(commit["$set"]["_critical_outbox_pending_count"]).to.be_nil()
+    end)
+
+    t.it("refuses a malformed event before writing anything", function()
+        local h = harness()
+        local result = internal(h, {
+            outbox = { { event_id = "evt_short", status = "PENDING" } },
+        })
+        t.expect(result.status).to.equal(h.critical.STATUS.PRECHECK_REJECTED)
+        t.expect(h.applied).to.equal(0)
+        t.expect(#h.store.updates).to.equal(0)
+    end)
+
+    -- 无上限增长会让角色在下次加载时撞上 512 KiB 关键字段预算
+    t.it("refuses new events when the outbox is full", function()
+        local h = harness()
+        local existing = {}
+        for i = 1, h.critical.MAX_OUTBOX do
+            existing[string.format("evt_%064x", i)] = { status = "ENQUEUED" }
+        end
+        h.store.critical = { _critical_outbox_v1 = existing, _critical_outbox_pending_count = 0 }
+        local result = internal(h)
+        t.expect(result.status).to.equal(h.critical.STATUS.CAPACITY_EXCEEDED)
+        t.expect(h.applied).to.equal(0)
+    end)
+end)

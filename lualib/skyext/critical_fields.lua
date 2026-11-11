@@ -16,8 +16,11 @@ local M = {}
 M.INTENT = "_critical_intent_v1"
 M.OPS = "_critical_ops_v1"
 M.OUTBOX = "_critical_outbox_v1"
+-- 待发事件的**可索引标志**。它必须和白名单里的结构字段一起提取，否则会命中
+-- "unknown critical field" 分支，让写了 Outbox 的角色直接加载失败
+M.OUTBOX_PENDING = "_critical_outbox_pending_count"
 
-M.FIELDS = { M.INTENT, M.OPS, M.OUTBOX }
+M.FIELDS = { M.INTENT, M.OPS, M.OUTBOX, M.OUTBOX_PENDING }
 
 local WHITELIST = {}
 for _, name in ipairs(M.FIELDS) do
@@ -206,6 +209,13 @@ function M.extract(raw)
         local ok, err = check_entry_table(M.OUTBOX, critical[M.OUTBOX])
         if not ok then
             return nil, err
+        end
+    end
+    if critical[M.OUTBOX_PENDING] ~= nil then
+        local pending = critical[M.OUTBOX_PENDING]
+        -- 只接受非负整数：写成浮点或字符串会让索引查询与计数减法都失真
+        if math.type(pending) ~= "integer" or pending < 0 then
+            return nil, M.OUTBOX_PENDING .. " must be a non-negative integer"
         end
     end
 

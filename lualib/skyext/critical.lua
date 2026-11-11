@@ -46,6 +46,10 @@ M.STATUS = {
 -- 单文档 16 MB 上限之前的安全阈值。超过就受控拒绝新的关键操作并告警，
 -- 靠归档吞吐保证平时不触达；不能等 Mongo 报文档过大再处理
 M.MAX_OPS = 512
+-- 单角色未清理的 Outbox 条目上限。超过就拒绝新事件：`_critical_outbox_v1`
+-- 和 `_critical_ops_v1` 共享 512 KiB 的关键字段预算，无上限增长会让角色
+-- 在下次加载时直接 fail-closed
+M.MAX_OUTBOX = 512
 
 -- 与 sproto_api 的缓存处置保持同一组字面量：PRECHECK_REJECTED / UNKNOWN 是瞬时结果，
 -- 一旦进 L1 就会被固定成"永远拒绝"或"永远未知"
@@ -55,6 +59,8 @@ M.NO_CACHE = "no_cache"
 M.INTENT_FIELD = "_critical_intent_v1"
 M.OPS_FIELD = "_critical_ops_v1"
 M.OUTBOX_FIELD = "_critical_outbox_v1"
+-- 待发事件计数：既是索引字段，也是"离开 PENDING 时恰减一次"的凭据
+M.OUTBOX_PENDING_FIELD = "_critical_outbox_pending_count"
 
 M.EVENT_PREFIX = "evt_"
 M.SERVICE_PREFIX = "srv_"
@@ -134,20 +140,68 @@ local function field_name_safe(op_id)
 end
 M.field_name_safe = field_name_safe
 
+-- 源侧 Outbox 事件的形状校验。生产端把事件交给提交内核，由内核与资产增量
+-- 在**同一次 CAS** 里落库；形状不对的事件必须在 PREPARE 之前拒绝，
+-- 否则会写进一个投递端永远解析不了的记录
+local function validate_outbox_events(events)
+    if type(events) ~= "table" then
+        return nil, "outbox must be a table"
+    end
+    for i, ev in ipairs(events) do
+        if type(ev) ~= "table" then
+            return nil, "outbox event #" .. i .. " must be a table"
+        end
+        if not field_name_safe(ev.event_id) then
+            return nil, "outbox event #" .. i .. " has an invalid event_id"
+        end
+        local _, oerr = M.service_op_id_from_event(ev.event_id)
+        if oerr then
+            return nil, "outbox event #" .. i .. " has an invalid event_id"
+        end
+        if type(ev.target_type) ~= "string" or #ev.target_type == 0 then
+            return nil, "outbox event #" .. i .. " needs target_type"
+        end
+        if ev.target_id == nil then
+            return nil, "outbox event #" .. i .. " needs target_id"
+        end
+        if type(ev.op_type) ~= "string" or #ev.op_type == 0 then
+            return nil, "outbox event #" .. i .. " needs op_type"
+        end
+        if type(ev.param_hash) ~= "string" or #ev.param_hash ~= 64 then
+            return nil, "outbox event #" .. i .. " needs a 64 hex param_hash"
+        end
+        if ev.status ~= "PENDING" then
+            return nil, "outbox event #" .. i .. " must start as PENDING"
+        end
+    end
+    return true
+end
+M.validate_outbox_events = validate_outbox_events
+
 -- ---------------------------------------------------------------------------
 -- 上下文与决策
 -- ---------------------------------------------------------------------------
 
 -- entity 只需提供 db 坐标。真实实体是 { rid, dbname, dbcoll, key, unique_id, handle }；
--- 测试可以直接给 db_coords
+-- 测试可以直接给 db_coords。
+--
+-- 实体系统本身不往 entity 上塞 dbname/dbcoll：坐标在 `entity_mgr.type_config` 里，
+-- 只有 `db_name/db_coll/id_field`。这里做一次回退，否则所有真实实体调用都会
+-- 变成"entity has no db coordinates"，只能靠游戏层自己补 db_coords
 local function coords_of(entity)
     local c = entity.db_coords or entity
     local dbname, dbcoll = c.dbname, c.dbcoll
+    local tc = entity.entity_mgr and entity.entity_mgr.type_config
+    if type(dbname) ~= "string" or type(dbcoll) ~= "string" then
+        if type(tc) == "table" then
+            dbname, dbcoll = tc.db_name, tc.db_coll
+        end
+    end
     if type(dbname) ~= "string" or type(dbcoll) ~= "string" then
         return nil, "entity has no db coordinates"
     end
-    local key = c.key or "rid"
-    local unique_id = c.unique_id or entity.rid
+    local key = c.key or (tc and tc.id_field) or "rid"
+    local unique_id = c.unique_id or entity.rid or entity.id
     if unique_id == nil then
         return nil, "entity has no unique id"
     end
@@ -159,7 +213,8 @@ local function coords_of(entity)
         unique_id = unique_id,
         handle = c.handle or entity.handle,
         rid = entity.rid or unique_id,
-        doc = c.doc or entity.doc,
+        -- 实体把 ORM 文档放在 data 里；dbmgr 的 _version 就挂在它上面
+        doc = c.doc or entity.doc or entity.data,
     }
 end
 M.coords_of = coords_of
@@ -237,6 +292,9 @@ local function param_hash_of(op_type, params, hash_fn)
     end
     return hex(digest)
 end
+-- 接收方（Outbox / Saga）要用同一个摘要函数校验"同一事件换了参数"，
+-- 因此导出而不是复制一份实现：两份实现的规范化差异就是两套指纹
+M.param_hash_of = param_hash_of
 M.param_hash = param_hash_of
 
 -- ---------------------------------------------------------------------------
@@ -360,6 +418,33 @@ local function commit_core(ctx, req, handlers)
         return decision(M.STATUS.CAPACITY_EXCEEDED, nil, M.NO_CACHE, { reason = "critical op ledger is full" })
     end
 
+    -- 源侧 Outbox：与资产增量进同一次 CAS。形状/容量在 PREPARE 之前校验，
+    -- 免得把一条投递端永远解析不了的事件写进文档
+    local new_events = req.outbox
+    if new_events ~= nil then
+        local ok, oerr = validate_outbox_events(new_events)
+        if not ok then
+            log.error("critical outbox event rejected", "op_id", req.op_id, "err", oerr)
+            return decision(M.STATUS.PRECHECK_REJECTED, nil, M.NO_CACHE, { reason = oerr })
+        end
+        local existing_events = 0
+        for _ in pairs(critical[M.OUTBOX_FIELD] or {}) do
+            existing_events = existing_events + 1
+        end
+        if existing_events + #new_events > M.MAX_OUTBOX then
+            log.error(
+                "critical outbox is full",
+                "rid",
+                tostring(ctx.rid),
+                "count",
+                existing_events,
+                "max",
+                M.MAX_OUTBOX
+            )
+            return decision(M.STATUS.CAPACITY_EXCEEDED, nil, M.NO_CACHE, { reason = "outbox is full" })
+        end
+    end
+
     -- 纯读预检：不写 PREPARED、不声明持久化拒绝、不进 L1
     if handlers.validate then
         local ok, pass, rejection = pcall(handlers.validate, ctx.entity, req.params)
@@ -461,6 +546,14 @@ local function commit_core(ctx, req, handlers)
         write["$unset"][M.INTENT_FIELD] = true
         ctx.revision = revision
         ctx.dirty = dirty
+        -- 源侧扣减与 Outbox 必须同一次 CAS：先扣资源再单独写事件，
+        -- 中间崩溃就会留下"钱扣了、事件没发"的永久不一致
+        if new_events and #new_events > 0 then
+            for _, ev in ipairs(new_events) do
+                write["$set"][M.OUTBOX_FIELD .. "." .. ev.event_id] = ev
+            end
+            write["$set"][M.OUTBOX_PENDING_FIELD] = (critical[M.OUTBOX_PENDING_FIELD] or 0) + #new_events
+        end
     else
         -- 业务拒绝：ORM 必须原样不动。改了就不能继续——这份内存再也说不清
         -- 到底哪些改动属于被拒绝的操作，只能隔离重载
@@ -529,6 +622,13 @@ local function commit_core(ctx, req, handlers)
     critical[M.INTENT_FIELD] = nil
     critical[M.OPS_FIELD] = critical[M.OPS_FIELD] or {}
     critical[M.OPS_FIELD][req.op_id] = op_doc
+    if applied == true and new_events and #new_events > 0 then
+        critical[M.OUTBOX_FIELD] = critical[M.OUTBOX_FIELD] or {}
+        for _, ev in ipairs(new_events) do
+            critical[M.OUTBOX_FIELD][ev.event_id] = copy_value(ev, 3)
+        end
+        critical[M.OUTBOX_PENDING_FIELD] = (critical[M.OUTBOX_PENDING_FIELD] or 0) + #new_events
+    end
     dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, critical, ctx.handle)
     local ended, end_err = dbmgr.end_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, ctx.handle, true)
     if not ended then
@@ -608,6 +708,7 @@ function M.execute_client(entity, grant_fields, seq, op_type, params, handlers, 
         source_id = grant_fields.grant_id,
         params = params,
         now = now,
+        outbox = opts.outbox,
     }, handlers)
 end
 
@@ -663,6 +764,7 @@ function M.execute_internal(entity, service_op_id, op_type, params, handlers, op
         source_id = opts.source_id,
         params = params,
         now = now_of(opts),
+        outbox = opts.outbox,
         -- 真正核销放在第一个写入点之前：纯读预检拒绝不该烧掉凭证
         authorize = function()
             return capability.consume(cap, {

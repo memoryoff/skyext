@@ -205,4 +205,27 @@ t.describe("P00-B fail-closed", function()
         t.expect(clean).to.be_nil()
         t.expect(err).to.match("size limit")
     end)
+
+    -- 计数是 Outbox 的索引字段。漏进白名单会让"写了 Outbox 的角色"直接加载失败，
+    -- 而它恰恰是唯一能恢复待发事件的文档
+    t.it("accepts the outbox pending counter", function()
+        local doc = role_doc()
+        doc._critical_outbox_pending_count = 3
+        local clean, critical = critical_fields.extract(doc)
+        t.expect(clean).to_not.be_nil()
+        t.expect(critical._critical_outbox_pending_count).to.equal(3)
+    end)
+
+    t.it("rejects a pending counter that is not a non-negative integer", function()
+        local doc = role_doc()
+        doc._critical_outbox_pending_count = -1
+        local clean, err = critical_fields.extract(doc)
+        t.expect(clean).to.be_nil()
+        t.expect(err).to.match("non%-negative integer")
+
+        doc._critical_outbox_pending_count = "3"
+        clean, err = critical_fields.extract(doc)
+        t.expect(clean).to.be_nil()
+        t.expect(err).to.match("non%-negative integer")
+    end)
 end)

@@ -200,6 +200,17 @@ function CMD.deliver_reliable_loaded(entity_id)
     return entitymgr:deliver_pending(entity_id, { loaded_only = true })
 end
 
+-- Outbox 调度器（P13）的投递入口。**只对已加载实体执行**：调度器自己决定要不要
+-- 为离线角色加载实体，这里再触发一次加载会让"扫描到就加载"绕开它的限额。
+-- 返回 true, stats 或 false, NOT_LOADED
+function CMD.outbox_pump(entity_id, limit)
+    local outbox_worker = require "skyext.outbox_worker"
+    return entitymgr:with_loaded_entity(entity_id, function(entity)
+        local stats, err = outbox_worker.pump_entity(entity, { limit = limit })
+        return stats, err
+    end)
+end
+
 -- 主动加载一个实体（常驻实体的预加载用）。返回 true，或 false, reason
 function CMD.activate(entity_id)
     local ok, reason = entitymgr:ensure_loaded(entity_id)

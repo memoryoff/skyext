@@ -1323,3 +1323,63 @@ t.describe("dbmgr 关键状态机", function()
         t.expect(orm.is_dirty(h.doc)).to.equal(true)
     end)
 end)
+
+-- P13：Outbox 状态 CAS 是元数据写，不能和资产提交的 UNKNOWN 混为一类
+t.describe("dbmgr 元数据 CAS 与版本对齐", function()
+    local OUTBOX = { ["$set"] = { ["_critical_outbox_v1.evt"] = { status = "ENQUEUED" } } }
+
+    t.it("does not quarantine the cache for a metadata-only unknown", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h:enable_critical("UNKNOWN", "write concern timeout")
+
+        local state, reason = h.db.critical_update("demo", "role", "rid", 7, 0, OUTBOX, { metadata_only = true })
+        t.expect(state).to.equal("UNKNOWN")
+        t.expect(reason).to.equal("write concern timeout")
+        -- 玩家资产操作不能被一次写关注超时锁死
+        t.expect(h.db.state_of("demo", "role", 7)).to.equal(h.db.STATE.NORMAL)
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(true)
+    end)
+
+    t.it("aligns the memory version and critical fields with the majority read", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h:enable_critical(nil, nil, {
+            rid = 7,
+            _version = 3,
+            name = "original",
+            _critical_outbox_v1 = { evt = { status = "ENQUEUED" } },
+            _critical_outbox_pending_count = 0,
+        })
+
+        local ok, version = h.db.refresh_critical("demo", "role", "rid", 7)
+        t.expect(ok).to.equal(true)
+        t.expect(version).to.equal(3)
+        t.expect(h.doc._version).to.equal(3)
+        t.expect(h.db.cached_critical("demo", "role", 7)._critical_outbox_pending_count).to.equal(0)
+    end)
+
+    -- 读到旧副本时绝不能把内存版本退回去：那会让下一次 CAS 永远打不中
+    t.it("refuses a read that is older than the cached version", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.doc._version = 2
+        h:enable_critical(nil, nil, { rid = 7, _version = 1, name = "original" })
+
+        local ok, reason = h.db.refresh_critical("demo", "role", "rid", 7)
+        t.expect(ok).to.be_nil()
+        t.expect(reason).to.equal("stale read")
+        t.expect(h.doc._version).to.equal(2)
+    end)
+
+    t.it("reports a read failure instead of pretending the document is gone", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h:enable_critical(nil, nil, nil)
+        h.critical_read_error = "socket closed"
+
+        local ok, reason = h.db.refresh_critical("demo", "role", "rid", 7)
+        t.expect(ok).to.be_nil()
+        t.expect(reason).to.equal("read failed")
+    end)
+end)

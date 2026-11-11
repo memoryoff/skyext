@@ -739,12 +739,24 @@ function M.critical_update(dbname, dbcoll, key, unique_id, expected_version, upd
 
         local called, state_or_n, detail = pcall(coll_obj.critical_update, coll_obj, query, write, false)
         if not called then
+            if opts.metadata_only then
+                -- 元数据 CAS（Outbox 状态之类）失败不该锁死玩家资产操作：
+                -- 标记"内存版本可疑"，由调用方用 refresh_critical 对齐后再继续
+                entry.stale = true
+                log.error("metadata update raised", "unique_id", unique_id, "err", state_or_n)
+                return "UNKNOWN", state_or_n
+            end
             entry.state = M.STATE.CRITICAL_QUARANTINED
             save_wheel_obj():remove(entry)
             log.error("critical update raised, quarantining", "unique_id", unique_id, "err", state_or_n)
             return "UNKNOWN", state_or_n
         end
         if state_or_n == "UNKNOWN" then
+            if opts.metadata_only then
+                entry.stale = true
+                log.error("metadata update unknown", "unique_id", unique_id, "reason", detail)
+                return "UNKNOWN", detail
+            end
             entry.state = M.STATE.CRITICAL_QUARANTINED
             save_wheel_obj():remove(entry)
             log.error("critical update unknown, quarantining", "unique_id", unique_id, "reason", detail)
@@ -817,6 +829,50 @@ function M.save(dbname, dbcoll, key, unique_id)
             return false
         end
         return save_doc(cache, get_collection_obj(dbname, dbcoll))
+    end)
+end
+
+-- 用多数派读把缓存里的 `_version` 与关键元数据对齐到库里的真实值。
+--
+-- 用在元数据 CAS 结果未决之后：写入可能已经生效，内存版本落后，继续用它做 CAS
+-- 会一直 `cas mismatch`。这里只推进版本与关键字段，**不动普通 ORM 字段**——
+-- 那些字段的权威仍在内存（有脏字段时更是如此），贸然覆盖会丢玩家数据。
+function M.refresh_critical(dbname, dbcoll, key, unique_id, opts)
+    check_collection(dbname, dbcoll)
+    opts = opts or {}
+    local raw, reason, err = M.critical_read(dbname, dbcoll, key, unique_id)
+    if not raw then
+        return nil, reason, err
+    end
+    local _, critical = critical_fields.extract(raw)
+    if not critical then
+        return nil, "extract failed"
+    end
+    return with_row_lock(dbname, dbcoll, unique_id, function()
+        local entry = get_entry(dbname, dbcoll, unique_id)
+        if not entry then
+            return nil, "not cached"
+        end
+        if opts.handle and entry.handle ~= opts.handle then
+            return nil, "owner changed"
+        end
+        local target = raw._version
+        if math.type(target) ~= "integer" then
+            return nil, "invalid version in document"
+        end
+        if target < entry.doc._version then
+            -- 库里的版本更低说明读到了旧副本：绝不能把内存版本退回去
+            return nil, "stale read"
+        end
+        while entry.doc._version < target do
+            local current = entry.doc._version
+            if not orm.advance_persisted_version(entry.doc, current, current + 1) then
+                return nil, "version advance failed"
+            end
+        end
+        entry.critical = critical
+        entry.stale = nil
+        return true, target
     end)
 end
 
