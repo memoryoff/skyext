@@ -65,13 +65,36 @@
 
 | 方法 | 行 | 作用 | 返回 / 边界 |
 | --- | --- | --- | --- |
-| `M.load(dbname, dbcoll, key, unique_id, handle, opts)` | 283 | 取文档：命中缓存直接返回；未命中则带 fence 认领（`opts.create` 为真才允许新建） | `doc`；`nil, "not found"` / `"lease expired"` / `"stale dirty cache requires recovery"` |
-| `M.save(dbname, dbcoll, key, unique_id)` | 418 | 把缓存里的脏改动写回库 | `true` / `false`（租约失效或写失败，已记日志） |
+| `M.load(dbname, dbcoll, key, unique_id, handle, opts)` | 357 | 取文档：命中缓存直接返回；未命中则带 fence 认领（`opts.create` 为真才允许新建） | `doc`；`nil, "not found"` / `"lease expired"` / `"stale dirty cache requires recovery"` / `"critical state unknown"` / `"critical write in progress"` |
+| `M.save(dbname, dbcoll, key, unique_id)` | 748 | 把缓存里的脏改动写回库 | `true` / `false`（租约失效、写失败、或缓存不处于 `NORMAL`，已记日志） |
 | `M.unload(dbname, dbcoll, key, unique_id)` | 429 | 落库后移出缓存与回存轮 | `true` / `false` |
 | `M.discard_clean(dbname, dbcoll, unique_id, handle)` | 456 | 丢弃**不脏**的缓存条目 | 布尔 |
 | `M.quarantine(dbname, dbcoll, unique_id, handle)` | 474 | 失租后把条目从回存轮摘下（止血），**保留缓存**——里面可能还有没落库的改动 | 布尔 |
 | `M.discard(dbname, dbcoll, unique_id, handle)` | 487 | 彻底放弃一份写不回去的缓存；调用方必须确认改动不要了并留了记录 | 布尔 |
-| `M.recover(dbname, dbcoll, key, unique_id, old_handle, new_handle)` | 512 | 失租后接管：重新认领（新 fence），`_version` 未变才把内存改动接回去 | `true`（已落库并清缓存）/ `false, "superseded"`（改动作废、缓存已清）/ 其余 `false`（可重试） |
+| `M.recover(dbname, dbcoll, key, unique_id, old_handle, new_handle)` | 845 | 失租后接管：重新认领（新 fence），`_version` 未变才把内存改动接回去。**非 `NORMAL` 状态直接拒绝** | `true`（已落库并清缓存）/ `false, "superseded"`（改动作废、缓存已清）/ 其余 `false`（可重试） |
+
+### 关键写入（P07）
+
+普通回存与关键 CAS 是两条独立通道，共用同一把行锁与同一个 cache entry，
+`_version` 只有一个推进者。关键 CAS **绝不调用 `orm.snapshot_mongo`**：
+PREPARE 阶段写普通脏字段等于提前提交未完成的资产变化。
+
+| 方法 | 行 | 作用 | 返回 / 边界 |
+| --- | --- | --- | --- |
+| `M.STATE` | 22 | 缓存状态常量 | `NORMAL` / `PREPARING` / `CRITICAL_QUARANTINED` / `DISCARDED` |
+| `M.state_of(dbname, dbcoll, unique_id)` | 542 | 只读观测缓存状态 | 状态字符串；未缓存为 `nil` |
+| `M.begin_critical(dbname, dbcoll, unique_id, handle)` | 548 | `NORMAL → PREPARING`；重复进入幂等 | `true` / `false, reason` |
+| `M.end_critical(dbname, dbcoll, unique_id, handle, ok)` | 572 | 收尾：`ok` 为真时**只允许 `PREPARING → NORMAL`**，否则进 `CRITICAL_QUARANTINED` 并摘除回存轮 | `true` / `false, reason` |
+| `M.quarantine_critical(dbname, dbcoll, unique_id, handle, reason)` | 594 | 直接隔离（`apply` 抛错污染内存但 COMMIT 未发出） | 布尔 |
+| `M.critical_update(dbname, dbcoll, key, unique_id, expected_version, update, opts)` | 629 | 关键 CAS：内部补齐 `key/_version/_fence` 条件，`_version` 恰好 +1，走 majority | `"CONFIRMED", {version,n,nModified}` / `"REJECTED", reason`（确定没写）/ `"UNKNOWN", reason`（可能已写，entry 已隔离） |
+| `M.critical_read(dbname, dbcoll, key, unique_id)` | 717 | 多数派读原始文档（含 `_fence`/`_version`/`_critical_*`），供恢复任务核对；**读失败不降级成 `not found`** | `raw` / `nil, "not found"` / `nil, "read failed", err` |
+| `M.set_critical(dbname, dbcoll, unique_id, critical, handle)` | 733 | CAS 确认后用新的关键元数据替换缓存副本 | 布尔 |
+
+`critical_update` 的拒绝条件（一律不发请求）：改写/删除身份字段、改写 `_fence`、
+自己指定 `_version`、`expected_version` 非整数或与内存版本不一致、本地租约已失效。
+校验覆盖**所有算子**（`$set`/`$unset`/`$inc`/…），且不会就地修改调用方的 `update` 表。
+`n == 0`（版本/fence 未命中）判 `REJECTED` 而不是 `UNKNOWN`——把它当 UNKNOWN 会让
+每一次正常的版本竞争都触发隔离。
 
 ### 内部实现
 

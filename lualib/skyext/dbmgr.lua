@@ -11,6 +11,31 @@ local queue = require "skynet.queue"
 
 local M = {}
 
+-- 缓存条目的关键状态。普通回存路径只允许 NORMAL：
+--   NORMAL                正常，普通回存与关键 CAS 都可以走
+--   PREPARING             关键事务进行中：只允许关键 CAS 推进，普通回存必须让路，
+--                         否则 PREPARE 之后的一次回存会把普通脏字段抢先写进去，
+--                         COMMIT 的 _version 就对不上了
+--   CRITICAL_QUARANTINED  关键写入结果未决：内存可能已被 apply 污染，禁止任何回写，
+--                         等恢复任务按持久化事实判定后重载
+--   DISCARDED             缓存已作废：任何写入都必须拒绝
+M.STATE = {
+    NORMAL = "NORMAL",
+    PREPARING = "PREPARING",
+    CRITICAL_QUARANTINED = "CRITICAL_QUARANTINED",
+    DISCARDED = "DISCARDED",
+}
+
+-- 只有 NORMAL 允许普通回存。其余状态一律拒绝，并且必须给出原因，
+-- 让调用方知道这是状态问题而不是网络抖动
+local function save_allowed(entry)
+    local state = entry.state or M.STATE.NORMAL
+    if state == M.STATE.NORMAL then
+        return true
+    end
+    return false, state
+end
+
 local g_collection_obj = {} -- 数据库链接
 local g_cache_collection = {} -- 缓存数据对象
 local g_row_locks = {}
@@ -246,7 +271,16 @@ local function claim_with_fence(coll_obj, key, unique_id, initial, fence, create
     return nil, "fence claim failed", last_err
 end
 
-local function save_doc(coll_obj, key, unique_id, doc, handle)
+-- 普通回存。handle 可以覆盖（recover 用新租约写旧缓存），但状态永远取 entry 的：
+-- 隔离/准备中的条目不能因为换了个 handle 就恢复写入
+local function save_doc(entry, coll_obj, handle)
+    local key, unique_id, doc = entry.key, entry.unique_id, entry.doc
+    handle = handle or entry.handle
+    local allowed, state = save_allowed(entry)
+    if not allowed then
+        log.warn("refusing save in a non-normal state", "key", key, "unique_id", unique_id, "state", state)
+        return false
+    end
     if not lease_valid(handle) then
         log.error("refusing save without lease", "key", key, "unique_id", unique_id)
         return false
@@ -290,8 +324,13 @@ local function sweep_save(entry)
         if get_cache_collection(entry.dbname, entry.dbcoll)[entry.unique_id] ~= entry then
             return true
         end
+        -- 非 NORMAL 状态不是"回存失败"，是"这一轮不该回存"。返回成功让轮子照常
+        -- 排下一轮，否则 PREPARING 期间每一轮都会刷一条 sweep save failed
+        if not save_allowed(entry) then
+            return true
+        end
         local coll_obj = get_collection_obj(entry.dbname, entry.dbcoll)
-        return save_doc(coll_obj, entry.key, entry.unique_id, entry.doc, entry.handle)
+        return save_doc(entry, coll_obj)
     end)
 end
 
@@ -332,14 +371,27 @@ function M.load(dbname, dbcoll, key, unique_id, handle, opts)
         local cache_collection = get_cache_collection(dbname, dbcoll)
         local cached = cache_collection[unique_id]
         if cached then
-            if cached.handle == handle then
+            -- 关键状态未定的缓存绝不能交回去当可写文档：内存可能已经被 apply 污染，
+            -- 交出去只会在下一次回存里把污染状态写进库。DISCARDED 是确定作废，可以直接丢。
+            local state = cached.state or M.STATE.NORMAL
+            if state == M.STATE.CRITICAL_QUARANTINED then
+                return nil, "critical state unknown"
+            end
+            if state == M.STATE.PREPARING then
+                return nil, "critical write in progress"
+            end
+            if state == M.STATE.DISCARDED then
+                save_wheel_obj():remove(cached)
+                cache_collection[unique_id] = nil
+            elseif cached.handle == handle then
                 return cached.doc
+            else
+                if orm.is_dirty(cached.doc) then
+                    return nil, "stale dirty cache requires recovery"
+                end
+                save_wheel_obj():remove(cached)
+                cache_collection[unique_id] = nil
             end
-            if orm.is_dirty(cached.doc) then
-                return nil, "stale dirty cache requires recovery"
-            end
-            save_wheel_obj():remove(cached)
-            cache_collection[unique_id] = nil
         end
 
         -- 浅拷贝，避免把 key/_version/_fence 写回调用方传入的 default 表。
@@ -467,12 +519,275 @@ function M.load(dbname, dbcoll, key, unique_id, handle, opts)
             key = key,
             unique_id = unique_id,
             -- 关键元数据的权威副本。普通 orm.snapshot_mongo 永远不会写这些路径，
-            -- 只有 P08 的专用 CAS 会读写它们
+            -- 只有关键 CAS 会读写它们
             critical = critical,
+            state = M.STATE.NORMAL,
         }
         cache_collection[unique_id] = entry
         save_wheel_obj():add(entry)
         return doc
+    end)
+end
+
+-- ===================== 关键写入（P07） =====================
+--
+-- 关键 CAS 与普通回存是两条独立通道：
+--   * 普通回存走 orm.snapshot_mongo + safe_update，w=1；
+--   * 关键 CAS 走 critical_update，w=majority+j，只写调用方给的 update，
+--     **绝不调用 orm.snapshot_mongo**。PREPARE 阶段如果顺手把普通脏字段写进去，
+--     等于把还没提交的资产变化提前落库，COMMIT 失败就再也回不去了。
+--
+-- 两者共用同一把行锁和同一个 entry，所以 _version 只有一个推进者。
+
+local function get_entry(dbname, dbcoll, unique_id)
+    return get_cache_collection(dbname, dbcoll)[unique_id]
+end
+
+-- 只读观测：测试与排障用
+function M.state_of(dbname, dbcoll, unique_id)
+    local entry = get_entry(dbname, dbcoll, unique_id)
+    return entry and (entry.state or M.STATE.NORMAL) or nil
+end
+
+-- 进入关键事务：NORMAL -> PREPARING。失败返回 false, reason
+function M.begin_critical(dbname, dbcoll, unique_id, handle)
+    check_collection(dbname, dbcoll)
+    return with_row_lock(dbname, dbcoll, unique_id, function()
+        local entry = get_entry(dbname, dbcoll, unique_id)
+        if not entry then
+            return false, "not cached"
+        end
+        if handle and entry.handle ~= handle then
+            return false, "owner changed"
+        end
+        local state = entry.state or M.STATE.NORMAL
+        if state == M.STATE.PREPARING then
+            -- 同 owner 快速续做会重复进入，幂等
+            return true
+        end
+        if state ~= M.STATE.NORMAL then
+            return false, state
+        end
+        entry.state = M.STATE.PREPARING
+        return true
+    end)
+end
+
+-- 关键事务收尾。ok 为真回到 NORMAL，否则进入 CRITICAL_QUARANTINED 并摘除回存轮
+function M.end_critical(dbname, dbcoll, unique_id, handle, ok)
+    check_collection(dbname, dbcoll)
+    return with_row_lock(dbname, dbcoll, unique_id, function()
+        local entry = get_entry(dbname, dbcoll, unique_id)
+        if not entry then
+            return false, "not cached"
+        end
+        if handle and entry.handle ~= handle then
+            return false, "owner changed"
+        end
+        if ok then
+            -- 只允许 PREPARING -> NORMAL。隔离条目已经被摘出回存轮，这里放回 NORMAL
+            -- 会得到一个"状态正常但不在轮上"的条目，下一次 M.save 就能把污染内存写回库
+            if (entry.state or M.STATE.NORMAL) ~= M.STATE.PREPARING then
+                return false, entry.state or M.STATE.NORMAL
+            end
+            entry.state = M.STATE.NORMAL
+            return true
+        end
+        entry.state = M.STATE.CRITICAL_QUARANTINED
+        -- 摘掉回存轮是止血：隔离期间任何写入都必须失败，留在轮上只会每轮刷错误日志
+        save_wheel_obj():remove(entry)
+        return true
+    end)
+end
+
+-- 直接隔离（例如 apply 抛错污染了内存，但 COMMIT 从未发出）
+function M.quarantine_critical(dbname, dbcoll, unique_id, handle, reason)
+    check_collection(dbname, dbcoll)
+    return with_row_lock(dbname, dbcoll, unique_id, function()
+        local entry = get_entry(dbname, dbcoll, unique_id)
+        if not entry then
+            return false
+        end
+        if handle and entry.handle ~= handle then
+            return false
+        end
+        entry.state = M.STATE.CRITICAL_QUARANTINED
+        save_wheel_obj():remove(entry)
+        log.error(
+            "critical cache quarantined",
+            "dbname",
+            dbname,
+            "dbcoll",
+            dbcoll,
+            "unique_id",
+            unique_id,
+            "reason",
+            reason
+        )
+        return true
+    end)
+end
+
+-- 关键 CAS。
+-- expected_version 是调用方认为的当前持久化版本，函数内部补齐 key/_version/_fence 三个条件，
+-- 调用方只需要给 update（$set / $unset / $inc 等）。
+--
+-- 返回：
+--   "CONFIRMED", { version = 新版本, n = , nModified = }   -- 多数派已确认
+--   "REJECTED",  reason                                    -- 确定没写（CAS 未匹配或命令级拒绝）
+--   "UNKNOWN",   reason                                    -- 可能已写；entry 已进入隔离
+function M.critical_update(dbname, dbcoll, key, unique_id, expected_version, update, opts)
+    check_collection(dbname, dbcoll)
+    opts = opts or {}
+    if math.type(expected_version) ~= "integer" or expected_version < 0 then
+        return "REJECTED", "expected_version must be a non-negative integer"
+    end
+    if type(update) ~= "table" then
+        return "REJECTED", "update must be a table"
+    end
+
+    return with_row_lock(dbname, dbcoll, unique_id, function()
+        local entry = get_entry(dbname, dbcoll, unique_id)
+        if not entry then
+            return "REJECTED", "not cached"
+        end
+        if opts.handle and entry.handle ~= opts.handle then
+            return "REJECTED", "owner changed"
+        end
+        local state = entry.state or M.STATE.NORMAL
+        if state == M.STATE.CRITICAL_QUARANTINED or state == M.STATE.DISCARDED then
+            return "REJECTED", state
+        end
+        if entry.doc._version ~= expected_version then
+            -- 内存版本和调用方的预期已经不一致，再发出去只会是无效 CAS
+            return "REJECTED", "version mismatch"
+        end
+
+        local next_version = expected_version + 1
+        -- 身份与版本必须是框架独占的：只看 $set 会漏掉 $unset/$inc/$rename，
+        -- 那些同样能删掉 rid 或改掉 _version
+        for op, fields in pairs(update) do
+            if type(fields) == "table" then
+                if fields[key] ~= nil then
+                    return "REJECTED", "update must not rewrite the identity field"
+                end
+                if fields._fence ~= nil then
+                    return "REJECTED", "update must not touch _fence"
+                end
+                if fields._version ~= nil then
+                    if op ~= "$set" then
+                        return "REJECTED", "_version is managed by the framework"
+                    end
+                    if fields._version ~= next_version then
+                        return "REJECTED", "_version must advance by exactly one"
+                    end
+                end
+            end
+        end
+
+        -- 浅拷贝，避免把注入的 _version 留在调用方的表里：同一张 update 表复用做
+        -- 下一步 CAS 时会因为"_version 必须恰好 +1"被拒
+        local write = {}
+        for op, fields in pairs(update) do
+            if type(fields) == "table" then
+                local copied = {}
+                for k, v in pairs(fields) do
+                    copied[k] = v
+                end
+                write[op] = copied
+            else
+                write[op] = fields
+            end
+        end
+        write["$set"] = write["$set"] or {}
+        write["$set"]._version = next_version
+
+        local query = { [key] = unique_id, _version = expected_version }
+        local handle = opts.handle or entry.handle
+        if handle then
+            -- 锁已经释放（或换了持有者）时不能再发多数派写：fence 条件挡不住
+            -- "同一个 fence 但租约已过期"的迟到写，这一层必须在本地拦
+            if not lease_valid(handle) then
+                return "REJECTED", "lease expired"
+            end
+            query._fence = handle.fence
+        end
+
+        local coll_obj = get_collection_obj(dbname, dbcoll)
+        if not coll_obj.critical_update then
+            -- 没有多数派写通道就不做关键写：降级成 w=1 等于放弃已提交语义
+            return "REJECTED", "majority update unavailable"
+        end
+
+        local called, state_or_n, detail = pcall(coll_obj.critical_update, coll_obj, query, write, false)
+        if not called then
+            entry.state = M.STATE.CRITICAL_QUARANTINED
+            save_wheel_obj():remove(entry)
+            log.error("critical update raised, quarantining", "unique_id", unique_id, "err", state_or_n)
+            return "UNKNOWN", state_or_n
+        end
+        if state_or_n == "UNKNOWN" then
+            entry.state = M.STATE.CRITICAL_QUARANTINED
+            save_wheel_obj():remove(entry)
+            log.error("critical update unknown, quarantining", "unique_id", unique_id, "reason", detail)
+            return "UNKNOWN", detail
+        end
+        if state_or_n ~= "CONFIRMED" then
+            return "REJECTED", detail
+        end
+        local n = type(detail) == "table" and detail.n or 0
+        if n ~= 1 then
+            -- nMatched=0：版本或 fence 条件没命中，确定没有应用本次更新
+            return "REJECTED", "cas mismatch"
+        end
+
+        -- 数据库已经到新版本，内存必须跟上。推进失败说明内存和库已经分叉，
+        -- 这时既不能说成功（内存是旧的），也不能说失败（库里已经写了）
+        if not orm.advance_persisted_version(entry.doc, expected_version, next_version) then
+            entry.state = M.STATE.CRITICAL_QUARANTINED
+            save_wheel_obj():remove(entry)
+            log.error("critical update applied but memory version diverged", "unique_id", unique_id)
+            return "UNKNOWN", "memory version diverged"
+        end
+        return "CONFIRMED", { version = next_version, n = n, nModified = detail.nModified }
+    end)
+end
+
+-- 用多数派读拿原始 BSON 后像。恢复任务靠它核对 _fence/_version/_critical_*，
+-- 不能用缓存里的内存副本代替
+function M.critical_read(dbname, dbcoll, key, unique_id)
+    check_collection(dbname, dbcoll)
+    local coll_obj = get_collection_obj(dbname, dbcoll)
+    local read = coll_obj.critical_find or coll_obj.find_one
+    local called, ret, err = pcall(read, coll_obj, { [key] = unique_id }, { _id = false })
+    if not called then
+        return nil, "read failed", ret
+    end
+    if type(ret) ~= "table" then
+        -- 读失败和"文档不存在"必须分开：恢复任务把读失败当成不存在，就会判定
+        -- 未提交并重放，等于二次扣费
+        if err ~= nil then
+            return nil, "read failed", err
+        end
+        return nil, "not found"
+    end
+    return ret
+end
+
+-- 用 CAS 确认后的关键元数据替换缓存副本。DB 是权威，这里只是让内存跟上，
+-- 所以进程在两步之间崩溃不影响正确性：下次加载会重新 extract
+function M.set_critical(dbname, dbcoll, unique_id, critical, handle)
+    check_collection(dbname, dbcoll)
+    return with_row_lock(dbname, dbcoll, unique_id, function()
+        local entry = get_entry(dbname, dbcoll, unique_id)
+        if not entry then
+            return false
+        end
+        if handle and entry.handle ~= handle then
+            return false
+        end
+        entry.critical = critical
+        return true
     end)
 end
 
@@ -483,7 +798,7 @@ function M.save(dbname, dbcoll, key, unique_id)
         if not cache then
             return false
         end
-        return save_doc(get_collection_obj(dbname, dbcoll), key, unique_id, cache.doc, cache.handle)
+        return save_doc(cache, get_collection_obj(dbname, dbcoll))
     end)
 end
 
@@ -495,7 +810,7 @@ function M.unload(dbname, dbcoll, key, unique_id)
         if not cache then
             return false
         end
-        local ok = save_doc(get_collection_obj(dbname, dbcoll), key, unique_id, cache.doc, cache.handle)
+        local ok = save_doc(cache, get_collection_obj(dbname, dbcoll))
         if not ok or orm.is_dirty(cache.doc) then
             log.error(
                 "unload failed, retaining dirty cache",
@@ -520,6 +835,9 @@ function M.discard_clean(dbname, dbcoll, unique_id, handle)
         local cache_collection = get_cache_collection(dbname, dbcoll)
         local cache = cache_collection[unique_id]
         if not cache or cache.handle ~= handle or orm.is_dirty(cache.doc) then
+            return false
+        end
+        if (cache.state or M.STATE.NORMAL) ~= M.STATE.NORMAL then
             return false
         end
         save_wheel_obj():remove(cache)
@@ -553,6 +871,9 @@ function M.discard(dbname, dbcoll, unique_id, handle)
         if not cache or cache.handle ~= handle then
             return false
         end
+        -- 先标 DISCARDED 再摘表：remove 可能失败，留一个明确状态比留一个
+        -- "看起来还能用"的条目安全
+        cache.state = M.STATE.DISCARDED
         save_wheel_obj():remove(cache)
         cache_collection[unique_id] = nil
         return true
@@ -578,6 +899,13 @@ function M.recover(dbname, dbcoll, key, unique_id, old_handle, new_handle)
         local cache = cache_collection[unique_id]
         if not cache or cache.handle ~= old_handle then
             return false, "cache replaced"
+        end
+        -- 关键状态未定的缓存不能走"重新拿锁再存一遍"：内存可能已经被 apply 污染，
+        -- 存回去就是拿污染状态盖掉库里的事实。这类条目只能由恢复任务判定后重载
+        local state = cache.state or M.STATE.NORMAL
+        if state ~= M.STATE.NORMAL then
+            log.error("refusing to recover a critical cache", "unique_id", unique_id, "state", state)
+            return false, state
         end
         local function drop()
             save_wheel_obj():remove(cache)
@@ -619,7 +947,7 @@ function M.recover(dbname, dbcoll, key, unique_id, old_handle, new_handle)
 
         -- 只把 new_handle 传给这一次写入，不改 cache.handle：写失败时缓存要原样留着，
         -- 下一轮重试仍然按 old_handle 找得到它。
-        if not save_doc(coll_obj, key, unique_id, cache.doc, new_handle) then
+        if not save_doc(cache, coll_obj, new_handle) then
             return false, "save failed"
         end
         drop()

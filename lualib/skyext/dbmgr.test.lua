@@ -126,6 +126,7 @@ local function harness(handle, stored, defer)
         calls = 0,
         fam = {},
         updates = {},
+        critical_updates = {},
         errors = {},
         warnings = {},
         cancelled = false,
@@ -222,6 +223,19 @@ local function harness(handle, stored, defer)
             return project(h.store, fields)
         end
         return nil
+    end
+
+    -- 关键 CAS 通道（多数派）。默认按真实语义执行；用例可以用 h.critical_state 强制三态
+    function collection:critical_update(query, update, upsert)
+        h.critical_updates[#h.critical_updates + 1] = { query = query, update = update, upsert = upsert }
+        if h.critical_state then
+            return h.critical_state, h.critical_detail
+        end
+        if not match_doc(h.store, query) then
+            return "CONFIRMED", { n = 0, nModified = 0 }
+        end
+        apply_update(h.store, update, false)
+        return "CONFIRMED", { n = 1, nModified = 1 }
     end
 
     function collection:safe_update(query, update, upsert)
@@ -1082,5 +1096,230 @@ t.describe("dbmgr 关键字段提取", function()
         t.expect(doc).to.be_nil()
         t.expect(err).to.equal("critical metadata rejected")
         t.expect(h.entry).to.be_nil()
+    end)
+end)
+
+-- P07：关键状态机与专用 CAS。
+-- 核心不变量：PREPARE 只推进 _version，不写普通脏字段；UNKNOWN 之后内存绝不能再回库
+t.describe("dbmgr 关键状态机", function()
+    local OP = "_critical_ops_v1.op_a"
+
+    t.it("blocks ordinary saves while a critical transaction is preparing", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.doc.name = "pending change"
+        t.expect(h.db.begin_critical("demo", "role", 7)).to.equal(true)
+        t.expect(h.db.state_of("demo", "role", 7)).to.equal(h.db.STATE.PREPARING)
+
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(false)
+        t.expect(#h.updates).to.equal(0)
+        t.expect(orm.is_dirty(h.doc)).to.equal(true)
+
+        t.expect(h.db.end_critical("demo", "role", 7, nil, true)).to.equal(true)
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(true)
+        t.expect(h.updates[1].update["$set"].name).to.equal("pending change")
+    end)
+
+    t.it("writes only the critical paths and advances _version on PREPARE", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        -- PREPARE 之前就有普通脏字段：这次 CAS 绝不能把它带上
+        h.doc.name = "uncommitted"
+        h.db.begin_critical("demo", "role", 7)
+
+        local state, detail = h.db.critical_update("demo", "role", "rid", 7, 0, {
+            ["$set"] = { _critical_intent_v1 = { state = "PREPARED", op_id = "op_a" } },
+        })
+        t.expect(state).to.equal("CONFIRMED")
+        t.expect(detail.version).to.equal(1)
+        t.expect(h.critical_updates[1].query._version).to.equal(0)
+        t.expect(h.critical_updates[1].update["$set"]._version).to.equal(1)
+        t.expect(h.critical_updates[1].update["$set"].name).to.be_nil()
+        -- 内存版本跟上，但普通脏字段必须还在
+        t.expect(h.doc._version).to.equal(1)
+        t.expect(orm.is_dirty(h.doc)).to.equal(true)
+        t.expect(h.store.name).to.equal("original")
+    end)
+
+    t.it("treats a zero-match CAS as a definite rejection, not an unknown", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        -- 库里版本已经被别人推进
+        h.store._version = 3
+        local state, reason =
+            h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { [OP] = { status = "COMMITTED" } } })
+        t.expect(state).to.equal("REJECTED")
+        t.expect(reason).to.equal("cas mismatch")
+        t.expect(h.db.state_of("demo", "role", 7)).to.equal(h.db.STATE.NORMAL)
+        t.expect(h.doc._version).to.equal(0)
+    end)
+
+    t.it("quarantines the cache when the majority write is unknown", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.doc.name = "polluted"
+        h.critical_state = "UNKNOWN"
+        h.critical_detail = "write concern timeout"
+
+        local state, reason =
+            h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { [OP] = { status = "COMMITTED" } } })
+        t.expect(state).to.equal("UNKNOWN")
+        t.expect(reason).to.equal("write concern timeout")
+        t.expect(h.db.state_of("demo", "role", 7)).to.equal(h.db.STATE.CRITICAL_QUARANTINED)
+
+        -- 隔离之后：普通回存、关键 CAS、重新加载都必须拒绝
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(false)
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { [OP] = { status = "COMMITTED" } } })).to
+            .equal("REJECTED")
+        local doc, err = h.db.load("demo", "role", "rid", 7, nil, { create = true })
+        t.expect(doc).to.be_nil()
+        t.expect(err).to.equal("critical state unknown")
+    end)
+
+    t.it("does not let a dirty-cache recovery write a quarantined document back", function()
+        local old_handle = { fence = 1, valid = true }
+        local new_handle = { fence = 2, valid = true }
+        local h = harness(old_handle, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, old_handle, { create = true }))
+        h.doc.name = "polluted"
+        h.db.quarantine_critical("demo", "role", 7, old_handle, "apply raised")
+
+        local ok, reason = h.db.recover("demo", "role", "rid", 7, old_handle, new_handle)
+        t.expect(ok).to.equal(false)
+        t.expect(reason).to.equal(h.db.STATE.CRITICAL_QUARANTINED)
+        t.expect(#h.updates).to.equal(0)
+        -- 缓存必须留着，等恢复任务判定，不能被丢掉也不能被写回
+        t.expect(h.db.state_of("demo", "role", 7)).to.equal(h.db.STATE.CRITICAL_QUARANTINED)
+    end)
+
+    t.it("refuses updates that would rewrite identity, fence or skip a version", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { rid = 8 } })).to.equal("REJECTED")
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { _fence = 9 } })).to.equal("REJECTED")
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { _version = 5 } })).to
+            .equal("REJECTED")
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 2, { ["$set"] = {} })).to.equal("REJECTED")
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 1.5, { ["$set"] = {} })).to.equal("REJECTED")
+        t.expect(#h.critical_updates).to.equal(0)
+        t.expect(h.doc._version).to.equal(0)
+    end)
+
+    t.it("fails closed when the collection has no majority channel", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.collection.critical_update = nil
+        local state, reason = h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { [OP] = {} } })
+        t.expect(state).to.equal("REJECTED")
+        t.expect(reason).to.equal("majority update unavailable")
+    end)
+
+    t.it("quarantines when the database moved but memory could not follow", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        -- 模拟内存版本在 CAS 期间被别的路径改掉：数据库写成功了，内存却对不上
+        local real = h.collection.critical_update
+        h.collection.critical_update = function(self, query, update, upsert)
+            h.doc._version = 99
+            return real(self, query, update, upsert)
+        end
+        local state, reason = h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { [OP] = {} } })
+        t.expect(state).to.equal("UNKNOWN")
+        t.expect(reason).to.equal("memory version diverged")
+        t.expect(h.db.state_of("demo", "role", 7)).to.equal(h.db.STATE.CRITICAL_QUARANTINED)
+    end)
+
+    t.it("reads the raw document for reconciliation instead of the memory copy", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.store._version = 4
+        h.store._fence = 11
+        -- 走多数派读通道，不是普通 find_one
+        local read_via
+        function h.collection:critical_find(query, fields)
+            read_via = { query = query, fields = fields }
+            return copy(h.store)
+        end
+        local raw = assert(h.db.critical_read("demo", "role", "rid", 7))
+        t.expect(raw._version).to.equal(4)
+        t.expect(raw._fence).to.equal(11)
+        t.expect(read_via.query).to.equal({ rid = 7 })
+        t.expect(h.doc._version).to.equal(0)
+    end)
+
+    -- 读失败被当成"文档不存在"，恢复任务就会判定未提交并重放，等于二次扣费
+    t.it("does not report a failed majority read as not found", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        function h.collection:critical_find()
+            return nil, "read timeout"
+        end
+        local raw, reason, err = h.db.critical_read("demo", "role", "rid", 7)
+        t.expect(raw).to.be_nil()
+        t.expect(reason).to.equal("read failed")
+        t.expect(err).to.equal("read timeout")
+    end)
+
+    t.it("refuses to revive a quarantined entry through end_critical", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.db.quarantine_critical("demo", "role", 7, nil, "apply raised")
+        local ok, state = h.db.end_critical("demo", "role", 7, nil, true)
+        t.expect(ok).to.equal(false)
+        t.expect(state).to.equal(h.db.STATE.CRITICAL_QUARANTINED)
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(false)
+    end)
+
+    -- 只看 $set 会漏掉 $unset/$inc：它们同样能删掉身份字段或改掉版本
+    t.it("rejects identity and version writes on every update operator", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$unset"] = { rid = true } })).to
+            .equal("REJECTED")
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$inc"] = { rid = 1 } })).to.equal("REJECTED")
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$unset"] = { _version = true } })).to
+            .equal("REJECTED")
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$unset"] = { _fence = true } })).to
+            .equal("REJECTED")
+        t.expect(#h.critical_updates).to.equal(0)
+    end)
+
+    -- 同一张 update 表复用做下一步 CAS 时，注入的 _version 不能留在调用方表里
+    t.it("does not mutate the caller's update table", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        local update = { ["$set"] = { [OP] = { status = "PREPARED" } } }
+        t.expect((h.db.critical_update("demo", "role", "rid", 7, 0, update))).to.equal("CONFIRMED")
+        t.expect(update["$set"]._version).to.be_nil()
+        t.expect(update["$set"][OP].status).to.equal("PREPARED")
+        -- 复用同一张表推进到下一版本
+        t.expect((h.db.critical_update("demo", "role", "rid", 7, 1, update))).to.equal("CONFIRMED")
+        t.expect(h.doc._version).to.equal(2)
+    end)
+
+    t.it("refuses a majority write once the lease is gone", function()
+        local handle = { fence = 3, valid = true }
+        local h = harness(handle, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, handle, { create = true }))
+        handle.valid = false
+        local state, reason = h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { [OP] = {} } })
+        t.expect(state).to.equal("REJECTED")
+        t.expect(reason).to.equal("lease expired")
+        t.expect(#h.critical_updates).to.equal(0)
+    end)
+
+    -- PREPARING 期间回存轮不该报"回存失败"：这一轮本来就不该回存
+    t.it("skips the save wheel quietly while preparing", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.doc.name = "uncommitted"
+        h.db.begin_critical("demo", "role", 7)
+        h.errors = {}
+        -- 回存轮的回调本身不返回值，这里看的是它有没有记错误
+        h.sweep()
+        t.expect(#h.errors).to.equal(0)
+        t.expect(#h.updates).to.equal(0)
+        t.expect(orm.is_dirty(h.doc)).to.equal(true)
     end)
 end)
