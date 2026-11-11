@@ -18,9 +18,8 @@ t.describe("connection_id.new_boot_id", function()
     end)
 
     t.it("derives the id from the injected random source", function()
-        t.expect(connection_id.new_boot_id(fake_random(0x01))).to_not.equal(
-            connection_id.new_boot_id(fake_random(0x02))
-        )
+        t.expect(connection_id.new_boot_id(fake_random(0x01))).to_not
+            .equal(connection_id.new_boot_id(fake_random(0x02)))
     end)
 
     t.it("rejects a short random buffer", function()
@@ -173,8 +172,8 @@ t.describe("connection_id.new argument validation", function()
         t.expect(parsed.gate_service).to.equal(worst)
         t.expect(parsed.local_seq).to.equal(connection_id.MAX_SEQ)
         -- 反向闭环：解析结果重新生成必须得到同一串
-        t.expect(connection_id.new(parsed.gate_node, parsed.gate_service, parsed.boot_id, parsed.local_seq))
-            .to.equal(cid)
+        t.expect(connection_id.new(parsed.gate_node, parsed.gate_service, parsed.boot_id, parsed.local_seq)).to
+            .equal(cid)
     end)
 
     t.it("round-trips NUL and high bytes", function()

@@ -64,10 +64,8 @@ t.describe("p00 request fingerprint chain", function()
         local digest = fingerprint.compute("shop.buy", request, fake_hash)
         local entry = fingerprint.entry_from_digest(digest, "shop.buy", "PACK")
 
-        t.expect(fingerprint.matches(entry, "shop.buy", { count = 1, item_id = 7 }, fake_hash))
-            .to.equal(true)
-        t.expect(fingerprint.matches(entry, "shop.buy", { item_id = 7, count = 2 }, fake_hash))
-            .to.equal(false)
+        t.expect(fingerprint.matches(entry, "shop.buy", { count = 1, item_id = 7 }, fake_hash)).to.equal(true)
+        t.expect(fingerprint.matches(entry, "shop.buy", { item_id = 7, count = 2 }, fake_hash)).to.equal(false)
     end)
 
     t.it("distinguishes a changed parameter from a stale entry", function()

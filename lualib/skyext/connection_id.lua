@@ -197,8 +197,7 @@ function M.parse(cid)
         return nil, "invalid conn_id"
     end
     -- 五个字段都不含分隔符，多一个或少一个 '|' 都无法匹配
-    local version, enc_node, enc_service, boot_id, seq_text =
-        cid:match("^([^|]*)|([^|]*)|([^|]*)|([^|]*)|([^|]*)$")
+    local version, enc_node, enc_service, boot_id, seq_text = cid:match("^([^|]*)|([^|]*)|([^|]*)|([^|]*)|([^|]*)$")
     if not version then
         return nil, "invalid conn_id format"
     end

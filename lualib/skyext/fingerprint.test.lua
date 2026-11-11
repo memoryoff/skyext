@@ -83,10 +83,12 @@ t.describe("fingerprint.compute", function()
     t.it("rejects a short or non-string digest", function()
         t.expect(fingerprint.compute("shop.buy", {}, function()
             return "short"
-        end)).to.be_nil()
+        end)).to
+            .be_nil()
         t.expect(fingerprint.compute("shop.buy", {}, function()
             return 42
-        end)).to.be_nil()
+        end)).to
+            .be_nil()
     end)
 
     t.it("propagates encoding errors", function()
@@ -120,8 +122,7 @@ t.describe("fingerprint entries", function()
         t.expect(fingerprint.entry_from_digest("short", "shop.buy", "PACK")).to.be_nil()
         t.expect(fingerprint.entry_from_digest(string.rep("\0", 32), "", "PACK")).to.be_nil()
         t.expect(fingerprint.entry_from_digest(string.rep("\0", 32), "bad name", "PACK")).to.be_nil()
-        t.expect(fingerprint.entry_from_digest(string.rep("\0", 32), string.rep("p", 129), "PACK"))
-            .to.be_nil()
+        t.expect(fingerprint.entry_from_digest(string.rep("\0", 32), string.rep("p", 129), "PACK")).to.be_nil()
     end)
 
     t.it("builds an entry from a precomputed digest", function()
@@ -177,12 +178,7 @@ t.describe("fingerprint.matches", function()
         t.expect(kind).to.equal(fingerprint.KIND.STALE_VERSION)
 
         -- 缺 hash 优先于协议冲突：旧条目要按 EXPIRED 处理
-        ok, _, kind = fingerprint.matches(
-            { fingerprint_version = 1, name = "shop.buy" },
-            "bag.use",
-            {},
-            fake_hash
-        )
+        ok, _, kind = fingerprint.matches({ fingerprint_version = 1, name = "shop.buy" }, "bag.use", {}, fake_hash)
         t.expect(ok).to.equal(false)
         t.expect(kind).to.equal(fingerprint.KIND.INVALID_HASH)
     end)
@@ -195,7 +191,6 @@ t.describe("fingerprint.matches", function()
     end)
 
     t.it("rejects a tampered hash", function()
-        local good = fingerprint.new_entry("shop.buy", { item = 1 }, "PACK", fake_hash)
         local tampered = {
             fingerprint_version = 1,
             name = "shop.buy",
@@ -247,6 +242,7 @@ t.describe("fingerprint.matches", function()
 
         t.expect(fingerprint.matches(good, "shop.buy", { item = 1 }, fake_hash, function(a, b)
             return a == b
-        end)).to.equal(true)
+        end)).to
+            .equal(true)
     end)
 end)

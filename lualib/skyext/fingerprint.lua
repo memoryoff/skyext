@@ -17,10 +17,7 @@ M.DOMAIN = "skyext:fingerprint:v1"
 M.HASH_BYTES = 32
 
 -- 编码域 F1 与指纹版本 1 必须一致；只改一边会让旧缓存被静默当成新格式
-assert(
-    canonical.ENCODING_DOMAIN == "F" .. tostring(M.VERSION),
-    "encoding domain and fingerprint version disagree"
-)
+assert(canonical.ENCODING_DOMAIN == "F" .. tostring(M.VERSION), "encoding domain and fingerprint version disagree")
 
 -- matches 的第三返回值。调用方据此映射错误码，不要比较 reason 文案：
 --   STALE_VERSION / INVALID_HASH -> REQUEST_EXPIRED

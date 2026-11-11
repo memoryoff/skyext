@@ -45,7 +45,8 @@ t.describe("grant.new_grant_id", function()
 
         t.expect(grant.new_grant_id(function()
             return 42
-        end)).to.be_nil()
+        end)).to
+            .be_nil()
 
         local id2, err2 = grant.new_grant_id(function()
             error("SECRET_GRANT_BYTES", 0)
@@ -250,7 +251,8 @@ t.describe("grant.sign / verify", function()
     t.it("rejects an empty mac from hmac_fn", function()
         t.expect(grant.sign(fields(), function()
             return ""
-        end)).to.be_nil()
+        end)).to
+            .be_nil()
     end)
 
     t.it("verifies a matching mac and rejects a tampered one", function()
@@ -290,16 +292,20 @@ t.describe("grant.sign / verify", function()
     t.it("rejects a non-string or missing mac from hmac_fn", function()
         t.expect(grant.sign(fields(), function()
             return 42
-        end)).to.be_nil()
+        end)).to
+            .be_nil()
         t.expect(grant.sign(fields(), function()
             return true
-        end)).to.be_nil()
+        end)).to
+            .be_nil()
         t.expect(grant.sign(fields(), function()
             return nil
-        end)).to.be_nil()
+        end)).to
+            .be_nil()
         t.expect(grant.sign(fields(), function()
             return "a", "b"
-        end)).to.equal("a")
+        end)).to
+            .equal("a")
     end)
 
     t.it("guards the equality function", function()
@@ -307,10 +313,12 @@ t.describe("grant.sign / verify", function()
         t.expect(grant.verify(fields(), mac, fake_hmac, "eq")).to.equal(false)
         t.expect(grant.verify(fields(), mac, fake_hmac, function()
             error("boom", 0)
-        end)).to.equal(false)
+        end)).to
+            .equal(false)
         t.expect(grant.verify(fields(), mac, fake_hmac, function()
             return "yes"
-        end)).to.equal(false)
+        end)).to
+            .equal(false)
     end)
 
     t.it("reports a missing hmac function through verify", function()
