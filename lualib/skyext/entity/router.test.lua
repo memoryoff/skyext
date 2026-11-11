@@ -122,6 +122,38 @@ t.describe("entity.router", function()
         end)
     end)
 
+    t.describe("loaded-only", function()
+        t.it("call_loaded 走 entity_call_loaded，本节点与跨节点都一样", function()
+            local h = harness()
+            h.router.call_loaded("role", 2, "peek", 1)
+            local c = h.calls[1]
+            t.expect(c.tag).to.equal("skynet.call")
+            t.expect(c[3]).to.equal("entity_call_loaded")
+            t.expect(c[4]).to.equal(2)
+            t.expect(c[5]).to.equal("peek")
+
+            h.router.call_loaded("role", 1, "peek")
+            c = h.calls[2]
+            t.expect(c.tag).to.equal("cluster.call")
+            t.expect(c[1]).to.equal("node2")
+            t.expect(c[3]).to.equal("entity_call_loaded")
+        end)
+
+        t.it("send_loaded 走 entity_send_loaded，本节点与跨节点都一样", function()
+            local h = harness()
+            h.router.send_loaded("role", 2, "peek", "x")
+            local c = h.calls[1]
+            t.expect(c.tag).to.equal("skynet.call")
+            t.expect(c[3]).to.equal("entity_send_loaded")
+            t.expect(c[5]).to.equal("peek")
+
+            h.router.send_loaded("role", 1, "peek")
+            c = h.calls[2]
+            t.expect(c.tag).to.equal("cluster.call")
+            t.expect(c[3]).to.equal("entity_send_loaded")
+        end)
+    end)
+
     t.describe("send", function()
         t.it("本节点的实体直接走 skynet.send", function()
             local h = harness()

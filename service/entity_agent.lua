@@ -141,6 +141,21 @@ function CMD.entity_call_loaded(entity_id, cmd, ...)
     end)
 end
 
+-- 只对已经加载的实体发消息：不加载、不转发，实体不在就返回 false
+function CMD.entity_send_loaded(entity_id, cmd, ...)
+    local handler_func = handler.handlers[cmd]
+    if not handler_func then
+        log.error("unknown entity command", "type", type_name, "cmd", cmd)
+        return false
+    end
+    local args = table.pack(...)
+    local ok, result = entitymgr:with_loaded_entity(entity_id, function(entity)
+        handler_func(entity, table.unpack(args, 1, args.n))
+        return true
+    end)
+    return ok and result == true
+end
+
 function CMD.entity_send(entity_id, cmd, ...)
     local handler_func = handler.handlers[cmd]
     if not handler_func then

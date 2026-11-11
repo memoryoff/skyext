@@ -32,6 +32,18 @@ function M.call(type_name, entity_id, cmd, ...)
     end
 end
 
+-- 只对**已经在内存里**的实体执行，绝不触发加载。
+-- 用于广播、状态查询这类"实体不在就跳过"的路径：触发加载会让一个非关键调用
+-- 抢锁、读库、甚至把别的节点上的实体 handoff 过来，代价和风险都不对等。
+function M.call_loaded(type_name, entity_id, cmd, ...)
+    local node, service_name = get_target(type_name, entity_id)
+    if node == self_node() then
+        return skynet.call(service_name, "lua", "entity_call_loaded", entity_id, cmd, ...)
+    else
+        return cluster.call(node, service_name, "entity_call_loaded", entity_id, cmd, ...)
+    end
+end
+
 function M.send(type_name, entity_id, cmd, ...)
     local node, service_name = get_target(type_name, entity_id)
     if node == self_node() then
@@ -39,6 +51,15 @@ function M.send(type_name, entity_id, cmd, ...)
     else
         cluster.send(node, service_name, "entity_send", entity_id, cmd, ...)
     end
+end
+
+-- 只对已经在内存里的实体发消息；实体不在就返回 false，不加载
+function M.send_loaded(type_name, entity_id, cmd, ...)
+    local node, service_name = get_target(type_name, entity_id)
+    if node == self_node() then
+        return skynet.call(service_name, "lua", "entity_send_loaded", entity_id, cmd, ...)
+    end
+    return cluster.call(node, service_name, "entity_send_loaded", entity_id, cmd, ...)
 end
 
 -- 唤醒目标实体去读取自己的 pending 消息。

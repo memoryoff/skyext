@@ -527,6 +527,21 @@ t.describe("entity_agent serialized ingress", function()
         t.expect(h.events).to.equal({ "unload_all", "unload_all" })
     end)
 
+    t.it("entity_send_loaded never loads an entity that is not in memory", function()
+        local h = harness()
+        h.handler.handlers.peek = function()
+            h.peeked = true
+        end
+        h.lease_expired = true
+        t.expect(h.CMD.entity_send_loaded(7, "peek")).to.equal(false)
+        t.expect(h.peeked).to.be_nil()
+
+        h.lease_expired = nil
+        h.mgr:ensure_loaded(7)
+        t.expect(h.CMD.entity_send_loaded(7, "peek")).to.equal(true)
+        t.expect(h.peeked).to.equal(true)
+    end)
+
     t.it("rejects an invalid conn_id on every entry point", function()
         local h = harness()
         t.expect(h.CMD.bind_session(7, "not-a-conn-id")).to.equal(errcode.PARAM_ERROR)
