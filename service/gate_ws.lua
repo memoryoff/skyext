@@ -24,6 +24,7 @@ local websocket = require "http.websocket"
 local cmd_api = require "skyext.cmd_api"
 local config = require "skyext.config"
 local connection_id = require "skyext.connection_id"
+local gate_owner = require "skyext.gate_owner"
 local node_shutdown_api = require "skyext.node_shutdown_api"
 local log = require "skyext.log"
 
@@ -49,6 +50,9 @@ local g_by_fd = {} -- fd -> conn_id
 local g_boot_id
 local g_seq = 0
 local g_handshake_timeout_ms = 5000
+-- 迟到旧 epoch 的下行/绑定计数：迁移期间应当有少量，持续增长说明有 owner 没换 epoch
+local g_stale_pushes = 0
+local g_stale_binds = 0
 
 local g_self_node
 local function self_node()
@@ -319,27 +323,71 @@ function CMD.open(conf)
     log.info("ws gate listening", "address", address, "port", conf.port, "protocol", protocol)
 end
 
--- 会话绑定到实体：之后的包原样转发给 owner。会话已经断开时返回 false
-function CMD.bind(conn_id, owner_node, owner_service)
+-- 会话绑定到实体：之后的包原样转发给 owner。会话已经断开时返回 false。
+-- owner_epoch 是网关内部的所有权代际，旧 epoch 的绑定一律拒绝
+function CMD.bind(conn_id, owner_node, owner_service, owner_epoch)
     local session = g_sessions[conn_id]
     if not session then
         return false
     end
-    session.owner_node, session.owner_service = owner_node, owner_service
+    if owner_epoch == nil then
+        session.owner_node, session.owner_service = owner_node, owner_service
+        return true
+    end
+    local ok, err = gate_owner.bind(session, owner_epoch, owner_node, owner_service)
+    if not ok then
+        log.warn("ws bind rejected", "conn", conn_id, "epoch", owner_epoch, "err", err)
+        g_stale_binds = g_stale_binds + 1
+        return false
+    end
     return true
 end
 
--- 发给客户端一个已经编码好的包（回包或推送）。WS 帧自带边界，不加长度头
-function CMD.push(conn_id, pack)
+-- 发给客户端一个已经编码好的包（回包或推送）。WS 帧自带边界，不加长度头。
+-- 屏障之后或 epoch 不匹配的包直接丢弃：那可能是上一个 owner 的迟到写
+function CMD.push(conn_id, pack, owner_epoch)
     local session = g_sessions[conn_id]
     if not session then
         return
     end
+    local allowed = gate_owner.push_allowed(session, owner_epoch)
+    if not allowed then
+        g_stale_pushes = g_stale_pushes + 1
+        return
+    end
+    session.pushed = (session.pushed or 0) + 1
     -- 写可能撞上连接正在关闭：这条连接的协程会走正常的断开流程，这里不能连累调用方
     local ok, err = pcall(websocket.write, session.fd, pack, "binary")
     if not ok then
         log.warn("ws push failed", "conn", conn_id, "err", err)
     end
+end
+
+-- 迁移屏障：从这一刻起丢弃 epoch <= owner_epoch 的下行，返回已写出的包数
+function CMD.freeze_owner(conn_id, owner_epoch, barrier_id)
+    local session = g_sessions[conn_id]
+    if not session then
+        return nil, "no session"
+    end
+    local ok, info = gate_owner.freeze(session, owner_epoch, barrier_id)
+    if not ok then
+        return nil, info
+    end
+    return info
+end
+
+-- 解除屏障并把所有权交给新 epoch
+function CMD.resume_owner(conn_id, new_epoch, owner_node, owner_service)
+    local session = g_sessions[conn_id]
+    if not session then
+        return false
+    end
+    local ok, err = gate_owner.resume(session, new_epoch, owner_node, owner_service)
+    if not ok then
+        log.warn("ws resume_owner rejected", "conn", conn_id, "epoch", new_epoch, "err", err)
+        return false
+    end
+    return true
 end
 
 -- 断开连接。断开回调照常走：未绑定的通知登录服务，已绑定的通知 owner
@@ -352,6 +400,20 @@ end
 
 function CMD.count()
     return g_count
+end
+
+-- 只读观测：owner_epoch 与屏障状态
+function CMD.owner_state(conn_id)
+    local session = g_sessions[conn_id]
+    if not session then
+        return nil
+    end
+    return gate_owner.state(session)
+end
+
+-- 只读观测：迟到包/绑定的累计次数
+function CMD.stats()
+    return { stale_pushes = g_stale_pushes, stale_binds = g_stale_binds }
 end
 
 -- 只读观测：测试与排障用，不参与转发逻辑

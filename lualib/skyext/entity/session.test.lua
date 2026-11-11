@@ -180,7 +180,8 @@ local function pushes(h)
     local out = {}
     for _, op in ipairs(h.gate_ops) do
         if op[2] == "push" then
-            out[#out + 1] = op[#op]
+            -- op = { transport, "push", conn_id, pack, owner_epoch }
+            out[#out + 1] = op[4]
         end
     end
     return out
@@ -203,7 +204,7 @@ t.describe("session bind", function()
         t.expect(h.entity.session.gate_service).to.equal(GATE)
         t.expect(h.entity.unload_timer).to.be_nil()
         t.expect(cancelled).to.equal(true)
-        t.expect(h.gate_ops[#h.gate_ops]).to.equal({ "local", "bind", cid(9), "role1", OWNER })
+        t.expect(h.gate_ops[#h.gate_ops]).to.equal({ "local", "bind", cid(9), "role1", OWNER, 1 })
     end)
 
     t.it("refuses a bind with an invalid conn_id instead of guessing a gate", function()
@@ -219,7 +220,7 @@ t.describe("session bind", function()
         t.expect(ok).to.equal(true)
         t.expect(key).to.equal(cid(9, "gate1"))
         t.expect(h.entity.session.key).to.equal(cid(9, "gate1"))
-        t.expect(h.gate_ops[#h.gate_ops]).to.equal({ "cluster", "gate1", "bind", cid(9, "gate1"), "role1", OWNER })
+        t.expect(h.gate_ops[#h.gate_ops]).to.equal({ "cluster", "gate1", "bind", cid(9, "gate1"), "role1", OWNER, 1 })
     end)
 
     t.it("reports failure when the gate already dropped the connection", function()
@@ -899,5 +900,39 @@ t.describe("session downlink v2", function()
             return "OK_PACK", nil, nil, "no_cache"
         end, 1, "role.buy")
         t.expect(ran).to.equal(true)
+    end)
+end)
+
+-- P14：owner_epoch 是网关内部的所有权代际。续接会推进它，但 wire 上的
+-- session_epoch 与 seq 必须保持不变——客户端看到的是同一个逻辑会话
+t.describe("owner epoch", function()
+    t.it("advances owner_epoch on resume without touching the wire epoch or seq", function()
+        local h = harness()
+        local key = cid(9)
+        local ok, nonce, epoch = h.session.bind(key, h.entity, OWNER, h.session.MODE_V2)
+        t.expect(ok).to.equal(true)
+        t.expect(h.entity.session_io.owner_epoch).to.equal(1)
+
+        t.expect(h.session.push(h.entity, "mail_notify", { id = 1 })).to.equal(true)
+        -- bind 与 push 都必须带 owner_epoch，网关靠它过滤迟到包
+        t.expect(h.gate_ops[#h.gate_ops - 1][6]).to.equal(1)
+        t.expect(h.gate_ops[#h.gate_ops][5]).to.equal(1)
+
+        local code, _, sent, resumed_epoch = h.session.resume(cid(10), h.entity, OWNER, nonce, 1)
+        t.expect(code).to.equal(errcode.OK)
+        t.expect(h.entity.session_io.owner_epoch).to.equal(2)
+        -- 逻辑会话身份不变，seq 继续往前走
+        t.expect(resumed_epoch).to.equal(epoch)
+        t.expect(sent).to.equal(1)
+        t.expect(h.entity.session_io.sent).to.equal(1)
+    end)
+
+    t.it("starts every new session io at owner epoch 1", function()
+        local h = harness()
+        t.expect(h.session.bind(cid(9), h.entity, OWNER, h.session.MODE_LEGACY)).to.equal(true)
+        t.expect(h.entity.session_io.owner_epoch).to.equal(1)
+        -- 顶号/重登会重建 session_io，代际从头开始；网关的 bind 也会接受更高的新代际
+        t.expect(h.session.bind(cid(11), h.entity, OWNER, h.session.MODE_LEGACY)).to.equal(true)
+        t.expect(h.entity.session_io.owner_epoch).to.equal(1)
     end)
 end)

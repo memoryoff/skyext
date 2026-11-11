@@ -542,3 +542,81 @@ t.describe("gate_ws downstream", function()
         t.expect(h.closes).to.equal({})
     end)
 end)
+
+-- P14：owner_epoch 路由过滤。网关只比较内部 RPC 参数，不解码客户端协议
+t.describe("ws owner epoch", function()
+    t.it("rejects a bind whose epoch is not newer", function()
+        local h = harness()
+        h.connect(9)
+        local id = h.cid(9)
+        t.expect(h.CMD.bind(id, "node1", ".entity_agent:role:1", 2)).to.equal(true)
+        t.expect(h.CMD.owner_state(id).owner_epoch).to.equal(2)
+
+        -- 相等是重复投递，小于 是旧 owner 的迟到 RPC
+        t.expect(h.CMD.bind(id, "node2", ".entity_agent:role:1", 2)).to.equal(false)
+        t.expect(h.CMD.bind(id, "node2", ".entity_agent:role:1", 1)).to.equal(false)
+        t.expect(h.CMD.owner_state(id).owner_epoch).to.equal(2)
+        t.expect(h.CMD.stats().stale_binds).to.equal(2)
+    end)
+
+    t.it("drops a push from another epoch instead of writing it to the socket", function()
+        local h = harness()
+        h.connect(9)
+        local id = h.cid(9)
+        h.CMD.bind(id, "node1", ".entity_agent:role:1", 3)
+
+        h.CMD.push(id, "OK", 3)
+        t.expect(#h.writes).to.equal(1)
+
+        h.CMD.push(id, "STALE", 2)
+        h.CMD.push(id, "FUTURE", 4)
+        t.expect(#h.writes).to.equal(1)
+        t.expect(h.writes[1].data).to.equal("OK")
+        t.expect(h.CMD.stats().stale_pushes).to.equal(2)
+    end)
+
+    -- 屏障之后旧 owner 的包必须被丢掉，迁移才不会把上一段会话的包混进来
+    t.it("freezes at the bound epoch and reports what was already sent", function()
+        local h = harness()
+        h.connect(9)
+        local id = h.cid(9)
+        h.CMD.bind(id, "node1", ".entity_agent:role:1", 2)
+        h.CMD.push(id, "A", 2)
+        h.CMD.push(id, "B", 2)
+
+        local info = h.CMD.freeze_owner(id, 2, "barrier-1")
+        t.expect(info.sent).to.equal(2)
+        t.expect(info.epoch).to.equal(2)
+        t.expect(info.barrier_id).to.equal("barrier-1")
+
+        h.CMD.push(id, "LATE", 2)
+        t.expect(#h.writes).to.equal(2)
+    end)
+
+    t.it("resumes only with a strictly newer epoch and clears the barrier", function()
+        local h = harness()
+        h.connect(9)
+        local id = h.cid(9)
+        h.CMD.bind(id, "node1", ".entity_agent:role:1", 2)
+        h.CMD.freeze_owner(id, 2, "barrier-1")
+
+        t.expect(h.CMD.resume_owner(id, 2, "node2", ".entity_agent:role:1")).to.equal(false)
+        t.expect(h.CMD.resume_owner(id, 3, "node2", ".entity_agent:role:1")).to.equal(true)
+        h.CMD.push(id, "NEW", 3)
+        t.expect(#h.writes).to.equal(1)
+        -- 解冻之后旧 epoch 仍然是迟到包
+        h.CMD.push(id, "OLD", 2)
+        t.expect(#h.writes).to.equal(1)
+    end)
+
+    -- 未带 epoch 的旧调用方保持可用，避免升级期直接断流
+    t.it("keeps accepting unversioned pushes and binds", function()
+        local h = harness()
+        h.connect(9)
+        local id = h.cid(9)
+        t.expect(h.CMD.bind(id, "node1", ".entity_agent:role:1")).to.equal(true)
+        h.CMD.push(id, "PACK")
+        t.expect(#h.writes).to.equal(1)
+        t.expect(h.CMD.owner_state(id).owner_epoch).to.be_nil()
+    end)
+end)

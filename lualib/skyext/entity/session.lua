@@ -115,6 +115,10 @@ local function new_session_io(mode)
         -- Role 迁移都保持不变，否则客户端会把同一个会话当成两次登录
         session_epoch = epoch,
         session_mode = mode,
+        -- 网关内部的所有权代际。完整登录创建新 session_io 时从 1 开始；断线续接与
+        -- 计划内迁移每次换 owner 都 +1。它只影响网关的迟到包过滤，
+        -- **不改变 wire 上的 session_epoch 与 seq**
+        owner_epoch = 1,
         nonce = nonce,
         -- 下行计数。LEGACY 下 seq 不上线，两端各数各的，只在 resume/ping 对账；
         -- V2 下 seq 写进 DownlinkV2 信封，客户端按 (session_epoch, seq) 去重。
@@ -211,7 +215,7 @@ local function record_and_send(entity, pack)
     if not conn or io_.replaying then
         return false
     end
-    gate_send(conn, "push", conn.conn_id, pack)
+    gate_send(conn, "push", conn.conn_id, pack, io_.owner_epoch)
     return true
 end
 
@@ -223,7 +227,8 @@ local function sender(key, pack, request_name)
         return
     end
     if UNCOUNTED_RESPONSE[request_name] then
-        gate_send(conn, "push", conn.conn_id, pack)
+        local io_ = conn.entity.session_io
+        gate_send(conn, "push", conn.conn_id, pack, io_ and io_.owner_epoch)
         return
     end
     record_and_send(conn.entity, pack)
@@ -271,11 +276,22 @@ function M.bind(conn_id, entity, owner_service, session_mode)
         log.warn("reject invalid conn_id", "err", perr)
         return false
     end
-    if not gate_call(parsed.gate_node, parsed.gate_service, "bind", conn_id, self_node(), owner_service) then
+    local io_ = new_session_io(session_mode)
+    if
+        not gate_call(
+            parsed.gate_node,
+            parsed.gate_service,
+            "bind",
+            conn_id,
+            self_node(),
+            owner_service,
+            io_.owner_epoch
+        )
+    then
         return false
     end
     local conn = install_conn(conn_id, parsed, entity)
-    entity.session_io = new_session_io(session_mode)
+    entity.session_io = io_
     log.info("session bind", "type", entity.type_name, "id", entity.id, "session", conn.key)
     return true, entity.session_io.nonce, entity.session_io.session_epoch, entity.session_io.session_mode
 end
@@ -327,7 +343,21 @@ function M.resume(conn_id, entity, owner_service, nonce, recv, opts)
         log.warn("resume recv out of range", "id", entity.id, "recv", recv, "acked", io_.acked, "sent", io_.sent)
         return errcode.RESUME_UNAVAILABLE
     end
-    if not gate_call(parsed.gate_node, parsed.gate_service, "bind", conn_id, self_node(), owner_service) then
+    -- 续接是一次所有权切换：owner_epoch 前进一格，网关据此拒绝旧 owner 的迟到下行。
+    -- wire 上的 session_epoch 与 seq 都不动，客户端看到的是同一个逻辑会话
+    io_.owner_epoch = (io_.owner_epoch or 1) + 1
+    if
+        not gate_call(
+            parsed.gate_node,
+            parsed.gate_service,
+            "bind",
+            conn_id,
+            self_node(),
+            owner_service,
+            io_.owner_epoch
+        )
+    then
+        io_.owner_epoch = io_.owner_epoch - 1
         return errcode.SESSION_CLOSED
     end
 
