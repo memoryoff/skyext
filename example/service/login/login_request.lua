@@ -10,16 +10,6 @@ local realm = require "skyext.realm"
 
 local M = {}
 
--- 配置是在 skyext 的 skynet.init 回调里注入的，本文件被服务 chunk 在加载期 require 到，
--- 顶层读取只会拿到 nil 并把它永久缓存下来，因此统一改成惰性读取
-local g_self_node
-local function self_node()
-    if not g_self_node then
-        g_self_node = assert(config.get("cluster_node_name"), "cluster_node_name is not configured")
-    end
-    return g_self_node
-end
-
 local g_proto_checksum_enable
 local function proto_checksum_enable()
     if g_proto_checksum_enable == nil then
@@ -29,17 +19,16 @@ local function proto_checksum_enable()
 end
 
 -- 把会话绑到角色实体上。实体加载在哪个节点由实体系统决定，和本网关在不在一个节点无关
-local function load_bind_role(fd, rid, gate_service, session_mode)
-    local code, nonce, session_epoch, bound_mode =
-        router.bind_session("role", rid, self_node(), gate_service, fd, session_mode)
+local function load_bind_role(conn_id, rid, session_mode)
+    local code, nonce, session_epoch, bound_mode = router.bind_session("role", rid, conn_id, session_mode)
     if code ~= errcode.OK then
-        log.warn("bind_session failed", "rid", rid, "fd", fd, "code", code)
+        log.warn("bind_session failed", "rid", rid, "conn", conn_id, "code", code)
         return { code = code }
     end
 
     -- 会话已经交给实体，之后的包网关直接转过去，登录服务不再管它
-    client.unbind(fd)
-    log.info("load_bind_role success", "rid", rid, "fd", fd, "mode", bound_mode)
+    client.unbind(conn_id)
+    log.info("load_bind_role success", "rid", rid, "conn", conn_id, "mode", bound_mode)
     return {
         code = errcode.OK,
         rid = rid,
@@ -63,7 +52,7 @@ local function normalize_session_mode(value)
     return nil
 end
 
-function M:login(fd, obj)
+function M:login(conn_id, obj)
     local data, err, kind = jwt.verify_login(self.token)
     if not data then
         if kind == "config" then
@@ -128,13 +117,13 @@ function M:login(fd, obj)
         }
     end
 
-    return load_bind_role(fd, rid, obj.gate, session_mode)
+    return load_bind_role(conn_id, rid, session_mode)
 end
 
 -- 断线续接。不验 token、不查库：凭据是 nonce，它只代表一条会话、最长活到实体卸载，
 -- 比代表整个账号的 access token 权限小得多。实体不在内存里就直接失败，不会去加载它。
 -- 任何错误码客户端都退化成走 login
-function M:resume(fd, obj)
+function M:resume(conn_id, obj)
     local rid = self.rid
     if (not rid) or (rid <= 0) then
         return { code = errcode.PARAM_ERROR }
@@ -143,23 +132,14 @@ function M:resume(fd, obj)
     if not session_mode then
         return { code = errcode.PARAM_ERROR }
     end
-    local code, nonce, sent, session_epoch, bound_mode = router.resume_session(
-        "role",
-        rid,
-        self_node(),
-        obj.gate,
-        fd,
-        self.nonce,
-        self.recv,
-        session_mode,
-        self.session_epoch
-    )
+    local code, nonce, sent, session_epoch, bound_mode =
+        router.resume_session("role", rid, conn_id, self.nonce, self.recv, session_mode, self.session_epoch)
     if code ~= errcode.OK then
-        log.info("resume rejected", "rid", rid, "fd", fd, "code", code)
+        log.info("resume rejected", "rid", rid, "conn", conn_id, "code", code)
         return { code = code }
     end
-    client.unbind(fd)
-    log.info("resume success", "rid", rid, "fd", fd, "mode", bound_mode)
+    client.unbind(conn_id)
+    log.info("resume success", "rid", rid, "conn", conn_id, "mode", bound_mode)
     return {
         code = errcode.OK,
         nonce = nonce,

@@ -52,16 +52,17 @@ function M.poke_reliable(type_name, entity_id)
     return (pcall(cluster.send, node, service_name, "__deliver_reliable", entity_id))
 end
 
--- 把网关上的会话（gate_node, gate_service, fd）绑到实体上，登录服务调用。实体加载在
--- 哪个节点由实体系统决定，网关和实体不必在同一个节点。
+-- 把网关上的会话（conn_id）绑到实体上，登录服务调用。实体加载在哪个节点由实体系统
+-- 决定，网关和实体不必在同一个节点。conn_id 里已经带着 gate_node/gate_service，
+-- 不再单独传裸 fd：fd 跨网关会重复，关闭后还会被复用。
 -- session_mode 是客户端协商的下行模式（0=LEGACY/1=V2），随 bind 一起交给实体进程，
 -- 由 session_io 终身持有。返回错误码、续接凭据、session_epoch、模式
-function M.bind_session(type_name, entity_id, gate_node, gate_service, fd, session_mode)
+function M.bind_session(type_name, entity_id, conn_id, session_mode)
     local node, service_name = get_target(type_name, entity_id)
     if node == self_node() then
-        return skynet.call(service_name, "lua", "bind_session", entity_id, gate_node, gate_service, fd, session_mode)
+        return skynet.call(service_name, "lua", "bind_session", entity_id, conn_id, session_mode)
     end
-    return cluster.call(node, service_name, "bind_session", entity_id, gate_node, gate_service, fd, session_mode)
+    return cluster.call(node, service_name, "bind_session", entity_id, conn_id, session_mode)
 end
 
 -- 断线后把一条新连接接回原来的会话。**只作用于已经在内存里的实体**：续接不验 token、
@@ -69,7 +70,7 @@ end
 -- 抢锁、甚至触发 handoff，是现成的放大攻击面。
 -- session_mode/session_epoch 是客户端声明的一致性证据，实体侧不匹配就拒绝续接。
 -- 返回错误码、轮换后的新凭据、服务端已发出的包数、session_epoch、模式
-function M.resume_session(type_name, entity_id, gate_node, gate_service, fd, nonce, recv, session_mode, session_epoch)
+function M.resume_session(type_name, entity_id, conn_id, nonce, recv, session_mode, session_epoch)
     local node, service_name = get_target(type_name, entity_id)
     if node == self_node() then
         return skynet.call(
@@ -77,9 +78,7 @@ function M.resume_session(type_name, entity_id, gate_node, gate_service, fd, non
             "lua",
             "resume_session",
             entity_id,
-            gate_node,
-            gate_service,
-            fd,
+            conn_id,
             nonce,
             recv,
             session_mode,
@@ -91,9 +90,7 @@ function M.resume_session(type_name, entity_id, gate_node, gate_service, fd, non
         service_name,
         "resume_session",
         entity_id,
-        gate_node,
-        gate_service,
-        fd,
+        conn_id,
         nonce,
         recv,
         session_mode,

@@ -6,6 +6,9 @@ local lfs = require "lfs"
 
 local source = fs.join(fs.absolute(os.getenv("SKYTEST_ROOT") or lfs.currentdir()), "example/service/login/client.lua")
 
+-- 网关生成的连接标识；登录端只把它当键，不解析内容
+local CID = "v1|gate1|.gate_ws|" .. string.rep("a", 32) .. "|9"
+
 local function harness()
     local h = { sent = {}, timers = {}, cancelled = 0 }
     local noop = function() end
@@ -48,10 +51,10 @@ end
 t.describe("login client registration", function()
     t.it("treats a duplicate open as the same connection", function()
         local h = harness()
-        local first = h.client.new({ fd = 9, addr = "a", gate = ".gate_ws" })
+        local first = h.client.new({ conn_id = CID, addr = "a", gate = ".gate_ws" })
         t.expect(#h.timers).to.equal(1)
 
-        local second = h.client.new({ fd = 9, addr = "b", gate = ".gate_tcp" })
+        local second = h.client.new({ conn_id = CID, addr = "b", gate = ".gate_tcp" })
         t.expect(second).to.equal(first)
         t.expect(first.addr).to.equal("b")
         t.expect(first.gate).to.equal(".gate_tcp")
@@ -61,30 +64,30 @@ t.describe("login client registration", function()
 
     t.it("routes login responses back to the gate that opened the connection", function()
         local h = harness()
-        h.client.new({ fd = 9, addr = "a", gate = ".gate_ws" })
-        h.client.sender(9, "PACK")
-        t.expect(h.sent).to.equal({ { ".gate_ws", "push", 9, "PACK" } })
+        h.client.new({ conn_id = CID, addr = "a", gate = ".gate_ws" })
+        h.client.sender(CID, "PACK")
+        t.expect(h.sent).to.equal({ { ".gate_ws", "push", CID, "PACK" } })
     end)
 
     t.it("cancels the login timeout when the connection is unbound", function()
         local h = harness()
-        h.client.new({ fd = 9, addr = "a", gate = ".gate_ws" })
-        h.client.unbind(9)
+        h.client.new({ conn_id = CID, addr = "a", gate = ".gate_ws" })
+        h.client.unbind(CID)
         t.expect(h.cancelled).to.equal(1)
-        t.expect(h.client.get_obj(9)).to.be_nil()
+        t.expect(h.client.get_obj(CID)).to.be_nil()
     end)
 
     t.it("kicks a client that never finishes logging in", function()
         local h = harness()
-        h.client.new({ fd = 9, addr = "a", gate = ".gate_ws" })
+        h.client.new({ conn_id = CID, addr = "a", gate = ".gate_ws" })
         h.timers[1].fn()
-        t.expect(h.sent).to.equal({ { ".gate_ws", "kick", 9 } })
+        t.expect(h.sent).to.equal({ { ".gate_ws", "kick", CID } })
     end)
 
     t.it("does not kick after the client has already gone", function()
         local h = harness()
-        h.client.new({ fd = 9, addr = "a", gate = ".gate_ws" })
-        h.client.closed(9)
+        h.client.new({ conn_id = CID, addr = "a", gate = ".gate_ws" })
+        h.client.closed(CID)
         h.timers[1].fn()
         t.expect(h.sent).to.equal({})
     end)
@@ -93,10 +96,10 @@ t.describe("login client registration", function()
     -- 这里只证明登录端两条路径都不抛错
     t.it("tolerates open and disconnect arriving in either order", function()
         local h = harness()
-        h.client.closed(9)
-        local conf = h.client.new({ fd = 9, addr = "a", gate = ".gate_ws" })
+        h.client.closed(CID)
+        local conf = h.client.new({ conn_id = CID, addr = "a", gate = ".gate_ws" })
         t.expect(conf).to.exist()
-        h.client.closed(9)
-        t.expect(h.client.get_obj(9)).to.be_nil()
+        h.client.closed(CID)
+        t.expect(h.client.get_obj(CID)).to.be_nil()
     end)
 end)

@@ -1,5 +1,5 @@
 -- WebSocket 网关：浏览器和小程序连接的落点。对外接口和 service/gate_tcp.lua 完全一致
--- （open / bind / push / kick / count，上行发 client_msg 和 session_closed），
+-- （bind / push / kick / count，上行发 client_msg 和 session_closed），
 -- 差别只在传输层，所以实体侧不需要知道客户端走的是哪一种。
 --
 -- **为什么不能和 gate_tcp 同一个服务**：snax.gateserver 注册 PTYPE_SOCKET 用的是
@@ -8,10 +8,9 @@
 -- 分开也更合适：裸 TCP 那边的长度前缀是 C 层解的，原生客户端要的就是这个加速，
 -- 不该为了省一个端口把它换成 Lua 手工解析。
 --
--- **为什么是单个服务而不是 watchdog + agent 池**：实体给客户端发包时按 gate_service
--- 这个注册名直接找到网关（见 skyext.entity.session），单服务意味着下行一跳到位。
--- 拆成池子就得在 watchdog 上多转一次，而下行是热路径。WS 帧解析确实落在 Lua 里，
--- 单服务有吞吐上限，横向扩的单位是节点——这和 gate_tcp 的扩容方式一致。
+-- **连接身份**：每条连接在 accept 时生成 ConnectionIdentity v1（`conn_id`），它带着
+-- gate 节点、gate 服务名、boot_id 与进程内序号。登录、实体、会话层只认 conn_id；
+-- 裸 fd 只在网关内部用来读写 socket——fd 会跨网关重复，关闭后还会被复用。
 --
 -- 连接生命周期（P02）：
 --   RESERVED → HANDSHAKING → REGISTERING → ACTIVE → CLOSING → CLOSED
@@ -24,6 +23,7 @@ local socket = require "skynet.socket"
 local websocket = require "http.websocket"
 local cmd_api = require "skyext.cmd_api"
 local config = require "skyext.config"
+local connection_id = require "skyext.connection_id"
 local node_shutdown_api = require "skyext.node_shutdown_api"
 local log = require "skyext.log"
 
@@ -44,8 +44,10 @@ local g_login
 local g_listen_fd
 local g_maxclient
 local g_count = 0
-local g_sessions = {}
-local g_token = 0
+local g_sessions = {} -- conn_id -> session
+local g_by_fd = {} -- fd -> conn_id
+local g_boot_id
+local g_seq = 0
 local g_handshake_timeout_ms = 5000
 
 local g_self_node
@@ -65,44 +67,62 @@ local function send_owner(session, cmd, ...)
     -- 不能让整个网关跟着出错
     local ok, err = pcall(cluster.send, session.owner_node, session.owner_service, cmd, ...)
     if not ok then
-        log.warn("session forward failed", "fd", session.fd, "owner", session.owner_node, "cmd", cmd, "err", err)
+        log.warn("session forward failed", "conn", session.conn_id, "owner", session.owner_node, "cmd", cmd, "err", err)
     end
 end
+
+local close_session
 
 -- 配额预占。**不许 yield**：这个函数跑在 socket 分发协程里，阻塞它就收不到新 accept。
 local function reserve(fd, addr)
     if g_count >= g_maxclient then
         return nil
     end
-    g_token = g_token + 1
+    -- fd 被复用：旧连接可能还有残留会话（关闭消息还没跑完），先结算掉再挂新的，
+    -- 否则旧会话永远不会被关闭，g_count 也会漏减
+    local stale = g_by_fd[fd]
+    if stale then
+        close_session(stale, "fd reused")
+    end
+    g_seq = g_seq + 1
+    local conn_id, err = connection_id.new(self_node(), GATE_NAME, g_boot_id, g_seq)
+    if not conn_id then
+        log.error("cannot generate a connection id", "fd", fd, "err", err)
+        return nil
+    end
     local session = {
+        conn_id = conn_id,
         fd = fd,
         addr = addr,
         state = STATE.RESERVED,
-        token = g_token,
+        token = g_seq,
     }
-    g_sessions[fd] = session
+    g_sessions[conn_id] = session
+    g_by_fd[fd] = conn_id
     g_count = g_count + 1
     return session
 end
 
 -- 幂等关闭：handler.close / handler.error / 注册失败 / serve 收尾 / 停服都会走到这里。
 -- 只有第一次调用会通知对端（登录服务或 owner），之后都是 no-op。
-local function close_session(fd, reason)
-    local session = g_sessions[fd]
+close_session = function(conn_id, reason)
+    local session = g_sessions[conn_id]
     if not session then
         return false
     end
-    g_sessions[fd] = nil
+    g_sessions[conn_id] = nil
+    if g_by_fd[session.fd] == conn_id then
+        g_by_fd[session.fd] = nil
+    end
     session.state = STATE.CLOSED
     g_count = g_count - 1
     if session.owner_node then
-        send_owner(session, "session_closed", self_node(), fd)
+        send_owner(session, "session_closed", self_node(), conn_id)
     else
-        skynet.send(g_login, "lua", "disconnect", fd)
+        skynet.send(g_login, "lua", "disconnect", conn_id)
     end
     if reason then
-        log.info("ws session closed", "fd", fd, "reason", reason)
+        log.info("ws session closed", "conn", conn_id, "reason", reason)
     end
     return true
 end
@@ -149,79 +169,75 @@ local handler = {}
 
 -- 握手成功、进入读帧循环之前调用。这里同步等登录服务确认，确认前不会读任何客户端帧：
 -- 客户端在这段时间发的字节留在 socket 缓冲里，由 TCP 窗口做天然背压。
-function handler.handshake(fd)
-    local session = g_sessions[fd]
+function handler.handshake(conn_id, fd)
+    local session = g_sessions[conn_id]
     if not session or session.state ~= STATE.RESERVED then
         return
     end
     session.state = STATE.HANDSHAKING
     session.state = STATE.REGISTERING
 
-    local token = session.token
     local ok, err = call_with_timeout(g_login, g_handshake_timeout_ms, function()
-        -- 迟到的成功：登录端可能已经为这个 fd 建了客户端记录，补一次 disconnect。
-        -- fd 已经被新连接复用时不能按 fd 补偿，否则会把新连接踢掉
-        local current = g_sessions[fd]
-        if not current then
-            skynet.send(g_login, "lua", "disconnect", fd)
-        elseif current.token ~= token then
-            log.warn("late registration ack for a reused fd", "fd", fd)
+        -- 迟到的成功：登录端可能已经为这个 conn_id 建了客户端记录，补一次 disconnect。
+        -- conn_id 在 boot 内不复用，所以不存在 fd 复用误踢的问题
+        if not g_sessions[conn_id] then
+            skynet.send(g_login, "lua", "disconnect", conn_id)
         end
-    end, "open", fd, session.addr, GATE_NAME)
+    end, "open", conn_id, session.addr, GATE_NAME)
 
-    if g_sessions[fd] ~= session then
+    if g_sessions[conn_id] ~= session then
         -- 等待期间连接已经断开，close_session 已经通知过登录端
         return
     end
     -- 必须拿到明确的 true 才算注册成功：nil / false 都可能是登录端拒绝或没有实现确认
     if ok ~= true then
-        log.warn("ws registration failed", "fd", fd, "err", err or tostring(ok))
+        log.warn("ws registration failed", "conn", conn_id, "err", err or tostring(ok))
         session.state = STATE.CLOSING
         pcall(websocket.close, fd, 1011, "register failed")
-        close_session(fd, "register failed")
+        close_session(conn_id, "register failed")
         return
     end
     session.state = STATE.ACTIVE
-    log.info("ws session active", "fd", fd, "addr", session.addr)
+    log.info("ws session active", "conn", conn_id, "addr", session.addr)
 end
 
 local function forward(session, msg)
     if session.owner_node then
-        send_owner(session, "client_msg", self_node(), session.fd, msg)
+        send_owner(session, "client_msg", self_node(), session.conn_id, msg)
     else
-        skynet.send(g_login, "lua", "client_msg", session.fd, msg)
+        skynet.send(g_login, "lua", "client_msg", session.conn_id, msg)
     end
 end
 
-function handler.message(fd, msg, msg_type)
-    local session = g_sessions[fd]
+function handler.message(conn_id, fd, msg, msg_type)
+    local session = g_sessions[conn_id]
     if not session then
         return
     end
     -- 协议是二进制 sproto。文本帧多半是接错了端口或者客户端用了 JSON，直接断开比
     -- 让它在后面某个解码器里炸掉清楚
     if msg_type ~= "binary" then
-        log.warn("ws client sent a non-binary frame", "fd", fd, "type", msg_type)
+        log.warn("ws client sent a non-binary frame", "conn", conn_id, "type", msg_type)
         websocket.close(fd, 1003, "binary only")
         return
     end
     -- 读帧循环只在 handshake 返回之后才开始；走到这里还不是 ACTIVE 说明状态机被绕过了，
     -- 宁可断开也不能把包转给尚未确认的登录/实体
     if session.state ~= STATE.ACTIVE then
-        log.warn("ws frame before registration completed", "fd", fd, "state", session.state)
+        log.warn("ws frame before registration completed", "conn", conn_id, "state", session.state)
         websocket.close(fd, 1011, "not active")
         return
     end
     forward(session, msg)
 end
 
-function handler.close(fd)
-    close_session(fd, "closed")
+function handler.close(conn_id)
+    close_session(conn_id, "closed")
 end
 
-function handler.error(fd, err)
-    log.warn("ws session error", "fd", fd, "err", err)
-    close_session(fd, "error")
+function handler.error(conn_id, fd, err)
+    log.warn("ws session error", "conn", conn_id, "fd", fd, "err", err)
+    close_session(conn_id, "error")
 end
 
 -- 这个回调拿到的第一个参数是 ws 对象而不是 fd（websocket.lua 的历史遗留）
@@ -229,13 +245,34 @@ function handler.warning(ws, size)
     log.warn("ws send buffer is piling up", "fd", ws.id, "size", size)
 end
 
-local function serve(fd, addr, protocol)
-    local ok, err = pcall(websocket.accept, fd, handler, protocol, addr)
+-- 每条连接的 handler 固化自己的 conn_id。**不能按 fd 反查**：关闭消息和下一次
+-- accept 是两条独立消息，新连接可能已经复用 fd 并把 g_by_fd 指向新 conn_id，
+-- 旧协程恢复后按 fd 查就会关掉别人的连接、还把自己的会话漏在表里。
+local function make_handler(conn_id, fd)
+    return {
+        handshake = function()
+            handler.handshake(conn_id, fd)
+        end,
+        message = function(_, msg, msg_type)
+            handler.message(conn_id, fd, msg, msg_type)
+        end,
+        close = function()
+            handler.close(conn_id)
+        end,
+        error = function(_, err)
+            handler.error(conn_id, fd, err)
+        end,
+        warning = handler.warning,
+    }
+end
+
+local function serve(fd, addr, protocol, conn_id)
+    local ok, err = pcall(websocket.accept, fd, make_handler(conn_id, fd), protocol, addr)
     if not ok then
         -- 握手阶段就失败了（不是 WS 请求、TLS 握手不过）。这时 handler.close 不会被调用
-        log.warn("ws handshake failed", "fd", fd, "addr", addr, "err", err)
+        log.warn("ws handshake failed", "conn", conn_id, "fd", fd, "addr", addr, "err", err)
     end
-    close_session(fd, "serve exit")
+    close_session(conn_id, "serve exit")
 end
 
 local CMD = {}
@@ -244,6 +281,12 @@ function CMD.open(conf)
     g_login = assert(conf.login, "gate_ws needs conf.login")
     g_maxclient = conf.maxclient or 1024
     g_handshake_timeout_ms = conf.handshake_timeout_ms or 5000
+    -- 没有可信随机数就没有连接身份。拒绝启动，而不是退化成可预测的序号
+    local boot, boot_err = connection_id.new_boot_id()
+    if not boot then
+        error("gate_ws cannot generate connection ids: " .. tostring(boot_err))
+    end
+    g_boot_id = boot
     local protocol = conf.protocol or "ws"
     assert(protocol == "ws" or protocol == "wss", "ws_protocol must be ws or wss")
     if protocol == "wss" then
@@ -266,19 +309,19 @@ function CMD.open(conf)
         -- 预占必须在这个回调里完成：fork 之后再计数，突发连接会一起通过上限检查
         local session = reserve(fd, addr)
         if not session then
-            log.warn("ws gate is full, dropping a new connection", "addr", addr, "maxclient", g_maxclient)
+            log.warn("ws gate is full or cannot identify the connection, dropping it", "addr", addr)
             socket.close_fd(fd)
             return
         end
         -- 这个回调跑在 socket 消息的分发协程里，阻塞它就收不到后续的 accept
-        skynet.fork(serve, fd, addr, protocol)
+        skynet.fork(serve, fd, addr, protocol, session.conn_id)
     end)
     log.info("ws gate listening", "address", address, "port", conf.port, "protocol", protocol)
 end
 
 -- 会话绑定到实体：之后的包原样转发给 owner。会话已经断开时返回 false
-function CMD.bind(fd, owner_node, owner_service)
-    local session = g_sessions[fd]
+function CMD.bind(conn_id, owner_node, owner_service)
+    local session = g_sessions[conn_id]
     if not session then
         return false
     end
@@ -287,21 +330,23 @@ function CMD.bind(fd, owner_node, owner_service)
 end
 
 -- 发给客户端一个已经编码好的包（回包或推送）。WS 帧自带边界，不加长度头
-function CMD.push(fd, pack)
-    if not g_sessions[fd] then
+function CMD.push(conn_id, pack)
+    local session = g_sessions[conn_id]
+    if not session then
         return
     end
     -- 写可能撞上连接正在关闭：这条连接的协程会走正常的断开流程，这里不能连累调用方
-    local ok, err = pcall(websocket.write, fd, pack, "binary")
+    local ok, err = pcall(websocket.write, session.fd, pack, "binary")
     if not ok then
-        log.warn("ws push failed", "fd", fd, "err", err)
+        log.warn("ws push failed", "conn", conn_id, "err", err)
     end
 end
 
 -- 断开连接。断开回调照常走：未绑定的通知登录服务，已绑定的通知 owner
-function CMD.kick(fd)
-    if g_sessions[fd] then
-        websocket.close(fd, 1000, "kicked")
+function CMD.kick(conn_id)
+    local session = g_sessions[conn_id]
+    if session then
+        websocket.close(session.fd, 1000, "kicked")
     end
 end
 
@@ -310,9 +355,14 @@ function CMD.count()
 end
 
 -- 只读观测：测试与排障用，不参与转发逻辑
-function CMD.state(fd)
-    local session = g_sessions[fd]
+function CMD.state(conn_id)
+    local session = g_sessions[conn_id]
     return session and session.state or STATE.CLOSED
+end
+
+-- 只读观测：fd 当前对应的 conn_id（测试需要，生产调用方不应依赖 fd）
+function CMD.conn_id(fd)
+    return g_by_fd[fd]
 end
 
 -- 停服第一步：关掉监听端口，不再接新连接。已经建立的连接继续服务到实体卸载

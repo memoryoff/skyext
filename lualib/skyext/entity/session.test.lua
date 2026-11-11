@@ -3,6 +3,7 @@ local skynet = require "skynet"
 local downlink = require "skyext.downlink"
 local errcode = require "skyext.errcode"
 local fs = require "skyext.util.fs"
+local connection_id = require "skyext.connection_id"
 local lfs = require "lfs"
 
 local source = fs.join(fs.absolute(os.getenv("SKYTEST_ROOT") or lfs.currentdir()), "lualib/skyext/entity/session.lua")
@@ -11,6 +12,12 @@ local source = fs.join(fs.absolute(os.getenv("SKYTEST_ROOT") or lfs.currentdir()
 local SELF_NODE = "role1"
 local GATE = ".gate_tcp"
 local OWNER = ".entity_agent:role:1"
+local BOOT = string.rep("b", 32)
+
+-- 网关生成的连接标识。测试用固定 boot_id + 序号，断言可以直接比较字符串
+local function cid(seq, gate_node, gate_service)
+    return assert(connection_id.new(gate_node or SELF_NODE, gate_service or GATE, BOOT, seq))
+end
 
 -- 16 字节：session_epoch 要求 16 字节随机源，nonce 的断言也基于同一格式
 local function fake_nonce(n)
@@ -160,11 +167,12 @@ local function harness(opts)
 end
 
 -- 绑定会话并返回会话键
-local function bind(h, fd, gate_node, entity)
+local function bind(h, seq, gate_node, entity)
     gate_node = gate_node or SELF_NODE
     entity = entity or h.entity
-    local ok, nonce = h.session.bind(gate_node, GATE, fd, entity, OWNER)
-    return ok, h.session.key(gate_node, fd), nonce
+    local key = cid(seq, gate_node)
+    local ok, nonce = h.session.bind(key, entity, OWNER)
+    return ok, key, nonce
 end
 
 -- 只保留 push 操作，断言下行顺序时用
@@ -189,28 +197,35 @@ t.describe("session bind", function()
         }
         local ok, key, nonce = bind(h, 9)
         t.expect(ok).to.equal(true)
-        t.expect(key).to.equal("role1/9")
+        t.expect(key).to.equal(cid(9))
         t.expect(nonce).to.equal(fake_nonce(1))
-        t.expect(h.entity.session.key).to.equal("role1/9")
+        t.expect(h.entity.session.key).to.equal(cid(9))
         t.expect(h.entity.session.gate_service).to.equal(GATE)
         t.expect(h.entity.unload_timer).to.be_nil()
         t.expect(cancelled).to.equal(true)
-        t.expect(h.gate_ops[#h.gate_ops]).to.equal({ "local", "bind", 9, "role1", OWNER })
+        t.expect(h.gate_ops[#h.gate_ops]).to.equal({ "local", "bind", cid(9), "role1", OWNER })
+    end)
+
+    t.it("refuses a bind with an invalid conn_id instead of guessing a gate", function()
+        local h = harness()
+        t.expect(h.session.bind("not-a-conn-id", h.entity, OWNER)).to.equal(false)
+        t.expect(h.entity.session).to.be_nil()
+        t.expect(h.gate_ops).to.equal({})
     end)
 
     t.it("routes the bind to a remote gate over cluster", function()
         local h = harness()
         local ok, key = bind(h, 9, "gate1")
         t.expect(ok).to.equal(true)
-        t.expect(key).to.equal("gate1/9")
-        t.expect(h.entity.session.key).to.equal("gate1/9")
-        t.expect(h.gate_ops[#h.gate_ops]).to.equal({ "cluster", "gate1", "bind", 9, "role1", OWNER })
+        t.expect(key).to.equal(cid(9, "gate1"))
+        t.expect(h.entity.session.key).to.equal(cid(9, "gate1"))
+        t.expect(h.gate_ops[#h.gate_ops]).to.equal({ "cluster", "gate1", "bind", cid(9, "gate1"), "role1", OWNER })
     end)
 
     t.it("reports failure when the gate already dropped the connection", function()
         local h = harness()
         h.gate_bind_result = false
-        local ok = h.session.bind("role1", GATE, 9, h.entity, OWNER)
+        local ok = h.session.bind(cid(9), h.entity, OWNER)
         t.expect(ok).to.equal(false)
         t.expect(h.entity.session).to.be_nil()
         t.expect(h.entity.session_io).to.be_nil()
@@ -230,7 +245,7 @@ t.describe("session bind", function()
         t.expect(h.entity.session_io.acked).to.equal(0)
 
         -- 旧凭据对新会话无效
-        t.expect(h.session.resume("role1", GATE, 11, h.entity, OWNER, first, 0)).to.equal(errcode.AUTH_FAILED)
+        t.expect(h.session.resume(cid(11), h.entity, OWNER, first, 0)).to.equal(errcode.AUTH_FAILED)
     end)
 end)
 
@@ -258,7 +273,7 @@ t.describe("session request gating", function()
     t.it("rejects with a reason instead of silently dropping unbound requests", function()
         local h = harness()
         local ran = false
-        local ok, reason = h.session.with_request("role1/9", function()
+        local ok, reason = h.session.with_request(cid(9), function()
             ran = true
         end)
         t.expect(ok).to.equal(false)
@@ -270,8 +285,8 @@ t.describe("session request gating", function()
     t.it("rejects requests that arrive before the entity manager is ready", function()
         local h = harness({ no_mgr = true })
         -- 手动装一个会话，绕过 init（没有 entitymgr）
-        h.session.bind("role1", GATE, 9, h.entity, OWNER)
-        local ok, reason = h.session.with_request("role1/9", function() end)
+        h.session.bind(cid(9), h.entity, OWNER)
+        local ok, reason = h.session.with_request(cid(9), function() end)
         t.expect(ok).to.equal(false)
         t.expect(reason).to.equal("entity manager not ready")
     end)
@@ -319,7 +334,7 @@ t.describe("session request gating", function()
         local ran = false
         h.before_handler = function()
             h.session.unbind(key)
-            h.session.bind("role1", GATE, 9, { type_name = "role", id = 7 }, OWNER)
+            h.session.bind(key, { type_name = "role", id = 7 }, OWNER)
         end
         local ok, reason = h.session.with_request(key, function()
             ran = true
@@ -466,22 +481,22 @@ t.describe("session disconnect", function()
     t.it("kick pushes to the gate that owns the session", function()
         local h = harness()
         bind(h, 9)
-        h.session.kick("role1/9")
-        t.expect(h.kicks).to.equal({ { node = "role1", fd = 9 } })
-        t.expect(h.gate_ops[#h.gate_ops]).to.equal({ "local", "kick", 9 })
+        h.session.kick(cid(9))
+        t.expect(h.kicks).to.equal({ { node = "role1", fd = cid(9) } })
+        t.expect(h.gate_ops[#h.gate_ops]).to.equal({ "local", "kick", cid(9) })
     end)
 
     t.it("kick reaches a remote gate over cluster", function()
         local h = harness()
         bind(h, 12, "gate1")
-        h.session.kick("gate1/12")
-        t.expect(h.kicks).to.equal({ { node = "gate1", fd = 12 } })
-        t.expect(h.gate_ops[#h.gate_ops]).to.equal({ "cluster", "gate1", "kick", 12 })
+        h.session.kick(cid(12, "gate1"))
+        t.expect(h.kicks).to.equal({ { node = "gate1", fd = cid(12, "gate1") } })
+        t.expect(h.gate_ops[#h.gate_ops]).to.equal({ "cluster", "gate1", "kick", cid(12, "gate1") })
     end)
 
     t.it("ignores a kick for a session it does not know", function()
         local h = harness()
-        h.session.kick("gate1/12")
+        h.session.kick(cid(12, "gate1"))
         t.expect(h.kicks).to.equal({})
     end)
 
@@ -489,9 +504,9 @@ t.describe("session disconnect", function()
         local h = harness()
         local _, key = bind(h, 9)
         h.session.reject_client(key, "client binding revoked")
-        t.expect(h.kicks).to.equal({ { node = "role1", fd = 9 } })
+        t.expect(h.kicks).to.equal({ { node = "role1", fd = cid(9) } })
         t.expect(h.session.get_entity(key)).to.equal(h.entity)
-        t.expect(h.entity.session.key).to.equal("role1/9")
+        t.expect(h.entity.session.key).to.equal(cid(9))
         t.expect(h.touched).to.be_nil()
     end)
 
@@ -499,7 +514,7 @@ t.describe("session disconnect", function()
         local h = harness()
         local _, key = bind(h, 9)
         t.expect(h.session.unbind_kick(key, h.entity)).to.equal(true)
-        t.expect(h.kicks).to.equal({ { node = "role1", fd = 9 } })
+        t.expect(h.kicks).to.equal({ { node = "role1", fd = cid(9) } })
         t.expect(h.session.get_entity(key)).to.be_nil()
         t.expect(h.entity.session).to.be_nil()
         t.expect(h.touched).to.equal(7)
@@ -521,9 +536,9 @@ t.describe("session disconnect", function()
         bind(h, 9, SELF_NODE, old_entity)
         bind(h, 9, SELF_NODE, h.entity)
 
-        t.expect(h.session.unbind_kick("role1/9", old_entity)).to.equal(false)
-        t.expect(h.session.get_entity("role1/9")).to.equal(h.entity)
-        t.expect(h.entity.session.key).to.equal("role1/9")
+        t.expect(h.session.unbind_kick(cid(9), old_entity)).to.equal(false)
+        t.expect(h.session.get_entity(cid(9))).to.equal(h.entity)
+        t.expect(h.entity.session.key).to.equal(cid(9))
         t.expect(h.kicks).to.equal({})
         t.expect(h.touched).to.be_nil()
     end)
@@ -535,7 +550,7 @@ t.describe("session disconnect", function()
         t.expect(h.kicks).to.equal({})
         h.now = h.now + 61 * 100
         h.session.sweep_idle()
-        t.expect(h.kicks).to.equal({ { node = "role1", fd = 9 } })
+        t.expect(h.kicks).to.equal({ { node = "role1", fd = cid(9) } })
     end)
 end)
 
@@ -567,11 +582,11 @@ t.describe("session downstream counting", function()
     t.it("the sproto sender counts responses but not transport handshakes", function()
         local h = harness()
         bind(h, 9)
-        h.sender("role1/9", "RESP", "role.bag_list")
+        h.sender(cid(9), "RESP", "role.bag_list")
         t.expect(h.entity.session_io.sent).to.equal(1)
         -- resume / ping 的回包处在计数边界之外：算进去客户端的自校验立刻失配
-        h.sender("role1/9", "PONG", "login.ping")
-        h.sender("role1/9", "RESUMED", "login.resume")
+        h.sender(cid(9), "PONG", "login.ping")
+        h.sender(cid(9), "RESUMED", "login.resume")
         t.expect(h.entity.session_io.sent).to.equal(1)
         t.expect(pushes(h)).to.equal({ "RESP", "PONG", "RESUMED" })
     end)
@@ -606,8 +621,7 @@ t.describe("session downstream counting", function()
             h.session.push(h.entity, "mail_notify", { id = i })
         end
         t.expect(h.entity.session_io.unresumable).to.equal(true)
-        t.expect(h.session.resume("role1", GATE, 10, h.entity, OWNER, fake_nonce(1), 0)).to
-            .equal(errcode.RESUME_UNAVAILABLE)
+        t.expect(h.session.resume(cid(10), h.entity, OWNER, fake_nonce(1), 0)).to.equal(errcode.RESUME_UNAVAILABLE)
     end)
 
     t.it("marks the session unresumable when the client acknowledges an impossible count", function()
@@ -631,13 +645,13 @@ t.describe("session resume", function()
     t.it("moves the session onto a new connection and rotates the credential", function()
         local h = harness()
         local _, nonce = bind_and_push(h, 2)
-        local code, new_nonce, sent = h.session.resume("role1", GATE, 20, h.entity, OWNER, nonce, 1)
+        local code, new_nonce, sent = h.session.resume(cid(20), h.entity, OWNER, nonce, 1)
         t.expect(code).to.equal(errcode.OK)
         t.expect(new_nonce).to_not.equal(nonce)
         t.expect(sent).to.equal(2)
-        t.expect(h.entity.session.fd).to.equal(20)
-        t.expect(h.session.get_entity("role1/20")).to.equal(h.entity)
-        t.expect(h.session.get_entity("role1/9")).to.be_nil()
+        t.expect(h.entity.session.conn_id).to.equal(cid(20))
+        t.expect(h.session.get_entity(cid(20))).to.equal(h.entity)
+        t.expect(h.session.get_entity(cid(9))).to.be_nil()
     end)
 
     -- 旧连接多半还半开着，要回收；但不能走 unbind_kick——那条路会引出网关的
@@ -645,8 +659,8 @@ t.describe("session resume", function()
     t.it("reclaims the half-open old connection without unbinding the entity", function()
         local h = harness()
         local _, nonce = bind_and_push(h, 0)
-        h.session.resume("role1", GATE, 20, h.entity, OWNER, nonce, 0)
-        t.expect(h.kicks).to.equal({ { node = "role1", fd = 9 } })
+        h.session.resume(cid(20), h.entity, OWNER, nonce, 0)
+        t.expect(h.kicks).to.equal({ { node = "role1", fd = cid(9) } })
         t.expect(h.entity.session).to_not.be_nil()
         t.expect(h.touched).to.be_nil()
     end)
@@ -655,10 +669,10 @@ t.describe("session resume", function()
     t.it("survives a session_closed for the old connection arriving after the swap", function()
         local h = harness()
         local old_key, nonce = bind_and_push(h, 0)
-        h.session.resume("role1", GATE, 20, h.entity, OWNER, nonce, 0)
+        h.session.resume(cid(20), h.entity, OWNER, nonce, 0)
         h.session.unbind(old_key)
         t.expect(h.entity.session).to_not.be_nil()
-        t.expect(h.entity.session.fd).to.equal(20)
+        t.expect(h.entity.session.conn_id).to.equal(cid(20))
         t.expect(h.touched).to.be_nil()
     end)
 
@@ -668,7 +682,7 @@ t.describe("session resume", function()
         h.session.ack(h.entity, 1)
         h.gate_ops = {}
 
-        h.session.resume("role1", GATE, 20, h.entity, OWNER, nonce, 1)
+        h.session.resume(cid(20), h.entity, OWNER, nonce, 1)
         -- 续接只做热替换，重放还没开始
         t.expect(pushes(h)).to.equal({})
         -- 业务在 on_resume_client 之前推的包也要排在旧包后面
@@ -686,7 +700,7 @@ t.describe("session resume", function()
         local h = harness()
         local _, nonce = bind_and_push(h, 2)
         h.gate_ops = {}
-        h.session.resume("role1", GATE, 20, h.entity, OWNER, nonce, 2)
+        h.session.resume(cid(20), h.entity, OWNER, nonce, 2)
         h.session.replay(h.entity)
         t.expect(pushes(h)).to.equal({})
     end)
@@ -694,43 +708,42 @@ t.describe("session resume", function()
     t.it("rejects a wrong credential and a credential that was already rotated", function()
         local h = harness()
         local _, nonce = bind_and_push(h, 0)
-        t.expect(h.session.resume("role1", GATE, 20, h.entity, OWNER, "wrong", 0)).to.equal(errcode.AUTH_FAILED)
-        t.expect(h.session.resume("role1", GATE, 20, h.entity, OWNER, nil, 0)).to.equal(errcode.AUTH_FAILED)
+        t.expect(h.session.resume(cid(20), h.entity, OWNER, "wrong", 0)).to.equal(errcode.AUTH_FAILED)
+        t.expect(h.session.resume(cid(20), h.entity, OWNER, nil, 0)).to.equal(errcode.AUTH_FAILED)
         -- 仍然挂在原连接上
-        t.expect(h.entity.session.fd).to.equal(9)
+        t.expect(h.entity.session.conn_id).to.equal(cid(9))
 
-        h.session.resume("role1", GATE, 20, h.entity, OWNER, nonce, 0)
-        t.expect(h.session.resume("role1", GATE, 21, h.entity, OWNER, nonce, 0)).to.equal(errcode.AUTH_FAILED)
+        h.session.resume(cid(20), h.entity, OWNER, nonce, 0)
+        t.expect(h.session.resume(cid(21), h.entity, OWNER, nonce, 0)).to.equal(errcode.AUTH_FAILED)
     end)
 
     t.it("rejects an entity that never had a session", function()
         local h = harness()
-        t.expect(h.session.resume("role1", GATE, 20, h.entity, OWNER, fake_nonce(1), 0)).to
-            .equal(errcode.RESUME_UNAVAILABLE)
+        t.expect(h.session.resume(cid(20), h.entity, OWNER, fake_nonce(1), 0)).to.equal(errcode.RESUME_UNAVAILABLE)
     end)
 
     -- 隐式计数不自带校验，这是唯一一次对账的机会
     t.it("rejects a received count that cannot be true", function()
         local h = harness()
         local _, nonce = bind_and_push(h, 2)
-        t.expect(h.session.resume("role1", GATE, 20, h.entity, OWNER, nonce, 3)).to.equal(errcode.RESUME_UNAVAILABLE)
+        t.expect(h.session.resume(cid(20), h.entity, OWNER, nonce, 3)).to.equal(errcode.RESUME_UNAVAILABLE)
         h.session.ack(h.entity, 2)
-        t.expect(h.session.resume("role1", GATE, 20, h.entity, OWNER, nonce, 1)).to.equal(errcode.RESUME_UNAVAILABLE)
+        t.expect(h.session.resume(cid(20), h.entity, OWNER, nonce, 1)).to.equal(errcode.RESUME_UNAVAILABLE)
     end)
 
     t.it("reports a closed connection when the gate dropped the new fd first", function()
         local h = harness()
         local _, nonce = bind_and_push(h, 0)
         h.gate_bind_result = false
-        t.expect(h.session.resume("role1", GATE, 20, h.entity, OWNER, nonce, 0)).to.equal(errcode.SESSION_CLOSED)
-        t.expect(h.entity.session.fd).to.equal(9)
+        t.expect(h.session.resume(cid(20), h.entity, OWNER, nonce, 0)).to.equal(errcode.SESSION_CLOSED)
+        t.expect(h.entity.session.conn_id).to.equal(cid(9))
     end)
 
     -- 会话和传输无关：TCP 断了可以从 WS 接回来，也可以换一个网关节点
     t.it("accepts a resume from another gate node and another transport", function()
         local h = harness()
         local _, nonce = bind_and_push(h, 0)
-        local code = h.session.resume("gate2", ".gate_ws", 3, h.entity, OWNER, nonce, 0)
+        local code = h.session.resume(cid(3, "gate2", ".gate_ws"), h.entity, OWNER, nonce, 0)
         t.expect(code).to.equal(errcode.OK)
         t.expect(h.entity.session.gate_node).to.equal("gate2")
         t.expect(h.entity.session.gate_service).to.equal(".gate_ws")
@@ -748,8 +761,8 @@ end)
 -- P14 的协议门禁：session_epoch 只在完整登录时生成，模式终身锁定，V2 下行按
 -- (session_epoch, seq) 去重，续接不换 epoch。旧 SDK 走 LEGACY，行为不变
 t.describe("session downlink v2", function()
-    local function bind_v2(h, fd, mode)
-        return h.session.bind("role1", GATE, fd or 9, h.entity, OWNER, mode or h.session.MODE_V2)
+    local function bind_v2(h, seq, mode)
+        return h.session.bind(cid(seq or 9), h.entity, OWNER, mode or h.session.MODE_V2)
     end
 
     t.it("issues a 32 hex epoch and locks the negotiated mode", function()
@@ -765,7 +778,7 @@ t.describe("session downlink v2", function()
 
     t.it("rejects an unknown mode instead of silently falling back to legacy", function()
         local h = harness()
-        t.expect(h.session.bind("role1", GATE, 9, h.entity, OWNER, 7)).to.equal(false)
+        t.expect(h.session.bind(cid(9), h.entity, OWNER, 7)).to.equal(false)
         t.expect(h.entity.session_io).to.be_nil()
     end)
 
@@ -785,7 +798,7 @@ t.describe("session downlink v2", function()
     t.it("keeps transport handshakes outside the envelope", function()
         local h = harness()
         bind_v2(h, 9)
-        h.sender(h.session.key("role1", 9), "PINGPACK", "login.ping")
+        h.sender(cid(9), "PINGPACK", "login.ping")
         t.expect(pushes(h)[1]).to.equal("PINGPACK")
         t.expect(h.entity.session_io.sent).to.equal(0)
     end)
@@ -814,9 +827,7 @@ t.describe("session downlink v2", function()
         local h = harness()
         local _, nonce, epoch = bind_v2(h, 9)
         local code, new_nonce, sent, resumed_epoch, mode = h.session.resume(
-            "role1",
-            GATE,
-            10,
+            cid(10),
             h.entity,
             OWNER,
             nonce,
@@ -833,11 +844,11 @@ t.describe("session downlink v2", function()
     t.it("refuses a resume with another mode or another epoch", function()
         local h = harness()
         local _, nonce = bind_v2(h, 9)
-        t.expect(h.session.resume("role1", GATE, 10, h.entity, OWNER, nonce, 0, {
+        t.expect(h.session.resume(cid(10), h.entity, OWNER, nonce, 0, {
             session_mode = h.session.MODE_LEGACY,
         })).to
             .equal(errcode.RESUME_UNAVAILABLE)
-        t.expect(h.session.resume("role1", GATE, 10, h.entity, OWNER, nonce, 0, {
+        t.expect(h.session.resume(cid(10), h.entity, OWNER, nonce, 0, {
             session_mode = h.session.MODE_V2,
             session_epoch = string.rep("b", 32),
         })).to

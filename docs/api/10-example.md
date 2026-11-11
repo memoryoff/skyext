@@ -182,20 +182,20 @@
 | 文件 / 方法 | 行 | 作用 | 边界 |
 | --- | --- | --- | --- |
 | `admin/main.lua` | 52 | 非实体服务示例：经可靠消息给角色发系统邮件（无命名函数） | — |
-| `login/client.lua` · `M.new(conf)` | 18 | 为一条待登录连接建跟踪对象，起 `login_timeout` 定时器 | 到点未登录：记日志并 `gate:kick(fd)` |
-| · `M.unbind(fd)` | 37 | 停止跟踪（登录成功移交实体时也会调） | — |
-| · `M.closed(fd)` | 44 | 连接已断开（比 `unbind` 更彻底） | — |
-| · `M.sender(fd, pack)` | 52 | 登录期回包一律**经网关** `push`：服务不知道连接是 TCP 还是 WS，直接写 socket 在 WS 上会是乱码 | 连接已不在跟踪表里就丢弃并告警 |
-| · `M.get_obj(fd)` | 66 | 给 `sproto_api` 取协议 handler 的 `obj` | 跟踪对象或 `nil` |
-| `login/login_request.lua` · `self_node()` | 16 | 读并缓存 `cluster_node_name` |
+| `login/client.lua` · `M.new(conf)` | 18 | 为一条待登录连接建跟踪对象（键是 `conn_id`），起 `login_timeout` 定时器 | 到点未登录：记日志并 `gate:kick(conn_id)` |
+| · `M.unbind(conn_id)` | 37 | 停止跟踪（登录成功移交实体时也会调） | — |
+| · `M.closed(conn_id)` | 44 | 连接已断开（比 `unbind` 更彻底） | — |
+| · `M.sender(conn_id, pack)` | 52 | 登录期回包一律**经网关** `push`：服务不知道连接是 TCP 还是 WS，直接写 socket 在 WS 上会是乱码 | 连接已不在跟踪表里就丢弃并告警 |
+| · `M.get_obj(conn_id)` | 66 | 给 `sproto_api` 取协议 handler 的 `obj` | 跟踪对象或 `nil` |
+| `login/login_request.lua` · `self_node()` | — | 已随 conn_id 改造移除（gate 节点由 conn_id 自带） |
 | · `proto_checksum_enable()` | 24 | 读 `proto_checksum_enable`（默认 false） |
-| · `load_bind_role(fd, rid, gate_service, session_mode)` | 32 | 调 `router.bind_session` 把会话绑到角色实体，回 `{ code, rid, nonce, session_mode, session_epoch }` | 绑定失败按错误码回包 |
-| · `M:login(fd, obj)` | 50 | 验 token → 校验 `proto_checksum` → 查角色 → 绑会话 | 各失败分支回不同错误码 |
-| · `M:resume(fd, obj)` | 113 | 断线续接：**只认 nonce、不验 token、不查库**，实体不在内存直接失败，绝不触发实体加载 | 任何错误客户端都退化成走 login |
+| · `load_bind_role(conn_id, rid, session_mode)` | 32 | 调 `router.bind_session` 把会话绑到角色实体，回 `{ code, rid, nonce, session_mode, session_epoch }` | 绑定失败按错误码回包 |
+| · `M:login(conn_id, obj)` | 50 | 验 token → 校验 `proto_checksum` → 查角色 → 绑会话 | 各失败分支回不同错误码 |
+| · `M:resume(conn_id, obj)` | 113 | 断线续接：**只认 nonce、不验 token、不查库**，实体不在内存直接失败，绝不触发实体加载 | 任何错误客户端都退化成走 login |
 | · `M.ping()` | 134 | 登录阶段心跳，回 `{ sent = 0 }`（此时还没有会话计数） |
-| `login/main.lua` · `CMD.open(fd, addr, gate_service)` | 18 | 网关把未绑定连接交给登录服务，建 client 对象 | `gate_service` 缺失直接断言 |
-| · `CMD.client_msg(fd, data)` | 22 | 协议分发到 `login`/`resume`/`ping` |
-| · `CMD.disconnect(fd)` | 26 | 清理连接状态 |
+| `login/main.lua` · `CMD.open(conn_id, addr, gate_service)` | 18 | 网关把未绑定连接交给登录服务，建 client 对象 | `gate_service` 缺失直接断言 |
+| · `CMD.client_msg(conn_id, data)` | 22 | 协议分发到 `login`/`resume`/`ping` |
+| · `CMD.disconnect(conn_id)` | 26 | 清理连接状态 |
 
 ## `example/tools/`
 

@@ -38,10 +38,10 @@
 | `CMD.deliver_reliable_loaded(entity_id)` | 183 | 只在已加载实体上补投 | — |
 | `CMD.activate(entity_id)` | 188 | 主动加载（常驻实体预加载用） | `true` / `false, reason` |
 | `CMD.unload_entity(entity_id)` | 193 | 卸载 | — |
-| `CMD.bind_session(entity_id, gate_node, gate_service, fd)` | 211 | 登录：绑定会话并返回续接凭据 `nonce` | 实体被别的节点持有时**向它要一次**（`unload_entity` 顺带踢掉旧连接）；错误码区分 `ENTITY_NOT_FOUND` / `LOCK_FAILED` / `IN_OTHER_NODE` / `SESSION_CLOSED` |
-| `CMD.resume_session(entity_id, gate_node, gate_service, fd, nonce, recv)` | 252 | 断线续接 | **绝不加载实体**：续接不验 token、不查库，能触发加载就等于开放一个无认证接口。返回 `RESUME_UNAVAILABLE` 表示状态已不存在 |
-| `CMD.client_msg(gate_node, fd, data)` | 277 | gate 转来的上行包 | — |
-| `CMD.session_closed(gate_node, fd)` | 285 | gate 上的连接断开 | — |
+| `CMD.bind_session(entity_id, conn_id, session_mode)` | 211 | 登录：绑定会话并返回续接凭据 `nonce`、`session_epoch`、模式。`conn_id` 必须是合法的 ConnectionIdentity v1，非法值返回 `PARAM_ERROR` | 实体被别的节点持有时**向它要一次**（`unload_entity` 顺带踢掉旧连接）；错误码区分 `ENTITY_NOT_FOUND` / `LOCK_FAILED` / `IN_OTHER_NODE` / `SESSION_CLOSED` |
+| `CMD.resume_session(entity_id, conn_id, nonce, recv, session_mode, session_epoch)` | 253 | 断线续接 | **绝不加载实体**：续接不验 token、不查库，能触发加载就等于开放一个无认证接口。返回 `RESUME_UNAVAILABLE` 表示状态已不存在 |
+| `CMD.client_msg(conn_id, data)` | 281 | gate 转来的上行包；`conn_id` 非法时丢弃 | — |
+| `CMD.session_closed(conn_id)` | 289 | gate 上的连接断开；`conn_id` 非法时丢弃 | — |
 | `CMD.shutdown()` | 200 | 停服：不再加载、卸载全部；返回没卸掉的数量（可再调一次） | 卸干净后本服务不再加锁；锁键消失同样推迟到撤节点租约 |
 | `CMD.start(conf)` | 308 | 起服务、注册名字、按 `client_enabled` 装协议模块 | 模块 `request` 必须返回表，否则断言失败 |
 | `sticky(entity_id, run_local, forward_cmd, args)` | 84 | 本地失败且锁在别处 → 转发；转发回来 `NOT_LOADED` 表示对方没执行，可回本地再试 | **转发本身抛错时不能重试**：分不清是没送到还是对方执行到一半出错 |

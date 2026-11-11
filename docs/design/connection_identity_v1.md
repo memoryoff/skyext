@@ -1,6 +1,8 @@
 # ConnectionIdentity v1（服务器内部连接标识契约）
 
-> **状态：设计契约（P00），由 `lualib/skyext/connection_id.lua` 实现。**
+> **状态：已实现并接入生产链路（P00 + P01）。** `lualib/skyext/connection_id.lua` 负责生成/
+> 解析；`gate_tcp`、`gate_ws` 在 accept 时生成 conn_id，登录、`router.bind_session`、
+> `entity_agent`、`entity.session` 全部以 conn_id 为身份，裸 fd 只留在网关内部读写 socket。
 > 本文件定义的是服务器内部 RPC 的身份，不是客户端协议字段；客户端 sproto 格式不变。
 > 对应方案：`docs/review-2026-11-10-hardening-plan.md` 与后续 v4.3 §1.1。
 
@@ -91,9 +93,8 @@ connection_id.equal(a, b)
 
 - `conn_id` **只能由可信网关生成**，客户端不能自报；`parse` 只是解析工具，不构成授权。
 - `conn_id` **不含 fd，也不能从 `parse` 反解出 fd**。`local_seq` 是网关进程内序号，与 socket fd 无关。
-  下行路由仍需要一张 `conn_id -> 当前 fd` 的映射，且**三方都要维护**：网关的 `g_sessions`、
-  登录服务的 `g_clients/g_gates`、实体侧连接的 `conn.fd`。用 `conn_id` 直接去查现有按数字 fd
-  索引的表会静默丢包，P01 必须先建映射再切换身份参数。
+  `conn_id -> 当前 fd` 的映射**只在网关内部维护**（`g_sessions` / `g_by_fd`）；登录服务与实体侧
+  只以 `conn_id` 为键，不再持有 fd。P01 已按这个边界完成切换。
 - `boot_id` 解决"进程重启后 fd 与本地序号复用"；`gate_node` + `gate_service` 解决跨网关冲突。
 - 登录服务仍须维护 `disconnect` 的短期 tombstone 与 `open` 的可确认注册（见方案 §1.1，不在本模块范围）。
 - 本模块是纯 Lua、无 IO、无 yield、无全局可变状态，可在实体队列与 accept 回调内安全调用。

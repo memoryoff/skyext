@@ -15,19 +15,19 @@ log.config {
 
 local CMD = {}
 
-function CMD.open(fd, addr, gate_service)
-    client.new({ fd = fd, addr = addr, gate = assert(gate_service, "gate must identify itself") })
+function CMD.open(conn_id, addr, gate_service)
+    client.new({ conn_id = conn_id, addr = addr, gate = assert(gate_service, "gate must identify itself") })
     -- 网关在 WS 握手回调里同步等这个确认；没有返回值会被当成注册失败并断开连接。
     -- 重复 open 是允许的：网关超时重试、ACK 丢失都会再发一次，client.new 做幂等处理
     return true
 end
 
-function CMD.client_msg(fd, data)
-    sproto_api.dispatch_message(fd, data)
+function CMD.client_msg(conn_id, data)
+    sproto_api.dispatch_message(conn_id, data)
 end
 
-function CMD.disconnect(fd)
-    client.closed(fd)
+function CMD.disconnect(conn_id)
+    client.closed(conn_id)
 end
 
 skynet.start(function()

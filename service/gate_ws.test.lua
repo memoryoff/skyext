@@ -159,9 +159,16 @@ local function harness(opts)
         end
     end
 
+    -- fd 当前对应的 conn_id（网关内部映射，测试只读）
+    function h.cid(fd)
+        return h.CMD.conn_id(fd)
+    end
+
     -- 接一条连接：跑 accept 回调，等连接协程走完握手/注册
     function h.connect(fd, addr)
         h.accept_cb(fd, addr or "127.0.0.1:1234")
+        -- 预占发生在 accept 回调里，此时 conn_id 已经生成；记下来供断连断言使用
+        h.last_cid = h.CMD.conn_id(fd)
         h.tick()
     end
 
@@ -298,8 +305,8 @@ t.describe("gate_ws registration lifecycle", function()
     t.it("confirms registration with the login service before reading frames", function()
         local h = harness()
         h.connect(9, "1.2.3.4:5678")
-        t.expect(h.calls).to.equal({ { LOGIN, "open", 9, "1.2.3.4:5678", ".gate_ws" } })
-        t.expect(h.CMD.state(9)).to.equal("ACTIVE")
+        t.expect(h.calls).to.equal({ { LOGIN, "open", h.cid(9), "1.2.3.4:5678", ".gate_ws" } })
+        t.expect(h.CMD.state(h.cid(9))).to.equal("ACTIVE")
         t.expect(h.CMD.count()).to.equal(1)
         -- 5000ms 必须换成 skynet.timeout 的 1/100 秒单位
         t.expect(h.timers[1].cs).to.equal(500)
@@ -317,16 +324,16 @@ t.describe("gate_ws registration lifecycle", function()
         local h = harness({ handshake_timeout_ms = 50 })
         h.call_block = true
         h.connect(9)
-        t.expect(h.CMD.state(9)).to.equal("REGISTERING")
+        t.expect(h.CMD.state(h.cid(9))).to.equal("REGISTERING")
         t.expect(h.CMD.count()).to.equal(1)
         -- 超时前不通知登录端，避免它先建记录又收不到后续
         t.expect(h.sent).to.equal({})
 
         h.fire_timeout()
-        t.expect(h.CMD.state(9)).to.equal("CLOSED")
+        t.expect(h.CMD.state(h.cid(9))).to.equal("CLOSED")
         t.expect(h.CMD.count()).to.equal(0)
         t.expect(h.closes[1]).to.equal({ fd = 9, code = 1011, reason = "register failed" })
-        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", 9 } })
+        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", h.last_cid } })
     end)
 
     t.it("compensates a late ACK after the timeout already closed the connection", function()
@@ -334,33 +341,38 @@ t.describe("gate_ws registration lifecycle", function()
         h.call_block = true
         h.connect(9)
         h.fire_timeout()
-        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", 9 } })
+        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", h.last_cid } })
 
         -- 登录端其实已经登记成功，只是响应来晚了：必须补一次 disconnect
         h.resolve_call(true)
-        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", 9 }, { LOGIN, "disconnect", 9 } })
+        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", h.last_cid }, { LOGIN, "disconnect", h.last_cid } })
     end)
 
-    t.it("does not compensate into an fd that has already been reused", function()
+    t.it("compensates the old conn_id without touching a connection that reused the fd", function()
         local h = harness({ handshake_timeout_ms = 50 })
         h.call_block = true
         h.connect(9)
+        local old_cid = h.last_cid
         h.fire_timeout()
 
-        -- fd 复用：新连接已经 ACTIVE，迟到的旧 ACK 不能再按 fd 踢人
+        -- fd 复用：新连接拿到的是新 conn_id，迟到的旧 ACK 只能补旧 conn_id 的 disconnect
         h.call_block = false
         h.connect(9)
-        t.expect(h.CMD.state(9)).to.equal("ACTIVE")
-        local before = #h.sent
+        local new_cid = h.cid(9)
+        t.expect(new_cid).to_not.equal(old_cid)
+        t.expect(h.CMD.state(new_cid)).to.equal("ACTIVE")
+
         h.resolve_call(true)
-        t.expect(#h.sent).to.equal(before)
+        t.expect(#h.sent).to.equal(2)
+        t.expect(h.sent[2]).to.equal({ LOGIN, "disconnect", old_cid })
+        t.expect(h.CMD.state(new_cid)).to.equal("ACTIVE")
     end)
 
     t.it("treats an explicit false acknowledgement as a failed registration", function()
         local h = harness()
         h.call_result = false
         h.connect(9)
-        t.expect(h.CMD.state(9)).to.equal("CLOSED")
+        t.expect(h.CMD.state(h.cid(9))).to.equal("CLOSED")
         t.expect(h.CMD.count()).to.equal(0)
         t.expect(h.closes[1].code).to.equal(1011)
     end)
@@ -369,7 +381,7 @@ t.describe("gate_ws registration lifecycle", function()
         local h = harness()
         h.call_error = "login is down"
         h.connect(9)
-        t.expect(h.CMD.state(9)).to.equal("CLOSED")
+        t.expect(h.CMD.state(h.cid(9))).to.equal("CLOSED")
         t.expect(h.CMD.count()).to.equal(0)
         t.expect(h.closes[1].code).to.equal(1011)
     end)
@@ -389,14 +401,30 @@ t.describe("gate_ws registration lifecycle", function()
         h.connect(9)
         t.expect(h.CMD.count()).to.equal(0)
         -- 没握成手的连接也要让登录服务知道，否则它的 fd 表会漏
-        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", 9 } })
+        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", h.last_cid } })
+    end)
+
+    -- 旧连接的 close 回调和下一次 accept 是两条独立消息；fd 复用时旧回调不能按 fd
+    -- 反查到新 conn_id 并把它关掉
+    t.it("does not let a late close from the old fd kill the connection that reused it", function()
+        local h = harness()
+        h.connect(9)
+        local old_handler = h.handler
+        local old_cid = h.last_cid
+        h.disconnect(9)
+        h.connect(9)
+        local new_cid = h.cid(9)
+        t.expect(new_cid).to_not.equal(old_cid)
+        old_handler.close()
+        t.expect(h.CMD.state(new_cid)).to.equal("ACTIVE")
+        t.expect(h.CMD.count()).to.equal(1)
     end)
 
     t.it("frees the slot when the connection closes", function()
         local h = harness()
         h.connect(9)
         h.handler.close(9)
-        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", 9 } })
+        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", h.last_cid } })
         t.expect(h.CMD.count()).to.equal(0)
         -- serve 收尾时不能再报一次
         h.disconnect(9)
@@ -416,27 +444,27 @@ t.describe("gate_ws forwarding", function()
     t.it("sends an unbound client's packages to the login service", function()
         local h = connected()
         h.handler.message(9, "BYTES", "binary")
-        t.expect(h.sent).to.equal({ { LOGIN, "client_msg", 9, "BYTES" } })
+        t.expect(h.sent).to.equal({ { LOGIN, "client_msg", h.cid(9), "BYTES" } })
     end)
 
     t.it("forwards a bound client's packages straight to the owning entity agent", function()
         local h = connected()
-        t.expect(h.CMD.bind(9, SELF_NODE, ".entity_agent:role:1")).to.equal(true)
+        t.expect(h.CMD.bind(h.cid(9), SELF_NODE, ".entity_agent:role:1")).to.equal(true)
         h.handler.message(9, "BYTES", "binary")
-        t.expect(h.sent).to.equal({ { ".entity_agent:role:1", "client_msg", SELF_NODE, 9, "BYTES" } })
+        t.expect(h.sent).to.equal({ { ".entity_agent:role:1", "client_msg", SELF_NODE, h.cid(9), "BYTES" } })
     end)
 
     t.it("forwards to an owner on another node over cluster", function()
         local h = connected()
-        h.CMD.bind(9, "rolenode1", ".entity_agent:role:1")
+        h.CMD.bind(h.cid(9), "rolenode1", ".entity_agent:role:1")
         h.handler.message(9, "BYTES", "binary")
-        t.expect(h.sent).to.equal({ { "rolenode1!.entity_agent:role:1", "client_msg", SELF_NODE, 9, "BYTES" } })
+        t.expect(h.sent).to.equal({ { "rolenode1!.entity_agent:role:1", "client_msg", SELF_NODE, h.cid(9), "BYTES" } })
     end)
 
     -- 实体节点挂了不能把网关也带下去：这个包丢了，客户端超时后会重连
     t.it("survives an unreachable owner node", function()
         local h = connected()
-        h.CMD.bind(9, "rolenode1", ".entity_agent:role:1")
+        h.CMD.bind(h.cid(9), "rolenode1", ".entity_agent:role:1")
         h.cluster_error = "node down"
         h.handler.message(9, "BYTES", "binary")
         t.expect(h.sent).to.equal({})
@@ -444,15 +472,15 @@ t.describe("gate_ws forwarding", function()
 
     t.it("tells the owner, not the login service, when a bound connection drops", function()
         local h = connected()
-        h.CMD.bind(9, "rolenode1", ".entity_agent:role:1")
+        h.CMD.bind(h.cid(9), "rolenode1", ".entity_agent:role:1")
         h.handler.close(9)
-        t.expect(h.sent).to.equal({ { "rolenode1!.entity_agent:role:1", "session_closed", SELF_NODE, 9 } })
+        t.expect(h.sent).to.equal({ { "rolenode1!.entity_agent:role:1", "session_closed", SELF_NODE, h.last_cid } })
     end)
 
     t.it("reports a socket error the same way as a clean close", function()
         local h = connected()
         h.handler.error(9, "reset by peer")
-        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", 9 } })
+        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", h.last_cid } })
         t.expect(h.CMD.count()).to.equal(0)
     end)
 
@@ -475,13 +503,13 @@ t.describe("gate_ws downstream", function()
     t.it("writes a binary frame without a length prefix, the WS frame has its own", function()
         local h = harness()
         h.connect(9)
-        h.CMD.push(9, "PACK")
+        h.CMD.push(h.cid(9), "PACK")
         t.expect(h.writes).to.equal({ { fd = 9, data = "PACK", fmt = "binary" } })
     end)
 
     t.it("drops a package for a connection it does not know", function()
         local h = harness()
-        h.CMD.push(9, "PACK")
+        h.CMD.push(h.cid(9), "PACK")
         t.expect(h.writes).to.equal({})
     end)
 
@@ -490,7 +518,7 @@ t.describe("gate_ws downstream", function()
         local h = harness()
         h.connect(9)
         h.write_error = "socket closed"
-        h.CMD.push(9, "PACK")
+        h.CMD.push(h.cid(9), "PACK")
         t.expect(h.writes).to.equal({})
     end)
 
@@ -499,18 +527,18 @@ t.describe("gate_ws downstream", function()
         local h = harness()
         h.connect(9)
         h.sent = {}
-        h.CMD.kick(9)
+        h.CMD.kick(h.cid(9))
         t.expect(h.closes[1].fd).to.equal(9)
         t.expect(h.sent).to.equal({})
         t.expect(h.CMD.count()).to.equal(1)
 
         h.handler.close(9)
-        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", 9 } })
+        t.expect(h.sent).to.equal({ { LOGIN, "disconnect", h.last_cid } })
     end)
 
     t.it("ignores a kick for a connection that is already gone", function()
         local h = harness()
-        h.CMD.kick(9)
+        h.CMD.kick(h.cid(9))
         t.expect(h.closes).to.equal({})
     end)
 end)

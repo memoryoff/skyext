@@ -184,8 +184,8 @@
 | `M.call(type_name, entity_id, cmd, ...)` | 26 | 同步调实体 handler | `true, ...返回值` / `false, reason`（实体不可用，handler 没执行）；handler 抛错或节点不可达照常抛错 |
 | `M.send(type_name, entity_id, cmd, ...)` | 35 | 单向投递，不等结果 | — |
 | `M.poke_reliable(type_name, entity_id)` | 47 | 唤醒目标去读自己的 pending 消息；失败不代表丢消息（已落库） | 是否成功投出唤醒 |
-| `M.bind_session(type_name, entity_id, gate_node, gate_service, fd, session_mode)` | 58 | 登录时把网关会话绑到实体；网关与实体不必同节点 | 错误码、续接凭据、`session_epoch`、模式 |
-| `M.resume_session(type_name, entity_id, gate_node, gate_service, fd, nonce, recv, session_mode, session_epoch)` | 70 | 续接：**只作用于已在内存的实体**，不验 token、不查库、不抢锁 | 错误码、新凭据、已发包数、`session_epoch`、模式 |
+| `M.bind_session(type_name, entity_id, conn_id, session_mode)` | 59 | 登录时把网关会话绑到实体；网关与实体不必同节点 | 错误码、续接凭据、`session_epoch`、模式 |
+| `M.resume_session(type_name, entity_id, conn_id, nonce, recv, session_mode, session_epoch)` | 72 | 续接：**只作用于已在内存的实体**，不验 token、不查库、不抢锁 | 错误码、新凭据、已发包数、`session_epoch`、模式 |
 | `M.scoped_call(type_name, value, cmd, ...)` | 80 | 作用域实体便捷入口，ID 由 `types.scoped_id` 算出 | 同 `call` |
 | `M.scoped_send(type_name, value, cmd, ...)` | 84 | 同上，单向 | — |
 | `M.reliable_send(type_name, entity_id, cmd, args)` | 88 | 可靠消息：落库后尝试立即投递，失败留给加载/重试定时器 | `msg_id` |

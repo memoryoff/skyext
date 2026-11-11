@@ -208,7 +208,16 @@ end
 -- 把网关上的一个会话绑到实体上（玩家登录）。由登录服务经 router.bind_session 调用。
 -- 实体还被别的节点持有着时向它要一次（重新登录的语义：对方卸载并踢掉旧连接）。
 -- 返回错误码、续接凭据、session_epoch 和协商后的下行模式
-function CMD.bind_session(entity_id, gate_node, gate_service, fd, session_mode)
+function CMD.bind_session(entity_id, conn_id, session_mode)
+    if not session then
+        log.warn("bind_session without a session layer", "id", entity_id)
+        return errcode.PARAM_ERROR
+    end
+    local parsed, perr = session.parse_conn(conn_id)
+    if not parsed then
+        log.warn("reject bind with an invalid conn_id", "id", entity_id, "err", perr)
+        return errcode.PARAM_ERROR
+    end
     local ok, reason, holder_node = entitymgr:try_ensure_loaded(entity_id)
     if not ok then
         if reason == "not found" then
@@ -222,14 +231,13 @@ function CMD.bind_session(entity_id, gate_node, gate_service, fd, session_mode)
         end
     end
 
-    local key = session.key(gate_node, fd)
+    local key = conn_id
     local bound, result, nonce, epoch, mode = entitymgr:with_entity(entity_id, function(entity)
         local old = entity.session
         if old and old.key ~= key then
             session.unbind_kick(old.key, entity)
         end
-        local ok_bind, new_nonce, new_epoch, new_mode =
-            session.bind(gate_node, gate_service, fd, entity, self_service_name(), session_mode)
+        local ok_bind, new_nonce, new_epoch, new_mode = session.bind(conn_id, entity, self_service_name(), session_mode)
         if not ok_bind then
             -- 排队期间客户端已经断开
             return errcode.SESSION_CLOSED
@@ -250,13 +258,18 @@ end
 -- 续接不验 token、不查库，能触发加载就等于开放一个无认证的接口。实体不在内存里意味着
 -- 会话状态早已不存在，续接本来也必然失败，这不是额外限制。
 -- 返回错误码、轮换后的新凭据、服务端已发出的包数、session_epoch、模式
-function CMD.resume_session(entity_id, gate_node, gate_service, fd, nonce, recv, session_mode, session_epoch)
+function CMD.resume_session(entity_id, conn_id, nonce, recv, session_mode, session_epoch)
     if not session then
         -- 这类实体根本没启用会话层，不是"实体不存在"
         return errcode.RESUME_UNAVAILABLE
     end
+    local parsed, perr = session.parse_conn(conn_id)
+    if not parsed then
+        log.warn("reject resume with an invalid conn_id", "id", entity_id, "err", perr)
+        return errcode.PARAM_ERROR
+    end
     local ok, code, new_nonce, sent, epoch, mode = entitymgr:with_loaded_entity(entity_id, function(entity)
-        local c, n, s, e, m = session.resume(gate_node, gate_service, fd, entity, self_service_name(), nonce, recv, {
+        local c, n, s, e, m = session.resume(conn_id, entity, self_service_name(), nonce, recv, {
             session_mode = session_mode,
             session_epoch = session_epoch,
         })
@@ -278,19 +291,27 @@ function CMD.resume_session(entity_id, gate_node, gate_service, fd, nonce, recv,
 end
 
 -- gate 转发来的上行包
-function CMD.client_msg(gate_node, fd, data)
+function CMD.client_msg(conn_id, data)
     if not session then
         return
     end
-    require("skyext.sproto_api").dispatch_message(session.key(gate_node, fd), data)
+    if not session.parse_conn(conn_id) then
+        log.warn("drop a package with an invalid conn_id")
+        return
+    end
+    require("skyext.sproto_api").dispatch_message(conn_id, data)
 end
 
 -- gate 上的连接断开了
-function CMD.session_closed(gate_node, fd)
+function CMD.session_closed(conn_id)
     if not session then
         return
     end
-    local key = session.key(gate_node, fd)
+    if not session.parse_conn(conn_id) then
+        log.warn("drop session_closed with an invalid conn_id")
+        return
+    end
+    local key = conn_id
     local entity = session.get_entity(key)
     if not entity then
         return

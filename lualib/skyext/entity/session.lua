@@ -3,7 +3,7 @@
 --
 -- 这里有两个寿命不同的东西，分清楚才能看懂续接：
 --
---   entity.session    连接。网络一断就是 nil，会话键 key = "<gate_node>/<fd>" 全集群唯一
+--   entity.session    连接。网络一断就是 nil，会话键 key = conn_id（ConnectionIdentity v1）
 --   entity.session_io 会话。从首次登录活到实体卸载，跨连接存活，**它才是「会话」**
 --
 -- 续接就是把 session_io 挂到一条新连接上。续接窗口因此天然等于实体的 unload_delay，
@@ -13,6 +13,7 @@ local skynet = require "skynet"
 local cluster = require "skynet.cluster"
 local crypto = require "crypto"
 local config = require "skyext.config"
+local connection_id = require "skyext.connection_id"
 local downlink = require "skyext.downlink"
 local errcode = require "skyext.errcode"
 local fingerprint = require "skyext.fingerprint"
@@ -64,8 +65,15 @@ local function conf_number(key, default)
     return v
 end
 
-function M.key(gate_node, fd)
-    return gate_node .. "/" .. tostring(fd)
+-- 会话键就是连接标识本身（ConnectionIdentity v1）：网关生成，实体只解析和比较。
+-- 裸 fd 会跨网关重复、关闭后还会被复用，不能当全局身份。
+function M.key(conn_id)
+    return conn_id
+end
+
+-- 解析并校验连接标识。失败返回 nil, err，调用方必须拒绝，不能猜一个 gate 出来
+function M.parse_conn(conn_id)
+    return connection_id.parse(conn_id)
 end
 
 local function gate_send(conn, cmd, ...)
@@ -87,7 +95,7 @@ local function gate_call(gate_node, gate_service, cmd, ...)
 end
 
 local function kick_conn(conn)
-    gate_send(conn, "kick", conn.fd)
+    gate_send(conn, "kick", conn.conn_id)
 end
 
 -- ---------------------------------------------------------------- 会话状态
@@ -203,7 +211,7 @@ local function record_and_send(entity, pack)
     if not conn or io_.replaying then
         return false
     end
-    gate_send(conn, "push", conn.fd, pack)
+    gate_send(conn, "push", conn.conn_id, pack)
     return true
 end
 
@@ -215,7 +223,7 @@ local function sender(key, pack, request_name)
         return
     end
     if UNCOUNTED_RESPONSE[request_name] then
-        gate_send(conn, "push", conn.fd, pack)
+        gate_send(conn, "push", conn.conn_id, pack)
         return
     end
     record_and_send(conn.entity, pack)
@@ -230,12 +238,12 @@ local function cancel_unload(entity)
     end
 end
 
-local function install_conn(gate_node, gate_service, fd, entity)
+local function install_conn(conn_id, parsed, entity)
     local conn = {
-        key = M.key(gate_node, fd),
-        gate_node = gate_node,
-        gate_service = gate_service,
-        fd = fd,
+        key = conn_id,
+        conn_id = conn_id,
+        gate_node = parsed.gate_node,
+        gate_service = parsed.gate_service,
         entity = entity,
     }
     g_conns[conn.key] = conn
@@ -253,15 +261,20 @@ end
 --
 -- session_mode 在完整登录时协商并终身锁定：只接受 0（LEGACY）/1（V2），
 -- 其它值 fail-closed，不能悄悄退回 LEGACY 让客户端以为自己在 V2
-function M.bind(gate_node, gate_service, fd, entity, owner_service, session_mode)
+function M.bind(conn_id, entity, owner_service, session_mode)
     if session_mode ~= nil and session_mode ~= M.MODE_LEGACY and session_mode ~= M.MODE_V2 then
         log.warn("reject unknown session mode", "mode", tostring(session_mode))
         return false
     end
-    if not gate_call(gate_node, gate_service, "bind", fd, self_node(), owner_service) then
+    local parsed, perr = connection_id.parse(conn_id)
+    if not parsed then
+        log.warn("reject invalid conn_id", "err", perr)
         return false
     end
-    local conn = install_conn(gate_node, gate_service, fd, entity)
+    if not gate_call(parsed.gate_node, parsed.gate_service, "bind", conn_id, self_node(), owner_service) then
+        return false
+    end
+    local conn = install_conn(conn_id, parsed, entity)
     entity.session_io = new_session_io(session_mode)
     log.info("session bind", "type", entity.type_name, "id", entity.id, "session", conn.key)
     return true, entity.session_io.nonce, entity.session_io.session_epoch, entity.session_io.session_mode
@@ -275,7 +288,12 @@ end
 -- 缺省（旧 SDK）按 LEGACY 处理，不校验 epoch。
 --
 -- 失败一律让客户端退化成完整登录，所以不区分"凭据错"和"状态没了"之外的细节。
-function M.resume(gate_node, gate_service, fd, entity, owner_service, nonce, recv, opts)
+function M.resume(conn_id, entity, owner_service, nonce, recv, opts)
+    local parsed, perr = connection_id.parse(conn_id)
+    if not parsed then
+        log.warn("reject invalid conn_id", "err", perr)
+        return errcode.PARAM_ERROR
+    end
     local io_ = entity.session_io
     if not io_ or io_.unresumable then
         return errcode.RESUME_UNAVAILABLE
@@ -309,7 +327,7 @@ function M.resume(gate_node, gate_service, fd, entity, owner_service, nonce, rec
         log.warn("resume recv out of range", "id", entity.id, "recv", recv, "acked", io_.acked, "sent", io_.sent)
         return errcode.RESUME_UNAVAILABLE
     end
-    if not gate_call(gate_node, gate_service, "bind", fd, self_node(), owner_service) then
+    if not gate_call(parsed.gate_node, parsed.gate_service, "bind", conn_id, self_node(), owner_service) then
         return errcode.SESSION_CLOSED
     end
 
@@ -317,7 +335,7 @@ function M.resume(gate_node, gate_service, fd, entity, owner_service, nonce, rec
     -- 先置标志再换连接：这段窗口里别的协程推的包照常计数入缓冲但不直接写网关，
     -- 等 M.replay 统一按序发出，避免新包抢在重放的旧包前面
     io_.replaying = true
-    local conn = install_conn(gate_node, gate_service, fd, entity)
+    local conn = install_conn(conn_id, parsed, entity)
     if old and old.key ~= conn.key then
         g_conns[old.key] = nil
         -- 旧连接多半还半开着（切网络不产生 FIN/RST），踢一次回收它。这里不能走
@@ -356,7 +374,7 @@ function M.replay(entity)
             kick_conn(conn)
             return false
         end
-        gate_send(conn, "push", conn.fd, pack)
+        gate_send(conn, "push", conn.conn_id, pack)
     end
     io_.replaying = false
     return true

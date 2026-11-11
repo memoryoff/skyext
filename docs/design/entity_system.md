@@ -382,14 +382,14 @@ GM 指令会在所有注册该指令的服务上执行，每类型注册一次�
 客户端一侧的协议号、字段和五条客户端义务见 [客户端协议](../guide/client_protocol.md)，这里只讲服务端模块。
 
 **核心函数：**
-- `key(gate_node, fd)` — 拼会话键 `"<gate_node>/<fd>"`
+- `key(conn_id)` — 会话键就是连接标识本身（ConnectionIdentity v1）；`parse_conn(conn_id)` 负责解析校验
 - `init(entitymgr)` — 注入 entitymgr 引用（供 unbind 触发 touch），把 `sproto_api` 的发送端
   `set_sender` 换成"按会话键找到网关再 push 字节"，并起空闲巡检定时器
-- `bind(gate_node, gate_service, fd, entity, owner_service)` — 先 `gate_call(..., "bind", fd, self_node(), owner_service)`
+- `bind(conn_id, entity, owner_service, session_mode)` — 先 `gate_call(..., "bind", conn_id, self_node(), owner_service)`
   让网关把这条连接之后的包转给 `owner_service`；网关那边连接已断开时返回 `false`。成功则记 `g_conns[key]`、
   设 `entity.session`、取消卸载定时器、**无条件重建 `session_io`** 并返回新 `nonce`。顶号和同账号重登走的是
   同一个实体对象，沿用旧 `session_io` 会让后来者继承前一个客户端的凭据、计数和响应缓存
-- `resume(gate_node, gate_service, fd, entity, owner_service, nonce, recv)` — 把会话热替换到新连接上，
+- `resume(conn_id, entity, owner_service, nonce, recv, opts)` — 把会话热替换到新连接上，
   只作用于内存里的实体，不查库不抢锁。校验 `nonce`（`crypto.const_equals` 恒定时间比对，每次 bind/resume 轮换）
   与 `recv ∈ [acked, sent]`，然后换连接、踢掉旧连接、`ack(recv)`、轮换 `nonce`。
   返回 `错误码, 新 nonce, sent`；失败返回 `RESUME_UNAVAILABLE` / `AUTH_FAILED` / `SESSION_CLOSED`
@@ -398,7 +398,7 @@ GM 指令会在所有注册该指令的服务上执行，每类型注册一次�
 - `ack(entity, recv)` — 裁剪重放缓冲；`recv` 越界说明计数已失同步，置 `unresumable`
 - `unbind(key)` — 解绑连接（`session_io` 一律保留），调用 `entitymgr:touch` 重启卸载定时器。
   连接可能已热替换到新连接上，旧连接迟到的 `session_closed` 不会清掉新连接
-- `kick(key)` — 断开客户端连接：`gate_send(conn, "kick", fd)`。解绑交给网关的断开通知（`session_closed`），
+- `kick(key)` — 断开客户端连接：`gate_send(conn, "kick", conn_id)`。解绑交给网关的断开通知（`session_closed`），
   这样 `on_unbind_client` 照常执行
 - `unbind_kick(key, expected_entity)` — 仅在该连接确实属于 `expected_entity` 时才 unbind+kick，
   防止误踢已经换绑的新连接；幂等，重复调用返回 `false`
