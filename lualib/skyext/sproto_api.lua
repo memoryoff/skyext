@@ -6,6 +6,8 @@ local sproto_host = require "skyext.sproto_host"
 local config = require "skyext.config"
 local log = require "skyext.log"
 local errcode = require "skyext.errcode"
+local crypto = require "crypto"
+local fingerprint = require "skyext.fingerprint"
 
 local M = {}
 
@@ -64,7 +66,7 @@ end
 -- 一个连接管理模块需要提供 get_obj 接口用于获取连接对象
 -- 同时也可以提供 middleware_cbs 表，用于注册中间件，主要用于做协议拦截
 -- obj 就是一个连接对象，由连接管理模块的 get_obj 接口提供
--- 可选的 with_request(fd, f, req_id, request_name) 用于把协议处理放进连接自己的串行
+-- 可选的 with_request(fd, f, req_id, request_name, request_digest) 用于把协议处理放进连接自己的串行
 -- 队列，约定返回 true, ...（f 已执行）或 false, reason, code（请求被拒绝，f 未执行）。
 -- req_id 是客户端带的 request id，连接模块可以拿它做上行幂等缓存；request_name 让它
 -- 能发现同一个 id 换了协议（客户端重置了计数器）
@@ -223,9 +225,21 @@ local function dispatch_request(fd, request_name, request, response_cb, req_id)
     if not with_request then
         return dispatch_request_unlocked(fd, request_name, request, response_cb)
     end
+    -- 摘要必须在 handler 执行前算：handler 可能原地改请求表，执行后再算就对不上
+    -- 客户端重传的原始参数了。req_id 为 nil 的单向协议不写缓存，也不需要摘要
+    local digest
+    if req_id ~= nil then
+        local err
+        digest, err = fingerprint.compute(request_name, request or {}, crypto.hmac_sha256)
+        if not digest then
+            -- fail-closed：算不出摘要就不能保证幂等，拒绝执行而不是退化成"不比对"
+            log.warn("request fingerprint failed", "request_name", request_name, "fd", fd, "err", err)
+            return nil, "request fingerprint failed", M.errcode_rejected
+        end
+    end
     local ok, a, b, c, cache_policy = with_request(fd, function()
         return dispatch_request_unlocked(fd, request_name, request, response_cb)
-    end, req_id, request_name)
+    end, req_id, request_name, digest)
     if ok == true then
         -- f 已执行：a, b, c 就是它的 pack, reason, code；cache_policy 只用于 L1 决策
         return a, b, c, cache_policy

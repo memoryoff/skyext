@@ -98,8 +98,9 @@ function M.new_entry(protocol_name, request, pack, hash_fn)
 end
 
 -- 返回 true 或 false, reason, kind。条目不可用时直接判失败，调用方按 REQUEST_EXPIRED 处理，
--- 不能猜测重放。matches 为 true 只说明参数相同，不说明业务已提交。
-function M.matches(entry, protocol_name, request, hash_fn, equal_fn)
+-- 不能猜测重放。matches_digest 用于"摘要已经算好"的路径（会话层在 handler 执行前算一次，
+-- 执行后复用同一个摘要写缓存），避免对同一请求二次编码。
+function M.matches_digest(entry, protocol_name, digest, equal_fn)
     if type(entry) ~= "table" then
         return false, "invalid entry", M.KIND.STALE_VERSION
     end
@@ -114,14 +115,13 @@ function M.matches(entry, protocol_name, request, hash_fn, equal_fn)
     if entry.name ~= protocol_name then
         return false, "protocol mismatch", M.KIND.PROTOCOL_MISMATCH
     end
+    if type(digest) ~= "string" or #digest ~= M.HASH_BYTES then
+        return false, "invalid digest", M.KIND.INTERNAL
+    end
 
     local eq, eq_err = resolve_equal(equal_fn)
     if not eq then
         return false, eq_err, M.KIND.INTERNAL
-    end
-    local digest, err = M.compute(protocol_name, request, hash_fn)
-    if not digest then
-        return false, err, M.KIND.INTERNAL
     end
     local ok, same = pcall(eq, digest, entry.hash)
     if not ok then
@@ -135,6 +135,28 @@ function M.matches(entry, protocol_name, request, hash_fn, equal_fn)
     end
     -- truthy 非布尔说明比较函数本身有问题，按内部故障处理，不能伪装成客户端冲突
     return false, "equal_fn returned a non-boolean", M.KIND.INTERNAL
+end
+
+function M.matches(entry, protocol_name, request, hash_fn, equal_fn)
+    if type(entry) ~= "table" then
+        return false, "invalid entry", M.KIND.STALE_VERSION
+    end
+    -- 先做条目自身与协议名的检查，避免为一个注定失败的比较去算摘要
+    if entry.fingerprint_version ~= M.VERSION then
+        return false, "stale fingerprint version", M.KIND.STALE_VERSION
+    end
+    if type(entry.hash) ~= "string" or #entry.hash ~= M.HASH_BYTES then
+        return false, "invalid cached hash", M.KIND.INVALID_HASH
+    end
+    if entry.name ~= protocol_name then
+        return false, "protocol mismatch", M.KIND.PROTOCOL_MISMATCH
+    end
+
+    local digest, err = M.compute(protocol_name, request, hash_fn)
+    if not digest then
+        return false, err, M.KIND.INTERNAL
+    end
+    return M.matches_digest(entry, protocol_name, digest, equal_fn)
 end
 
 return M

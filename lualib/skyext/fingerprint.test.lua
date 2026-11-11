@@ -246,3 +246,51 @@ t.describe("fingerprint.matches", function()
             .equal(true)
     end)
 end)
+
+-- 摘要已算好的路径（会话层 P03 用）：检查顺序必须与 matches 一致，
+-- 条目不可用优先于语义冲突，比较函数异常按 INTERNAL 处理。
+t.describe("fingerprint.matches_digest", function()
+    local digest = string.rep("a", 32)
+    local function entry(over)
+        local e = { fingerprint_version = 1, name = "shop.buy", hash = digest, pack = "PACK" }
+        for k, v in pairs(over or {}) do
+            e[k] = v
+        end
+        return e
+    end
+
+    t.it("matches the same digest and rejects a different one", function()
+        t.expect(fingerprint.matches_digest(entry(), "shop.buy", digest)).to.equal(true)
+        local ok, _, kind = fingerprint.matches_digest(entry(), "shop.buy", string.rep("b", 32))
+        t.expect(ok).to.equal(false)
+        t.expect(kind).to.equal(fingerprint.KIND.MISMATCH)
+    end)
+
+    t.it("reports an unusable entry before a protocol mismatch", function()
+        local ok, _, kind = fingerprint.matches_digest(entry({ fingerprint_version = 0 }), "other.req", digest)
+        t.expect(ok).to.equal(false)
+        t.expect(kind).to.equal(fingerprint.KIND.STALE_VERSION)
+
+        local _, _, hash_kind = fingerprint.matches_digest(entry({ hash = "short" }), "other.req", digest)
+        t.expect(hash_kind).to.equal(fingerprint.KIND.INVALID_HASH)
+    end)
+
+    t.it("reports a protocol mismatch without comparing the digest", function()
+        local ok, _, kind = fingerprint.matches_digest(entry(), "other.req", digest)
+        t.expect(ok).to.equal(false)
+        t.expect(kind).to.equal(fingerprint.KIND.PROTOCOL_MISMATCH)
+    end)
+
+    t.it("treats a broken compare function as an internal fault", function()
+        local ok, _, kind = fingerprint.matches_digest(entry(), "shop.buy", digest, function()
+            error("boom")
+        end)
+        t.expect(ok).to.equal(false)
+        t.expect(kind).to.equal(fingerprint.KIND.INTERNAL)
+
+        local _, _, bool_kind = fingerprint.matches_digest(entry(), "shop.buy", digest, function()
+            return "yes"
+        end)
+        t.expect(bool_kind).to.equal(fingerprint.KIND.INTERNAL)
+    end)
+end)

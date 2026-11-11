@@ -373,8 +373,9 @@ t.describe("session upstream idempotency", function()
             runs = runs + 1
             return "RESP"
         end
-        t.expect({ h.session.with_request(key, handler, 5) }).to.equal({ true, "RESP" })
-        t.expect({ h.session.with_request(key, handler, 5) }).to.equal({ true, "RESP" })
+        local digest = string.rep("d", 32)
+        t.expect({ h.session.with_request(key, handler, 5, "shop.buy", digest) }).to.equal({ true, "RESP" })
+        t.expect({ h.session.with_request(key, handler, 5, "shop.buy", digest) }).to.equal({ true, "RESP" })
         t.expect(runs).to.equal(1)
     end)
 
@@ -399,19 +400,22 @@ t.describe("session upstream idempotency", function()
             runs = runs + 1
             return "RESP"
         end
+        local function digest_of(req_id)
+            return string.rep(string.char(96 + req_id), 32)
+        end
         for req_id = 1, 3 do
-            h.session.with_request(key, handler, req_id)
+            h.session.with_request(key, handler, req_id, "shop.buy", digest_of(req_id))
         end
         t.expect(runs).to.equal(3)
 
-        local ok, reason, code = h.session.with_request(key, handler, 1)
+        local ok, reason, code = h.session.with_request(key, handler, 1, "shop.buy", digest_of(1))
         t.expect(ok).to.equal(false)
         t.expect(code).to.equal(errcode.REQUEST_EXPIRED)
         t.expect(reason).to.equal("response for this request id was already evicted")
         t.expect(runs).to.equal(3)
 
         -- 还在缓存里的照常命中
-        t.expect({ h.session.with_request(key, handler, 3) }).to.equal({ true, "RESP" })
+        t.expect({ h.session.with_request(key, handler, 3, "shop.buy", digest_of(3)) }).to.equal({ true, "RESP" })
         t.expect(runs).to.equal(3)
     end)
 
@@ -425,9 +429,10 @@ t.describe("session upstream idempotency", function()
                 return resp
             end
         end
-        t.expect({ h.session.with_request(key, handler("BAG"), 1, "bag.use_item") }).to.equal({ true, "BAG" })
+        local digest = string.rep("b", 32)
+        t.expect({ h.session.with_request(key, handler("BAG"), 1, "bag.use_item", digest) }).to.equal({ true, "BAG" })
 
-        local ok, reason, code = h.session.with_request(key, handler("SHOP"), 1, "shop.buy")
+        local ok, reason, code = h.session.with_request(key, handler("SHOP"), 1, "shop.buy", digest)
         t.expect(ok).to.equal(false)
         t.expect(code).to.equal(errcode.REQUEST_CONFLICT)
         t.expect(reason).to.equal("request id reused for a different request")
@@ -438,7 +443,7 @@ t.describe("session upstream idempotency", function()
             h.session.with_request(key, function()
                 runs = runs + 1
                 return "AGAIN"
-            end, 1, "bag.use_item"),
+            end, 1, "bag.use_item", digest),
         }).to
             .equal({ true, "BAG" })
         t.expect(runs).to.equal(0)
@@ -837,6 +842,34 @@ t.describe("session downlink v2", function()
             session_epoch = string.rep("b", 32),
         })).to
             .equal(errcode.RESUME_UNAVAILABLE)
+    end)
+
+    -- 同协议但参数不同：只看协议名会静默回放上一次的结果
+    t.it("refuses a cached request id whose parameters changed", function()
+        local h = harness()
+        local _, key = bind(h, 9)
+        local runs = 0
+        local function handler()
+            runs = runs + 1
+            return "RESP"
+        end
+        h.session.with_request(key, handler, 1, "shop.buy", string.rep("a", 32))
+        local ok, _, code = h.session.with_request(key, handler, 1, "shop.buy", string.rep("c", 32))
+        t.expect(ok).to.equal(false)
+        t.expect(code).to.equal(errcode.REQUEST_CONFLICT)
+        t.expect(runs).to.equal(1)
+    end)
+
+    -- 旧格式条目没有 version/hash，无法证明参数相同，只能按 EXPIRED 让客户端重走流程
+    t.it("refuses a legacy cache entry without a fingerprint", function()
+        local h = harness()
+        local _, key = bind(h, 9)
+        h.entity.session_io.resp_cache[1] = { pack = "OLD", name = "shop.buy" }
+        local ok, _, code = h.session.with_request(key, function()
+            return "NEW"
+        end, 1, "shop.buy", string.rep("a", 32))
+        t.expect(ok).to.equal(false)
+        t.expect(code).to.equal(errcode.REQUEST_EXPIRED)
     end)
 
     t.it("does not cache a NO_CACHE response in L1", function()

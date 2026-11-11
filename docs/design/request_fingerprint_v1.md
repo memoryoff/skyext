@@ -1,7 +1,9 @@
 # request_fingerprint_v1（请求指纹输入契约）
 
-> **状态：§1 规范化编码与 §2 指纹接口均已实现；真实 HMAC 与解码等价性仍须过 P00-A 探针；
-> 会话层接入（P03）与 `resp_cache` 条目格式变更尚未实现。**
+> **状态：§1 规范化编码、§2 指纹接口、P00-A 运行时探针（含真实 sproto 解码与
+> RFC 4231 HMAC 向量）以及会话层接入（P03）均已实现。`resp_cache` 条目为
+> `{fingerprint_version, name, hash, pack}`；没有 version/hash 的旧条目按
+> `REQUEST_EXPIRED` 处理。**
 > 本文件定义服务器内部如何把一个**已解码**的请求表变成确定性字节流，供会话层做
 > `req_id` 参数摘要比对。它不改变客户端 wire 格式，客户端 SDK 不参与计算。
 
@@ -109,7 +111,7 @@ canonical.encode_request(protocol_name, value)
 摘要域；两者任一变化都要整体提升，旧缓存按 `REQUEST_EXPIRED` 处理，否则新旧输入会混在一起。
 协议名限定为 `[A-Za-z0-9._-]+`，最多 128 字节：它来自 `proto.name`，出现别的字节一定是上游拼错了。
 
-## 2. 指纹计算（接口已实现，真实 HMAC 待 P00-A 验证）
+## 2. 指纹计算（接口已实现，P00-A 已验证）
 
 `lualib/skyext/fingerprint.lua` 提供：
 
@@ -118,7 +120,11 @@ fingerprint.compute(protocol_name, request, hash_fn)   -- -> 32 字节 digest | 
 fingerprint.entry_from_digest(digest, protocol_name, pack)
 fingerprint.new_entry(protocol_name, request, pack, hash_fn)
 fingerprint.matches(entry, protocol_name, request, hash_fn, equal_fn)
+fingerprint.matches_digest(entry, protocol_name, digest, equal_fn)
 ```
+
+`matches_digest` 用于摘要已经算好的路径：会话层在 handler 执行前算一次摘要，执行后
+用同一个摘要写缓存，命中时也只比对摘要，避免对同一请求二次编码。
 
 `hash_fn(domain, framed_bytes)` 由调用方注入，**两个参数**。生产直接把
 `crypto.hmac_sha256` 当 `hash_fn` 传入（key 第一、msg 第二、输出 32 字节二进制），
@@ -148,9 +154,8 @@ Grant 使用独立的服务端保密密钥与 `G1` 域，两者不能互换。`e
 
 - `matches` 为 true **只说明参数相同，不代表业务已提交**；条目只能在 handler 产出 pack
   之后写入，不能为了"预热"提前写。
-- `resp_cache` 条目目标格式是 `{fingerprint_version=1, name, hash, pack}`（P03 落地；当前仍是
-  `{pack, name}`）；缺版本或 hash 的旧条目一律按不可用处理，调用方应返回 `REQUEST_EXPIRED`，
-  不能猜测重放。
+- `resp_cache` 条目格式是 `{fingerprint_version=1, name, hash, pack}`；缺版本或 hash 的
+  旧条目一律按不可用处理，调用方返回 `REQUEST_EXPIRED`，不能猜测重放。
 - 快照传输时 `hash` 用 `crypto.base64urlencode` 编码、安装时 `base64urldecode` 还原；
   `matches` 收的是**解码后的 32 字节原始值**，漏解码会让续接后的所有重传变成
   `invalid_hash`。`SessionSnapshotV1` 是方案中拟新增的契约，当前仓库尚未实现。
@@ -168,7 +173,7 @@ P00-A 探针必须先固定并验证：
    改 `fingerprint.DOMAIN` 后同一请求的 digest 必须变化。这条专门拦截"预绑定第一个参数"
    或忽略输入的实现——它们仍会返回合法的 32 字节长度。
 
-**探针未通过前，P03 不得接入指纹比对。**
+**P00-A 已通过**：见 `docs/design/p00_gate_evidence.md` 的命令与输出。
 
 ## 3. 与 L1/L2 幂等的关系
 
@@ -186,4 +191,8 @@ sproto 解码器对**缺失字段**与**显式默认值**的实际表现决定�
 - 若解码器保留缺失，则二者形状不同、指纹不同，调用方必须接受"同一业务意图可能有两个指纹"，
   或在上层把可选字段显式补全后再计算。
 
-这条必须用探针实测后写入 `docs/guide/client_protocol.md`，不能凭猜测实现。
+**实测结论（P00-A）**：当前 Skynet 解码器**不补零值**——缺失字段不出现在解码结果里，
+显式空 map 会解码成空表，二者指纹不同。因此同一业务意图的"字段缺省"与"显式零值"
+会产生两个指纹；服务端不替客户端补全可选字段，客户端重传时必须原样重发同一组字段。
+用例：`lualib/skyext/p00a_sproto_fingerprint.test.lua` 的
+"leaves absent optional fields absent" 与 "keeps an explicitly empty map distinct from a missing one"。

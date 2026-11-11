@@ -395,3 +395,62 @@ t.describe("sproto_api critical decision", function()
         t.expect(h.api.is_decision(h.api.decision({ name = "ok" }))).to.equal(true)
     end)
 end)
+
+-- P03：指纹必须在 handler 执行前算好并交给会话层，handler 改过请求表也不能影响它。
+t.describe("sproto_api fingerprint handoff", function()
+    t.it("computes a 32-byte digest before the handler can mutate the request", function()
+        local seen
+        local h = harness({
+            with_request = function(_, f, req_id, name, digest)
+                seen = { req_id = req_id, name = name, digest = digest }
+                local result = table.pack(f())
+                return true, table.unpack(result, 1, result.n)
+            end,
+        })
+        h.handlers["role.login_info"] = function(request)
+            request.rid = 999
+            return { name = "x" }
+        end
+        local msg = h.client_send("role_login_info", { rid = 7 }, 31)
+        local kind, _, request, response_cb = h.server_host:dispatch(msg)
+        t.expect(kind).to.equal("REQUEST")
+        h.api.raw_dispatch(h.fd, "REQUEST", "role.login_info", request, response_cb, 31)
+        t.expect(seen.req_id).to.equal(31)
+        t.expect(seen.name).to.equal("role.login_info")
+        t.expect(type(seen.digest)).to.equal("string")
+        t.expect(#seen.digest).to.equal(32)
+    end)
+
+    t.it("does not compute a digest for a one-way request without a session", function()
+        local called = false
+        local h = harness({
+            with_request = function(_, f, req_id, name, digest)
+                called = true
+                t.expect(req_id).to.be_nil()
+                t.expect(digest).to.be_nil()
+                local result = table.pack(f())
+                return true, table.unpack(result, 1, result.n)
+            end,
+        })
+        local msg = h.client_send("role_note", { text = "x" })
+        local kind, _, request, response_cb = h.server_host:dispatch(msg)
+        t.expect(kind).to.equal("REQUEST")
+        h.api.raw_dispatch(h.fd, "REQUEST", "role.note", request, response_cb)
+        t.expect(called).to.equal(true)
+    end)
+
+    t.it("rejects a request whose fingerprint cannot be computed", function()
+        local ran = false
+        local h = harness()
+        h.handlers["role.login_info"] = function()
+            ran = true
+            return { name = "should not run" }
+        end
+        local cyclic = {}
+        cyclic.self = cyclic
+        h.api.raw_dispatch(h.fd, "REQUEST", "role.login_info", cyclic, function(args)
+            return args
+        end, 32)
+        t.expect(ran).to.equal(false)
+    end)
+end)

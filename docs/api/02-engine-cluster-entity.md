@@ -223,7 +223,7 @@
 
 | 方法 | 行 | 作用 | 边界 |
 | --- | --- | --- | --- |
-| `M.with_request(key, f, req_id, request_name)` | 394 | 在实体串行队列里执行协议函数，顺带上行幂等：同 `req_id` 重复请求直接回缓存，`req_id` 被别的请求复用返回 `REQUEST_CONFLICT`，缓存已淘汰返回 `REQUEST_EXPIRED` | `true, ...` 或 `false, reason, code`（被拒绝时 `f` 没执行） |
+| `M.with_request(key, f, req_id, request_name, request_digest)` | 513 | 在实体串行队列里执行协议函数，顺带上行幂等：同 `req_id` 且协议名、32 字节参数摘要都相同才回缓存；协议名或参数不同返回 `REQUEST_CONFLICT`，旧格式条目或缓存已淘汰返回 `REQUEST_EXPIRED` | `true, ...` 或 `false, reason, code`（被拒绝时 `f` 没执行） |
 | `M.push(entity, name, msg)` | 463 | 给实体自己的客户端推消息；返回「有没有写到网关」，不在线时包已进重放缓冲不算丢 | 布尔 |
 | `M.reject_client(key, reason)` | 456 | 错误码无法通过协议回给客户端时的兜底：断开连接让客户端重连 | — |
 | `M.cmds.ping(request, _, obj)` | 475 | `ping` 回 `{ sent = 已发包数 }` | — |
