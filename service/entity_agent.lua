@@ -18,6 +18,9 @@ local session
 local g_data_modules = {}
 -- 数据模块的声明顺序（来自 conf.modules）：on_load 正序、on_unload 逆序
 local g_module_order = {}
+-- 支付发奖的 capability 签发器与摘要函数（进程内单例）
+local g_charge_issuer
+local g_charge_hash
 
 local CMD = {}
 
@@ -105,7 +108,17 @@ local function sticky(entity_id, run_local, forward_cmd, args)
     return table.pack(run_local())
 end
 
+-- 框架内部命令：由框架模块（Outbox 调度器、支付回调、对账 worker）经 `router.call`
+-- 调用。它们不属于业务 handler——`router.call` 固定走 `entity_call`，
+-- 只认 `handler.handlers[cmd]`，所以框架命令必须在这里注册，否则永远"unknown command"。
+-- 同名时框架优先：业务 handler 覆盖 `charge_grant` 会绕过 capability 签发。
+local FRAMEWORK = {}
+
 local function handler_of(cmd)
+    local framework = FRAMEWORK[cmd]
+    if framework then
+        return framework
+    end
     local handler_func = handler.handlers[cmd]
     if not handler_func then
         error(string.format("unknown entity command: %s.%s", type_name, cmd))
@@ -143,8 +156,10 @@ end
 
 -- 只对已经加载的实体发消息：不加载、不转发，实体不在就返回 false
 function CMD.entity_send_loaded(entity_id, cmd, ...)
-    local handler_func = handler.handlers[cmd]
-    if not handler_func then
+    -- 用 handler_of 而不是只查 handler.handlers：框架命令（outbox_pump 等）
+    -- 不在业务 handler 里，直接查会一律"unknown entity command"
+    local ok_cmd, handler_func = pcall(handler_of, cmd)
+    if not ok_cmd then
         log.error("unknown entity command", "type", type_name, "cmd", cmd)
         return false
     end
@@ -200,16 +215,64 @@ function CMD.deliver_reliable_loaded(entity_id)
     return entitymgr:deliver_pending(entity_id, { loaded_only = true })
 end
 
--- Outbox 调度器（P13）的投递入口。**只对已加载实体执行**：调度器自己决定要不要
--- 为离线角色加载实体，这里再触发一次加载会让"扫描到就加载"绕开它的限额。
--- 返回 true, stats 或 false, NOT_LOADED
-function CMD.outbox_pump(entity_id, limit)
-    local outbox_worker = require "skyext.outbox_worker"
-    return entitymgr:with_loaded_entity(entity_id, function(entity)
-        local stats, err = outbox_worker.pump_entity(entity, { limit = limit })
-        return stats, err
-    end)
+-- 框架内部命令（`router.call` 的落点）。都在实体队列内执行，参数是已经解析好的
+-- 业务值，不做任何鉴权——鉴权由调用方（框架模块）负责，它们不会暴露给客户端。
+local function framework_charge_grant(entity, order)
+    if type(order) ~= "table" then
+        return nil, "order is required"
+    end
+    if type(handler.charge_handlers) ~= "function" then
+        return nil, "entity handler has no charge_handlers"
+    end
+    local charge_order = require "skyext.charge_order"
+    local critical = require "skyext.critical"
+    local capability = require "skyext.capability"
+    if not g_charge_issuer then
+        -- 白名单限定框架真正会用到的操作：空白名单等于放行任意 op_type
+        g_charge_issuer = assert(capability.new_issuer("charge_order", { "grant", "compensate" }))
+        g_charge_hash = require("crypto").hmac_sha256
+    end
+    local op_type = charge_order.grant_op_type(order)
+    local params = charge_order.grant_params(order)
+    local param_hash, herr = critical.param_hash_of(op_type, params, g_charge_hash)
+    if not param_hash then
+        error(herr, 0)
+    end
+    -- rid 必须和 critical 的 ctx.rid 同源：那里优先取 db_coords/entity.rid，
+    -- 直接用 entity.id 在自定义主键的实体类型上会静默绑定失败
+    local ctx, cerr = critical.coords_of(entity)
+    if not ctx then
+        return nil, cerr
+    end
+    local now = os.time()
+    local cap, cap_err = capability.issue(g_charge_issuer, {
+        rid = ctx.rid,
+        service_op_id = order.service_op_id,
+        op_type = op_type,
+        payload_hash = param_hash,
+        source_id = charge_order.source_id(order),
+        now = now,
+    })
+    if not cap then
+        error(cap_err, 0)
+    end
+    return charge_order.grant(entity, order, handler.charge_handlers(entity, order), {
+        capability = cap,
+        hash_fn = g_charge_hash,
+        now = now,
+    })
 end
+
+FRAMEWORK.outbox_pump = function(entity, limit)
+    local outbox_worker = require "skyext.outbox_worker"
+    return outbox_worker.pump_entity(entity, { limit = limit })
+end
+
+FRAMEWORK.critical_status = function(entity, op_id)
+    return require("skyext.critical").query(entity, op_id, { now = os.time() })
+end
+
+FRAMEWORK.charge_grant = framework_charge_grant
 
 -- 主动加载一个实体（常驻实体的预加载用）。返回 true，或 false, reason
 function CMD.activate(entity_id)

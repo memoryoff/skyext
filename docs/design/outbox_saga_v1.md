@@ -99,6 +99,9 @@ scan  --(索引 _critical_outbox_pending_count > 0)--> [rid...]
 - 为什么必须经 owner：`PENDING -> ENQUEUED` 是一次 `_version` CAS，角色文档的写入
   必须和玩家请求走同一条实体队列。绕过 owner 直接写会和业务请求抢同一个 `_version`，
   把版本冲突变成线上随机失败。
+- `outbox_pump` 是**框架内部命令**：`router.call` 固定走 `entity_call`，只认
+  `handler.handlers[cmd]`，所以框架命令在 `entity_agent` 的 `FRAMEWORK` 表里注册，
+  且同名时框架优先——业务 handler 覆盖它会绕过 capability 签发。
 - 索引是门禁：`ensure_indexes` 失败时调度器**不启动**，宁可不投递也不用全表扫描。
 - 轮转游标：每轮记录 `skip`，页满时前进、页不满归零，避免前面的角色一直投不出去时
   后面的角色饿死。

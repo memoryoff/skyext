@@ -145,6 +145,15 @@ function M.record(orders_coll, opts)
         new = true,
     })
     if type(ret) ~= "table" or ret.ok ~= 1 then
+        -- 并发重复回调可能撞唯一索引（E11000）。这不是存储故障：回读一次，
+        -- 是同一笔就按已有订单处理，否则才算冲突
+        local existing = orders_coll:find_one({ provider = provider, order_id = order_id })
+        if type(existing) == "table" then
+            if existing.amount ~= opts.amount or existing.currency ~= currency or existing.rid ~= opts.rid then
+                return nil, "order conflict"
+            end
+            return existing, false
+        end
         return nil, (type(ret) == "table" and ret.errmsg) or ferr or "order upsert failed"
     end
     local order = ret.value
@@ -220,6 +229,27 @@ function M.ack(orders_coll, provider, order_id, result, now)
     return type(ret.value) == "table" and ret.value or nil
 end
 
+-- 发奖参数：**唯一**一份构造。签发 capability 时要算摘要，执行时要算同一条摘要，
+-- 两边各写一份就会因为字段顺序/缺省值不同而永远对不上
+function M.grant_params(order)
+    return {
+        amount = order.amount,
+        currency = order.currency,
+        provider = order.provider,
+        order_id = order.order_id,
+    }
+end
+
+-- 发奖操作类型。订单里持久化的 action 是权威，默认 "grant"
+function M.grant_op_type(order)
+    return order.action or "grant"
+end
+
+-- 发奖来源标识：与 capability 绑定、与 `_critical_ops_v1` 落库归属一致
+function M.source_id(order)
+    return tostring(order.provider) .. ":" .. tostring(order.order_id)
+end
+
 -- 发奖：调用方已经验签并落单，这里只负责走关键提交内核并推进订单状态。
 --
 -- 返回值直接透传 critical 的 decision。只有 COMMITTED 才把订单推进到 GRANTED；
@@ -237,19 +267,14 @@ function M.grant(entity, order, handlers, opts)
     local result = critical.execute_internal(
         entity,
         order.service_op_id,
-        order.action or "grant",
-        {
-            amount = order.amount,
-            currency = order.currency,
-            provider = order.provider,
-            order_id = order.order_id,
-        },
+        M.grant_op_type(order),
+        M.grant_params(order),
         handlers,
         {
             capability = opts.capability,
             hash_fn = opts.hash_fn,
             source_namespace = "charge_order",
-            source_id = order.provider .. ":" .. order.order_id,
+            source_id = M.source_id(order),
             now = opts.now,
         }
     )
@@ -319,6 +344,83 @@ function M.compensation_op_id(order, hash_fn)
         return nil, "order is required"
     end
     return M.service_op_id(order.provider, order.order_id, "compensate", hash_fn)
+end
+
+-- 只记错误、不改状态。业务拒绝或契约失败时订单要留在 GRANTING 等人工处理，
+-- 用 transition 会把它推到一个不存在于状态机的状态
+function M.note_error(orders_coll, order, err, now)
+    if type(order) ~= "table" then
+        return nil, "order is required"
+    end
+    local ret, ferr = orders_coll:find_and_modify({
+        query = { provider = order.provider, order_id = order.order_id },
+        update = { ["$set"] = { last_error = tostring(err), last_error_at = now or os.time() } },
+        new = true,
+    })
+    if type(ret) ~= "table" or ret.ok ~= 1 then
+        return nil, (type(ret) == "table" and ret.errmsg) or ferr or "note_error failed"
+    end
+    return type(ret.value) == "table" and ret.value or nil
+end
+
+-- 停止自动对账并把订单交给人工（业务拒绝、串单等）。状态不动，只打标记：
+-- 把它推进到一个不存在的状态会让后续退款/补偿逻辑无从判断原始业务结果
+function M.block_reconcile(orders_coll, order, reason, now)
+    if type(order) ~= "table" then
+        return nil, "order is required"
+    end
+    local ret, ferr = orders_coll:find_and_modify({
+        query = { provider = order.provider, order_id = order.order_id },
+        update = {
+            ["$set"] = {
+                reconcile_blocked_at = now or os.time(),
+                last_error = tostring(reason),
+            },
+        },
+        new = true,
+    })
+    if type(ret) ~= "table" or ret.ok ~= 1 then
+        return nil, (type(ret) == "table" and ret.errmsg) or ferr or "block_reconcile failed"
+    end
+    return type(ret.value) == "table" and ret.value or nil
+end
+
+-- 对账：GRANTED -> RECONCILED。
+--
+-- 只有拿到"角色文档里该 op 已 COMMITTED"的持久化证明才允许推进；凭"调用成功过"
+-- 就标 RECONCILED 等于把一次可能没落库的发奖当成已结案。
+-- `proof` 会原样存进订单，事后能回答"凭什么认为发完了"。
+function M.mark_reconciled(orders_coll, order, proof, now)
+    if type(order) ~= "table" then
+        return nil, "order is required"
+    end
+    if type(proof) ~= "table" then
+        return nil, "proof is required"
+    end
+    local ret, err = orders_coll:find_and_modify({
+        query = {
+            provider = order.provider,
+            order_id = order.order_id,
+            status = M.STATUS.GRANTED,
+        },
+        update = {
+            ["$set"] = {
+                status = M.STATUS.RECONCILED,
+                reconciled_at = now or os.time(),
+                reconcile_proof = proof,
+            },
+        },
+        new = true,
+    })
+    if type(ret) ~= "table" or ret.ok ~= 1 then
+        return nil, (type(ret) == "table" and ret.errmsg) or err or "reconcile transition failed"
+    end
+    if type(ret.value) ~= "table" then
+        -- 状态已经不是 GRANTED：并发对账或订单被补偿过
+        return nil, "state mismatch"
+    end
+    m_orders:inc(1, { status = M.STATUS.RECONCILED })
+    return ret.value
 end
 
 return M

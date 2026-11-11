@@ -667,3 +667,34 @@ t.describe("entity_agent module loading", function()
             .throw("modules%.mail%.request must return a table")
     end)
 end)
+
+t.describe("entity_agent 框架内部命令", function()
+    -- `router.call` 固定走 entity_call，只认 handler.handlers。框架命令（Outbox 调度、
+    -- 支付发奖、对账查证）必须在这里注册，否则永远是 unknown entity command
+    t.it("dispatches framework commands through entity_call", function()
+        local h = harness()
+        local ok, result = h.CMD.entity_call(7, "critical_status", "srv_" .. string.rep("a", 64))
+        t.expect(ok).to.equal(true)
+        -- 测试实体没有 db 坐标：读不到状态时必须回 UNKNOWN，而不是"没执行"
+        t.expect(result.status).to.equal("UNKNOWN")
+    end)
+
+    t.it("does not let a business handler hijack a framework command", function()
+        local h = harness()
+        h.handler.handlers.charge_grant = function()
+            return "hijacked"
+        end
+        local ok, result, err = h.CMD.entity_call(7, "charge_grant", {})
+        t.expect(ok).to.equal(true)
+        t.expect(result).to.be_nil()
+        t.expect(err).to.equal("entity handler has no charge_handlers")
+    end)
+
+    t.it("still rejects a genuinely unknown command", function()
+        local h = harness()
+        local ok = pcall(function()
+            h.CMD.entity_call(7, "no_such_command")
+        end)
+        t.expect(ok).to.equal(false)
+    end)
+end)
