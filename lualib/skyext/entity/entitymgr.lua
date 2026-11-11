@@ -1,5 +1,6 @@
 local skynet = require "skynet"
 local dbmgr = require "skyext.dbmgr"
+local delivery = require "skyext.entity.delivery"
 local distributed_lock = require "skyext.distributed_lock"
 local timer = require "skyext.timer"
 local log = require "skyext.log"
@@ -142,9 +143,16 @@ function M:_deliver_one(entity, msg)
     local args = table.pack(table.unpack(msg.args or {}))
     args.n = args.n + 1
     args[args.n] = msg.msg_id
-    local ok, err = xpcall(handler_func, debug.traceback, entity, table.unpack(args, 1, args.n))
+    local ok, result = xpcall(handler_func, debug.traceback, entity, table.unpack(args, 1, args.n))
     if not ok then
-        return false, err, true
+        -- 抛异常仍是"消息本身/处理逻辑有问题"：计 attempts，到上限进 DLQ。
+        -- 新关键 handler 若遇到环境暂态，必须在边界内转换成 delivery.retryable，
+        -- 不能指望框架把所有 xpcall 抛错都当环境故障——那会让代码 bug 永远卡在 pending
+        return false, result, true
+    end
+    if delivery.is_retryable(result) then
+        -- 环境故障：不 save、不 mark_delivered、不计 attempts、不进 DLQ
+        return false, result.reason, false, true
     end
     if entity.invalid or not distributed_lock.is_valid(entity.handle) then
         return false, "lease expired during handler", false
@@ -229,35 +237,48 @@ end
 function M:_deliver_pending_msgs(entity)
     local rmsg = reliable_msg()
     local msgs = rmsg.load_pending(self.type_name, entity.id, { max_count = rmsg.DEFAULT_PAGE_SIZE })
+    delivery.observe_pending(self.type_name, entity.id, #msgs)
     local quarantined = 0
+    local delivered = 0
     for _, msg in ipairs(msgs) do
         if entity.invalid or not distributed_lock.is_valid(entity.handle) then
             return false, "lease expired"
         end
-        local ok, reason, message_fault = self:_deliver_one(entity, msg)
-        if not ok then
-            if not message_fault then
-                log.error(
-                    "reliable message delivery deferred",
-                    "type",
-                    self.type_name,
-                    "id",
-                    entity.id,
-                    "msg_id",
-                    msg.msg_id,
-                    "err",
-                    reason
-                )
-                return false, reason
-            end
+        local ok, reason, message_fault, retryable = self:_deliver_one(entity, msg)
+        if ok then
+            delivered = delivered + 1
+            delivery.clear(msg.msg_id)
+        elseif retryable then
+            -- 保留 pending，等实体队列的后续重投。这里只做转换计数与连续次数升级，
+            -- 绝不累计 attempts / 进 DLQ：Mongo 暂不可用不是毒消息
+            delivery.note_retryable(self.type_name, entity.id, msg.msg_id, reason)
+            delivery.observe_pending(self.type_name, entity.id, #msgs - delivered)
+            return false, reason
+        elseif not message_fault then
+            log.error(
+                "reliable message delivery deferred",
+                "type",
+                self.type_name,
+                "id",
+                entity.id,
+                "msg_id",
+                msg.msg_id,
+                "err",
+                reason
+            )
+            delivery.observe_pending(self.type_name, entity.id, #msgs - delivered)
+            return false, reason
+        else
             -- 毒消息没达到上限时仍然卡在队首：消息之间可能有先后依赖，
             -- 不能为了让队列往前走就跳过一条还可能成功的消息
             if not self:_quarantine(entity, msg, reason) then
+                delivery.observe_pending(self.type_name, entity.id, #msgs - delivered)
                 return false, reason
             end
             quarantined = quarantined + 1
         end
     end
+    delivery.observe_pending(self.type_name, entity.id, #msgs - delivered - quarantined)
     if quarantined > 0 or #msgs == rmsg.DEFAULT_PAGE_SIZE then
         -- 隔离掉毒消息后被它挡住的消息已经可以投递了，立刻再跑一轮
         skynet.fork(function()
@@ -414,6 +435,7 @@ function M:_forget_entity(entity)
     self:_cancel_unload_timer(entity)
     self:_cancel_delivery_retry(entity)
     self:_cancel_unload_retry(entity)
+    delivery.forget(self.type_name, entity.id)
     if self.entities[entity.id] == entity then
         self.entities[entity.id] = nil
     end

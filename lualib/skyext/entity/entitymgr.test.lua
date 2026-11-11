@@ -1333,3 +1333,44 @@ t.describe("entitymgr resident entities and timers", function()
         t.expect(h.timers["entity_unload:7"]).to.equal(unload_timer)
     end)
 end)
+
+-- P13：只有新关键 handler 显式返回私有 retryable 标记时才走环境重试。
+-- 旧 handler 的 nil/true/false/table 全部维持"没有抛错就是成功"
+t.describe("可靠消息环境故障", function()
+    local delivery = require "skyext.entity.delivery"
+
+    t.it("keeps a retryable environment fault pending without counting a poison attempt", function()
+        local h = harness()
+        h.max_attempts = 1
+        h.pending = { { msg_id = 11, cmd = "apply", args = {} } }
+        h.handler.handlers.apply = function()
+            return delivery.retryable("mongo down")
+        end
+
+        local ok, err = h.mgr:deliver_pending(7)
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("mongo down")
+        t.expect(h.pending[1].attempts).to.be_nil()
+        t.expect(h.pending[1].dead).to.be_nil()
+        t.expect(index_of(h.events, "attempt:11")).to.be_nil()
+        t.expect(index_of(h.events, "ack:11")).to.be_nil()
+    end)
+
+    t.it("treats every legacy return value as success", function()
+        local h = harness()
+        h.pending = {}
+        -- ipairs 会在第一个 nil 处停下，这里用显式索引覆盖 nil/true/false/table 四种返回
+        local returns = { [1] = nil, [2] = true, [3] = false, [4] = { any = "table" } }
+        for i = 1, 4 do
+            h.pending[#h.pending + 1] = { msg_id = 100 + i, cmd = "legacy", args = { i } }
+            local value = returns[i]
+            h.handler.handlers.legacy = function()
+                return value
+            end
+        end
+        t.expect(h.mgr:deliver_pending(7)).to.equal(true)
+        for i = 1, 4 do
+            t.expect(h.pending[i].delivered).to.equal(true)
+        end
+    end)
+end)

@@ -84,6 +84,9 @@ curl http://127.0.0.1:9190/metrics
 | `skyext_metrics_services` | gauge | 注册到 `.metrics` 的服务数 |
 | `skyext_metrics_scrape_failures` | gauge | 本次抓取没回包的服务数 |
 | `skyext_metrics_scrape_duration_seconds` | gauge | 本次抓取耗时 |
+| `skyext_reliable_msg_pending{type}` | gauge | 本 VM 观察到的可靠消息 pending 条数（满页时是下界） |
+| `skyext_reliable_msg_retryable_total{type}` | counter | handler 返回环境故障的转换次数 |
+| `skyext_reliable_msg_retry_escalated_total{type}` | counter | 同一 `msg_id` 连续 N 次环境故障后升级人工的次数 |
 
 服务名取自 `.launcher`，并且会抹掉实例间的差异：`mongo_conn:center:1` 归到 `mongo_conn`，`http_agent_gm_2` 归到 `http_agent_gm`。不这么做的话服务一扩容时间序列就跟着涨。不是由 `.launcher` 拉起的服务（比如 skynet 自己启动的 logger）归到 `unknown`。
 

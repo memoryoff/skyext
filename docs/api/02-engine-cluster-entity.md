@@ -142,7 +142,7 @@
 
 | 方法 | 行 | 作用 | 返回 / 边界 |
 | --- | --- | --- | --- |
-| `M:_deliver_one(entity, msg)` | 137 | 投一条给 handler；区分 **message_fault**（消息本身坏：无 handler、handler 抛错，要计毒消息次数）与**环境问题**（失租、落库失败，换个时间能成功，不计数） | `ok, reason, message_fault` |
+| `M:_deliver_one(entity, msg)` | 137 | 投一条给 handler；区分 **message_fault**（消息本身坏：无 handler、handler 抛错，要计毒消息次数）、**环境问题**（失租、落库失败，换个时间能成功，不计数）与新关键 handler 显式返回的 `delivery.retryable` | `ok, reason, message_fault, retryable` |
 | `M:_quarantine(entity, msg, reason)` | 169 | 累计失败次数，到上限移入死信 | `true`（已隔离可跳过）；`false`（留在队头，整批停下重试） |
 | `M:_deliver_pending_msgs(entity)` | 229 | 循环投递 pending：成功就 `mark_delivered`，环境问题就 `record_failure` 并停下 | `true` / `false, reason` |
 | `M:_dead_letter_missing(entity_id)` | 625 | 实体根本不存在时，把它的 pending 整批移进死信（`dlq_replay` 可重放）；调用方必须已持 gate | 移走条数 |
@@ -184,8 +184,8 @@
 | `M.call(type_name, entity_id, cmd, ...)` | 26 | 同步调实体 handler | `true, ...返回值` / `false, reason`（实体不可用，handler 没执行）；handler 抛错或节点不可达照常抛错 |
 | `M.send(type_name, entity_id, cmd, ...)` | 35 | 单向投递，不等结果 | — |
 | `M.poke_reliable(type_name, entity_id)` | 47 | 唤醒目标去读自己的 pending 消息；失败不代表丢消息（已落库） | 是否成功投出唤醒 |
-| `M.bind_session(type_name, entity_id, gate_node, gate_service, fd)` | 58 | 登录时把网关会话绑到实体；网关与实体不必同节点 | 错误码 + 续接凭据 |
-| `M.resume_session(type_name, entity_id, gate_node, gate_service, fd, nonce, recv)` | 70 | 续接：**只作用于已在内存的实体**，不验 token、不查库、不抢锁 | 错误码、新凭据、已发包数 |
+| `M.bind_session(type_name, entity_id, gate_node, gate_service, fd, session_mode)` | 58 | 登录时把网关会话绑到实体；网关与实体不必同节点 | 错误码、续接凭据、`session_epoch`、模式 |
+| `M.resume_session(type_name, entity_id, gate_node, gate_service, fd, nonce, recv, session_mode, session_epoch)` | 70 | 续接：**只作用于已在内存的实体**，不验 token、不查库、不抢锁 | 错误码、新凭据、已发包数、`session_epoch`、模式 |
 | `M.scoped_call(type_name, value, cmd, ...)` | 80 | 作用域实体便捷入口，ID 由 `types.scoped_id` 算出 | 同 `call` |
 | `M.scoped_send(type_name, value, cmd, ...)` | 84 | 同上，单向 | — |
 | `M.reliable_send(type_name, entity_id, cmd, args)` | 88 | 可靠消息：落库后尝试立即投递，失败留给加载/重试定时器 | `msg_id` |
