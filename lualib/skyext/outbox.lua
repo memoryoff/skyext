@@ -47,6 +47,12 @@ M.ENQUEUED_RETENTION = 7 * 24 * 3600
 
 local m_enqueued =
     metrics.counter("skyext_outbox_enqueued_total", "Outbox events whose reliable message was confirmed", { "op_type" })
+-- 毒事件被隔离的次数：持续增长说明有事件永远投不出去，需要人工看 failed_reason
+local m_failed = metrics.counter(
+    "skyext_outbox_quarantined_total",
+    "Outbox events quarantined as FAILED after repeated delivery failures",
+    { "op_type" }
+)
 local m_pending = metrics.gauge("skyext_outbox_pending", "Outbox events still PENDING in this VM", { "type" })
 local m_unknown = metrics.counter(
     "skyext_outbox_status_unknown_total",
@@ -248,6 +254,12 @@ function M.pending_events(critical_table, limit)
         end
     end
     table.sort(out, function(a, b)
+        -- 持久化因果序号优先：同一秒创建的事件只靠 created_at 排不出确定顺序，
+        -- 而可靠消息的 msg_id 只保证唯一、不保证因果顺序
+        local sa, sb = a.causal_seq, b.causal_seq
+        if math.type(sa) == "integer" and math.type(sb) == "integer" and sa ~= sb then
+            return sa < sb
+        end
         local ta, tb = a.created_at or 0, b.created_at or 0
         if ta ~= tb then
             return ta < tb
@@ -337,6 +349,110 @@ end
 -- 返回 { enqueued, failed, unknown, already, batches, pending, oldest_age }
 --
 -- `nMatched=0` 是**版本/条件冲突**，不是"资产已执行但 ACK 丢失"：重新读当前文档后
+-- 同一条事件连续投递失败多少次后判为毒事件。
+-- 不设上限的话，一条永远送不出去的事件会让该角色之后的**所有**事件都投不出去：
+-- pump 遇到失败就 break 保序，队首事件永远不动，后面的事件全部饿死。
+M.MAX_DELIVER_ATTEMPTS = 5
+
+local function copy_critical(critical_table)
+    local copy = {}
+    for k, v in pairs(critical_table or {}) do
+        if type(v) == "table" then
+            local sub = {}
+            for k2, v2 in pairs(v) do
+                sub[k2] = v2
+            end
+            copy[k] = sub
+        else
+            copy[k] = v
+        end
+    end
+    return copy
+end
+
+-- 把一条毒事件标成 FAILED（终态，进 DLQ 语义），并让出队列。
+-- 失败原因写进事件本身，人工排查不用去翻日志。
+function M._quarantine_event(ctx, event, critical_table, now, attempts, reason, max_retry)
+    for _ = 1, max_retry + 1 do
+        local next_table = copy_critical(critical_table)
+        local ev = next_table[M.FIELD] and next_table[M.FIELD][event.event_id]
+        if type(ev) ~= "table" then
+            return nil
+        end
+        if ev.status ~= M.STATUS.PENDING then
+            -- 别的 worker 已经推进过：按当前文档继续，不再重复处理
+            return next_table
+        end
+        ev.status = M.STATUS.FAILED
+        ev.updated_at = now
+        ev.deliver_attempts = attempts
+        ev.failed_at = now
+        ev.failed_reason = tostring(reason):sub(1, 200)
+        next_table[M.PENDING_COUNT_FIELD] = math.max(0, (next_table[M.PENDING_COUNT_FIELD] or 0) - 1)
+        local state = dbmgr.critical_update(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, ctx.doc._version, {
+            ["$set"] = {
+                [M.FIELD .. "." .. event.event_id] = ev,
+                [M.PENDING_COUNT_FIELD] = next_table[M.PENDING_COUNT_FIELD],
+            },
+        }, {
+            handle = ctx.handle,
+            metadata_only = true,
+            extra_query = { [M.FIELD .. "." .. event.event_id .. ".status"] = M.STATUS.PENDING },
+        })
+        if state == "CONFIRMED" then
+            dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, next_table, ctx.handle)
+            m_failed:inc(1, { op_type = event.op_type or "unknown" })
+            return next_table
+        end
+        if state == "UNKNOWN" then
+            dbmgr.refresh_critical(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, { handle = ctx.handle })
+            return nil
+        end
+        local fresh = dbmgr.cached_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id)
+        if not fresh then
+            return nil
+        end
+        critical_table = fresh
+    end
+    return nil
+end
+
+-- 未到上限：只记一次尝试次数，事件保持 PENDING，本轮停止（保序）
+function M._note_deliver_attempt(ctx, event, critical_table, now, attempts, max_retry)
+    for _ = 1, max_retry + 1 do
+        local state = dbmgr.critical_update(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, ctx.doc._version, {
+            ["$set"] = {
+                [M.FIELD .. "." .. event.event_id .. ".deliver_attempts"] = attempts,
+                [M.FIELD .. "." .. event.event_id .. ".last_attempt_at"] = now,
+            },
+        }, {
+            handle = ctx.handle,
+            metadata_only = true,
+            extra_query = { [M.FIELD .. "." .. event.event_id .. ".status"] = M.STATUS.PENDING },
+        })
+        if state == "CONFIRMED" then
+            local next_table = copy_critical(critical_table)
+            local ev = next_table[M.FIELD] and next_table[M.FIELD][event.event_id]
+            if type(ev) == "table" then
+                ev.deliver_attempts = attempts
+                ev.last_attempt_at = now
+            end
+            dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, next_table, ctx.handle)
+            return next_table
+        end
+        if state == "UNKNOWN" then
+            dbmgr.refresh_critical(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, { handle = ctx.handle })
+            return nil
+        end
+        local fresh = dbmgr.cached_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id)
+        if not fresh then
+            return nil
+        end
+        critical_table = fresh
+    end
+    return nil
+end
+
 -- 有界重试。重读后事件已被别的 worker 推进时不再重投、也不再减第二次计数。
 function M.pump(ctx, deliver, opts)
     opts = opts or {}
@@ -345,7 +461,7 @@ function M.pump(ctx, deliver, opts)
     end
     local limit = opts.limit or M.DEFAULT_LIMIT
     local max_retry = opts.cas_retry or M.CAS_RETRY
-    local stats = { enqueued = 0, failed = 0, unknown = 0, already = 0, batches = 0 }
+    local stats = { enqueued = 0, failed = 0, unknown = 0, already = 0, batches = 0, quarantined = 0 }
     local source = opts.source or {}
     local now = opts.now
 
@@ -372,13 +488,39 @@ function M.pump(ctx, deliver, opts)
         else
             local ok, deliver_err = pcall(deliver, envelope)
             if not ok or deliver_err ~= true then
-                -- 投递未确认：保持 PENDING，允许底层 msg_id 重复，业务靠 event_id 去重。
-                -- 这里必须停下：跳过它去投后面的事件会让接收方看到乱序
                 stats.failed = stats.failed + 1
+                local attempts = (event.deliver_attempts or 0) + 1
                 if not ok then
                     log.warn("outbox deliver raised", "event", event.event_id, "err", deliver_err)
                 end
-                break
+                if attempts >= (opts.max_deliver_attempts or M.MAX_DELIVER_ATTEMPTS) then
+                    -- 毒事件：标 FAILED 后继续。不隔离的话，队首一条永远送不出去的事件
+                    -- 会让该角色之后的所有事件都饿死（pump 失败即 break 保序）
+                    local quarantined =
+                        M._quarantine_event(ctx, event, critical_table, now, attempts, deliver_err, max_retry)
+                    if not quarantined then
+                        -- 连"标记失败"都写不进去：保持 PENDING，本轮停止
+                        break
+                    end
+                    critical_table = quarantined
+                    stats.quarantined = stats.quarantined + 1
+                    log.error(
+                        "outbox event quarantined after repeated delivery failures",
+                        "event",
+                        event.event_id,
+                        "attempts",
+                        attempts,
+                        "err",
+                        tostring(deliver_err)
+                    )
+                else
+                    -- 未到上限：记录尝试次数并停止本轮，保持同角色事件的顺序
+                    local noted = M._note_deliver_attempt(ctx, event, critical_table, now, attempts, max_retry)
+                    if noted then
+                        critical_table = noted
+                    end
+                    break
+                end
             else
                 local advanced, state = M._advance(ctx, event, critical_table, now, max_retry, stats)
                 if state == "CONFIRMED" then
@@ -405,13 +547,27 @@ function M.pump(ctx, deliver, opts)
     return M._finish_pump(ctx, now, stats)
 end
 
--- 一轮收尾：没有待发事件时顺手清一次终态事件，活跃角色不会攒下一堆 DELIVERED。
+-- 定期清理的节流窗口（秒）。活跃角色每轮都清一次会把 Mongo 打得很碎，
+-- 但只在 pending == 0 时清又会让"一直有积压"的角色永远攒着终态记录。
+M.CLEANUP_INTERVAL = 60
+local g_last_cleanup_at = 0
+
+-- 仅供测试：清掉进程内的清理节流
+function M._reset_cleanup()
+    g_last_cleanup_at = 0
+end
+
+-- 一轮收尾：没有待发事件时立即清；仍有积压时按 CLEANUP_INTERVAL 定期清。
+-- 静默角色没有 pump，仍靠容量腾挪兜底。
 -- 清理失败不影响本轮投递结果，下一轮再试
 function M._finish_pump(ctx, now, stats)
-    if stats.pending == 0 then
+    local clock = now or os.time()
+    local due = stats.pending == 0 or (clock - g_last_cleanup_at >= M.CLEANUP_INTERVAL)
+    if due then
         local cleaned, cerr = M.cleanup(ctx, { now = now })
         if cleaned then
             stats.cleaned = cleaned
+            g_last_cleanup_at = clock
         elseif cerr then
             log.warn("outbox cleanup skipped", "err", tostring(cerr))
         end

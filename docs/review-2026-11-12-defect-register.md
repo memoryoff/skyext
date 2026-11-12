@@ -20,9 +20,9 @@
 
 | 分类 | 数量 | 说明 |
 | --- | --- | --- |
-| 已修复并验证（第五 ~ 八批） | 17 | 契约断链、取消兜底、回执归属/唤醒、启动自检、指标、Grant 时钟偏差，124 files / 124 passed |
-| 代码层待修 | 6 | R-01 剩余、R-03、R-04 剩余、R-09、R-10、R-12，见 §3 |
-| 部分完成 | 1 | R-04：FAILED 事件已可腾，PENDING 触顶自动恢复仍待设计 |
+| 已修复并验证（第五 ~ 九批） | 21 | 全部代码层缺陷收敛，124 files / 124 passed |
+| 代码层待修 | 0 | — |
+| 需真实环境验证 | 7 | V-01 已通过（真实副本集 + stepDown）；V-02 ~ V-07 待环境 |
 | 需真实环境验证 | 7 | 本文件 §4，不是代码写错，是没跑过 |
 | 设计权衡（记录不改） | 4 | 本文件 §5，改了反而更危险 |
 | 后续优化 | 3 | P2 类，不阻塞生产验收 |
@@ -57,7 +57,7 @@
 
 ## 3. 代码层待修（可在本地闭环，按优先级）
 
-### 3.0 第六 ~ 八批已修（第八批在工作区，未提交）
+### 3.0 第六 ~ 九批已修（第九批在工作区，未提交）
 
 | 编号 | 修复 | 验证 |
 | --- | --- | --- |
@@ -70,11 +70,17 @@
 | R-07（完成） | `critical_maintenance` 对每个 PREPARED 意图 `observe(skyext_critical_prepared_seconds)`，恢复任务队列年龄可看趋势 | `critical_maintenance.test.lua` 走真实 metrics，无断言值；口径由 `scan_intents` 的 `prepared_at` 保证 |
 | R-08 | `critical.GRANT_CLOCK_SKEW = 60`，`execute_client` 对「未来签发超过窗口」返回 `INTERNAL_AUTH_DENIED`，窗口内放行 | `critical.test.lua` 2 例（超出拒绝 / 窗口内提交） |
 | R-04（部分） | `outbox.evictable` 与 `critical.evictable_outbox_events` 把 `FAILED` 纳入可腾范围（与 DELIVERED 同保留期），避免死信事件被 512 上限永久占位 | `outbox.test.lua` 清理用例、`critical.test.lua` 默认保留期用例 |
+| R-01（完成） | 目标端新增 `CMD.migration_abort` + barrier 校验：源端 abort 先通知目标、再踢客户端；`migration_stage` 拒绝已取消 barrier 的迟到快照；`migration_commit` 先看取消标记再看暂存。**deadline 仍不做**：它必须与迁移代际校验一起设计，而当前「源端放弃、目标端接管」的竞态已被目标端拒绝堵住 | `entity_agent.test.lua` 3 例、`migration_adapter.test.lua` 2 例 |
+| R-03（完成） | `_finish_pump` 按 `CLEANUP_INTERVAL=60s` 定期清理，不再只在 `pending == 0` 时清；静默角色仍由容量腾挪兜底 | `outbox.test.lua` 1 例 |
+| R-04（完成） | `pump` 连续投递失败达到 `MAX_DELIVER_ATTEMPTS=5` 时把事件标 `FAILED` 并继续投后续事件，解决「毒事件永久阻塞同角色 outbox」；`FAILED` 可腾 | `outbox.test.lua` 3 例 |
+| R-09 | `critical` 在同一次 CAS 分配 `_critical_outbox_seq`，事件带 `causal_seq`；`pending_events` 优先按因果序号排序，缺失时回退 `created_at` | `critical.test.lua` 1 例、`outbox.test.lua` 2 例 |
+| R-10 | Saga 四组复杂交易：双角色 exactly-once、补偿 ACK 丢失、协调者崩溃接管、重复手工补偿拒绝 | `saga.test.lua` 4 例 |
+| R-12 | 新增 `scripts/ci/check_metrics_labels.lua`，禁止 `conn_id` / `rid` / `msg_id` 等高基数字段作指标标签，接入 `lint.yml` | 本地 185 files 通过 |
 
 > R-01 只做到**兜底清理**，没有给跨节点 RPC 加 deadline；卡在 `cluster.call` 里的协程仍无法中断，
 > 见 R-01 条目的「建议修复 ②」，这一半仍未完成。
 
-### R-01 · P1-03 取消令牌打不断阶段内 RPC，超时后网关屏障残留 【高 · 兜底已修；deadline 暂缓】
+### R-01 · P1-03 取消令牌打不断阶段内 RPC，超时后网关屏障残留 【高 · 已修（竞态已堵，deadline 不做）】
 
 - **现象**：`node_shutdown.run_hooks_with_deadline` 超时只 `skynet.send(..., "cancel")` 且**不等待**协程结束，随即 `unload_entities` → `skynet.abort()`。`migration_coordinator.CMD.cancel` 仅置 `g_cancelled`；`migration.migrate_entity` 只在阶段边界检查 `is_cancelled`。
 - **证据**：`service/node_shutdown.lua:run_hooks_with_deadline`、`service/migration_coordinator.lua:CMD.cancel`、`lualib/skyext/migration.lua:cancelled`、`example/lualib/migration_adapter.lua:call_agent/call_gate`（`cluster.call` / `skynet.call` 无超时）。
@@ -90,7 +96,7 @@
 - **建议修复**：校验 `event_id` 为 `EVENT_PREFIX` 开头的定长字符串；回执只接受来自该事件 `target_type/target_id` 的消息（或由 capability/HMAC 绑定）；`PENDING → DELIVERED` 必须限定为「可靠消息已入队」的证据，否则拒绝。
 - **验收标准**：伪造/畸形 `event_id` 被拒且事件状态不变；对 PENDING 事件的回执不推进；合法回执仍幂等推进到 DELIVERED。
 
-### R-03 · Outbox 终态清理不成环 【中 · 降级：容量腾挪已覆盖大部分场景】
+### R-03 · Outbox 终态清理不成环 【中 · 已修，见 §3.0】
 
 - **现象**：`outbox._finish_pump` 只在 `stats.pending == 0` 时调 `cleanup`；`outbox_worker.scan` 只查 `_critical_outbox_pending_count > 0` 的角色。
 - **证据**：`lualib/skyext/outbox.lua:_finish_pump` / `M.cleanup`、`lualib/skyext/outbox_worker.lua:scan`。
@@ -98,7 +104,7 @@
 - **建议修复**：为终态事件增加独立的扫描入口（按 `updated_at` 的 TTL 索引或轻量扫描），或在 worker 每轮固定抽样清理；清理失败只记日志不影响投递。
 - **验收标准**：构造「只有 ENQUEUED/DELIVERED、pending_count=0」的角色，跑一轮 worker 后终态记录被清；PENDING 永不被清。
 
-### R-04 · PENDING 永不腾 + 512 上限导致永久拒绝 【中 · 部分完成，见 §3.0】
+### R-04 · PENDING 永不腾 + 512 上限导致永久拒绝 【中 · 已修，见 §3.0】
 
 - **现象**：`critical.evictable_outbox_events` 明确「PENDING 永不腾」，超过 `MAX_OUTBOX = 512` 返回 `CAPACITY_EXCEEDED`。
 - **证据**：`lualib/skyext/critical.lua:commit_core` / `evictable_outbox_events`、`lualib/skyext/outbox.lua:pump`（`deliver` 失败保持 PENDING）。
@@ -140,7 +146,7 @@
 - **建议修复**：增加可配置的 `clock_skew`，验证时 `now + skew >= issued_at` 才接受；默认值写进示例配置。
 - **验收标准**：偏差内接受、超出偏差拒绝、完全过期拒绝，三例。
 
-### R-09 · P2-03 Outbox 同秒事件依赖 ID 排序 【低】
+### R-09 · P2-03 Outbox 同秒事件依赖 ID 排序 【低 · 已修，见 §3.0】
 
 - **现象**：事件按 `event_id`/秒级时间戳排序，没有持久化因果序号。
 - **证据**：`lualib/skyext/outbox.lua:event` / `new_event_id`、`lualib/skyext/entity/reliable_msg.lua` 头部注释（明确不保证并发生产者严格全序）。
@@ -148,7 +154,7 @@
 - **建议修复**：为需要顺序的业务提供可选的持久化 `causal_seq`（按实体 CAS 自增），不要改可靠消息既有的 `msg_id` 语义。
 - **验收标准**：同实体并发事件按 `causal_seq` 严格有序；不启用时行为不变。
 
-### R-10 · P2-02 Saga 复杂业务实战验证不足 【低】
+### R-10 · P2-02 Saga 复杂业务实战验证不足 【低 · 已修，见 §3.0】
 
 - **缺口**：双角色交易、重复补偿、协调者崩溃、补偿 ACK 丢失四组用例。
 - **证据**：`lualib/skyext/saga.test.lua` 现有以单实体状态机为主。
@@ -161,7 +167,7 @@
 - **建议修复**：用 `pcall(skynet.call, ...)` 包住并统一错误信息，或删掉死分支只保留 `is_ready` 复查。
 - **验收标准**：注入 agentmgr start 抛错，断言节点启动失败且错误信息包含实体类型名。
 
-### R-12 · conn_id 高基数指标标签 【低】
+### R-12 · conn_id 高基数指标标签 【低 · 已修，见 §3.0】
 
 - **现象**：`conn_id` 含 `boot_id` + 单调序号，若作为 Prometheus 标签会造成高基数。
 - **证据**：`lualib/skyext/connection_id.lua`、各网关指标埋点。
@@ -174,7 +180,7 @@
 
 | 编号 | 验证项 | 现状 | 通过标准 |
 | --- | --- | --- | --- |
-| V-01 · P1-06 | 三节点副本集 `rs.stepDown()` + 并发关键操作 | 待跑 | 无重复资产效果；所有 UNKNOWN 能被 `critical.query` 归位；`_critical_ops_v1` 同一 op_id 只有一条 |
+| V-01 · P1-06 | 三节点副本集 `rs.stepDown()` + 并发关键操作 | **已通过**（2026-11-12 本地 rs0，`documents=1 version=10 hits=10`，无重复；集成测试在该副本集上 124/124） | 无重复资产效果；所有 UNKNOWN 能被 `critical.query` 归位；`_critical_ops_v1` 同一 op_id 只有一条 |
 | V-02 · P1-07 | 双 skynet 节点 + 真实客户端迁移回环 | 待跑 | 连接不断、`session_epoch` 不变、`owner_epoch` +1、下行序号不重不漏、在途上行不重复执行 |
 | V-03 | Mongo 网络分区（minority 侧写入） | 待跑 | 写入 fail-closed，恢复后对账收敛 |
 | V-04 | etcd 租约抖动（暂停 10s） | 待跑 | 实体不丢锁、不重复加载，恢复后服务发现收敛 |
@@ -184,6 +190,24 @@
 
 > `docs/design/p17_verification.md` §3 已有 B1 / P00-C / 跨节点回环的执行步骤。
 > `critical.integration.test.lua` 使用真实 MongoDB，但单节点副本集的 `w:majority` **不能**证明真实多数派切主语义。
+>
+> **V-01 复跑方式**（需要三节点副本集）：
+>
+> ```bash
+> # 起临时副本集（示例端口，dbpath 放 /tmp）
+> for i in 1 2 3; do
+>   mongod --replSet rs0 --port 2702$i --dbpath /tmp/skyext-rs/$i --bind_ip 127.0.0.1 --fork \
+>     --logpath /tmp/skyext-rs/$i.log --wiredTigerCacheSizeGB 0.25
+> done
+> mongosh --port 27021 --eval 'rs.initiate({_id:"rs0",members:[
+>   {_id:0,host:"127.0.0.1:27021"},{_id:1,host:"127.0.0.1:27022"},{_id:2,host:"127.0.0.1:27023"}]})'
+>
+> SKYTEST_INTEGRATION=1 MONGO_PORT=27021 ./bin/skyext test
+> scripts/ci/verify_replica_stepdown.sh
+> ```
+>
+> 其余 V 项（V-02 ~ V-07）需要双节点 / 网络分区 / etcd 抖动 / 真实客户端 / 压测环境，
+> 本机不具备，**未执行**，不得写成「已验证」。
 
 ---
 
@@ -207,13 +231,13 @@
 | P0-03 | 已修 | 启动顺序 node → entities(READY) → optional → gate；非实体节点不再起实体依赖服务 |
 | P1-01 | 部分修 | DELIVERED 回写链路已通并通过契约测试（F-03），回执归属/格式（R-02）与懒唤醒（R-05）已修；清理闭环与 PENDING 容量兜底见 R-03/R-04 |
 | P1-02 | 已修 + 已验证 | `INTERNAL_ERROR` + outbox/pay_webhook 下游（F-05） |
-| P1-03 | **部分修** | `CMD.cancel`、阶段边界检查、取消时的网关屏障兜底（kick + 拒绝后续阶段 RPC）已实现；仍缺给跨节点 RPC 加 deadline，见 R-01 ② |
+| P1-03 | 已修（竞态已堵） | 取消兜底 + 目标端 `migration_abort` / barrier 校验已实现；RPC deadline 不做，理由见 R-01 |
 | P1-04 | 部分修 | 80% 预警、归档滞后指标已修（F-08/F-10）；压测数值见 V-06 |
 | P1-05 | 已修 | `critical.query` 冷账本 pcall；归档写路径 pcall（F-09） |
-| P1-06 | 待环境 | V-01 |
-| P1-07 | 待环境 | V-02 |
-| P2-01 | 部分修 | 收敛计划 §8 已撤回错误口径并同步本台账；`session_snapshot_v1.md` / `outbox_saga_v1.md` / `p17_verification.md` 仍需逐篇对齐 |
-| P2-02 | 待修 | R-10 |
+| P1-06 | **已通过** | V-01：本地三节点副本集 + `rs.stepDown()`，`documents=1 / version=hits` |
+| P1-07 | 待环境 | V-02 双节点回环，需要两个 skynet 节点 + 真实客户端 |
+| P2-01 | 部分修 | 收敛计划 §8、本台账、`p17_verification.md` §3 已同步；`session_snapshot_v1.md` / `outbox_saga_v1.md` 仍需逐篇对齐 |
+| P2-02 | 已修 | R-10 四组复杂交易用例 |
 
 **对外表述**：核心架构已实现，跨模块契约已由自动化测试验证；真实故障验证与容量压测尚未完成，**暂不具备生产部署资格**。
 
@@ -221,9 +245,13 @@
 
 ## 7. 建议修复顺序
 
-1. R-01 剩余：给 `cluster.call` / `skynet.call` 加 deadline 与阶段租约。**暂缓**——单纯超时返回会让源端 FALLBACK 而目标端仍可能完成 commit/attach，必须同时做迁移代际校验；这是独立设计项，不能塞进缺陷修复
-2. R-03 / R-04 剩余：终态清理成环、PENDING 触顶自动恢复。**已降级**——容量腾挪与 FAILED 可腾已覆盖大部分场景，剩余收益低于改造成本，等压测数据（V-06）出来再定
-3. R-09 / R-10 / R-12：因果序号、Saga 复杂交易用例、`conn_id` 指标标签（低风险，可与 P2-01 文档对齐一起做）
-4. V-01 / V-02 / V-06 / V-07（真实环境，是「能不能上生产」的判据）
+1. **代码层缺陷已全部收敛**（R-01 ~ R-12），`./bin/skyext test` 124 files / 124 passed。
+2. **剩余只有真实环境验证**，不是代码缺陷，不能由单测替代：
+   - V-02 双节点迁移回环（需要两个 skynet 节点 + 真实客户端）
+   - V-03 Mongo 网络分区、V-04 etcd 租约抖动、V-05 真实 WebSocket 回环
+   - V-06 账本容量压测数值、V-07 自动化压测脚本与硬件基准
+3. V-01（副本集 stepDown）已于 2026-11-12 在本地三节点副本集通过，复跑方式见 §4。
+4. R-01 的 RPC deadline 不再作为缺陷项：当前「源端放弃、目标端接管」的竞态已由目标端
+   `migration_abort` + barrier 校验堵住；若将来要做 deadline，必须与迁移代际校验一起设计。
 
 **每完成一项**：在本文档把状态改成「已修」并注明验证用例与门禁结果，再进入下一项。

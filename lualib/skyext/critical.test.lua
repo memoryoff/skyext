@@ -1698,3 +1698,38 @@ t.describe("critical Grant 时钟偏差", function()
         t.expect(h.applied).to.equal(1)
     end)
 end)
+
+-- 同一秒创建的事件只靠 created_at 排不出确定顺序；因果序号在同一次 CAS 里分配
+t.describe("critical Outbox 因果序号", function()
+    local function commit(h, seq, event_id)
+        return h.critical.execute_client(h.entity, h.new_grant(), seq, "shop.buy", { amount = 1 }, h.handlers(), {
+            hmac_fn = HASH,
+            hash_fn = HASH,
+            equal_fn = EQ,
+            now = h.now,
+            outbox = {
+                {
+                    event_id = event_id,
+                    target_type = "role",
+                    target_id = 9,
+                    op_type = "mail.send",
+                    param_hash = string.rep("a", 64),
+                    status = "PENDING",
+                },
+            },
+        })
+    end
+
+    t.it("assigns a monotonic causal sequence across commits", function()
+        local h = harness()
+        local e1 = "evt_" .. string.rep("1", 64)
+        local e2 = "evt_" .. string.rep("2", 64)
+        assert(commit(h, 1, e1))
+        assert(commit(h, 2, e2))
+        local box = h.store.critical._critical_outbox_v1
+        t.expect(box[e1].causal_seq).to.equal(1)
+        t.expect(box[e2].causal_seq).to.equal(2)
+        -- 序号水位与事件同一次 CAS 落库
+        t.expect(h.store.critical._critical_outbox_seq).to.equal(2)
+    end)
+end)

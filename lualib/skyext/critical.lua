@@ -89,6 +89,9 @@ M.OPS_FIELD = "_critical_ops_v1"
 M.OUTBOX_FIELD = "_critical_outbox_v1"
 -- 待发事件计数：既是索引字段，也是"离开 PENDING 时恰减一次"的凭据
 M.OUTBOX_PENDING_FIELD = "_critical_outbox_pending_count"
+-- 持久化因果序号：同一角色的事件按它排序，不依赖秒级 created_at。
+-- 与可靠消息的 msg_id 是两件事：msg_id 只保证唯一，不保证因果顺序。
+M.OUTBOX_SEQ_FIELD = "_critical_outbox_seq"
 -- 热账本最老一条操作的 `at`：归档扫描的索引字段
 M.OPS_OLDEST_FIELD = "_critical_ops_oldest_at"
 
@@ -735,9 +738,15 @@ local function commit_core(ctx, req, handlers)
         -- 源侧扣减与 Outbox 必须同一次 CAS：先扣资源再单独写事件，
         -- 中间崩溃就会留下"钱扣了、事件没发"的永久不一致
         if new_events and #new_events > 0 then
+            -- 因果序号与事件同一次 CAS 分配：重启、重试、多节点都不会重号，
+            -- 同秒创建的事件也能靠它排出确定顺序
+            local seq_base = math.tointeger(critical[M.OUTBOX_SEQ_FIELD]) or 0
             for _, ev in ipairs(new_events) do
+                seq_base = seq_base + 1
+                ev.causal_seq = seq_base
                 write["$set"][M.OUTBOX_FIELD .. "." .. ev.event_id] = ev
             end
+            write["$set"][M.OUTBOX_SEQ_FIELD] = seq_base
             write["$set"][M.OUTBOX_PENDING_FIELD] = (critical[M.OUTBOX_PENDING_FIELD] or 0) + #new_events
         end
         if evicted_events and #evicted_events > 0 then
@@ -828,9 +837,15 @@ local function commit_core(ctx, req, handlers)
     end
     if applied == true and new_events and #new_events > 0 then
         critical[M.OUTBOX_FIELD] = critical[M.OUTBOX_FIELD] or {}
+        local seq_base = math.tointeger(critical[M.OUTBOX_SEQ_FIELD]) or 0
         for _, ev in ipairs(new_events) do
+            -- 写入分支已经分配过；这里只同步内存副本的序号水位
+            if math.type(ev.causal_seq) == "integer" and ev.causal_seq > seq_base then
+                seq_base = ev.causal_seq
+            end
             critical[M.OUTBOX_FIELD][ev.event_id] = copy_value(ev, 3)
         end
+        critical[M.OUTBOX_SEQ_FIELD] = seq_base
         critical[M.OUTBOX_PENDING_FIELD] = (critical[M.OUTBOX_PENDING_FIELD] or 0) + #new_events
     end
     if applied == true and evicted_events and #evicted_events > 0 and critical[M.OUTBOX_FIELD] then

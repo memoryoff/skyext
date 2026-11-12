@@ -497,3 +497,126 @@ t.describe("saga 索引门禁", function()
         t.expect(names[2]).to.equal("state_lease")
     end)
 end)
+
+-- R-10：复杂业务验证。协调者只驱动状态机，资产效果由步骤幂等保证；
+-- 用可观测账本模拟双角色交易，断言重复投递 / 崩溃接管 / 补偿 ACK 丢失下
+-- 同一业务操作最多一次经济效果。
+t.describe("saga 复杂交易", function()
+    local function new_trade()
+        local coll = fake_coll()
+        assert(saga.create(coll, { saga_id = "sag_trade", kind = "trade", business_key = "o1" }))
+        return coll
+    end
+
+    t.it("moves value between two roles exactly once across retries", function()
+        local coll = new_trade()
+        local ledger = { a = 100, b = 0 }
+        local applied = {}
+        local function apply_once(key, fn)
+            if applied[key] then
+                return "COMMITTED"
+            end
+            fn()
+            applied[key] = true
+            return "COMMITTED"
+        end
+        local deps = {
+            reserve = function(doc)
+                return apply_once("reserve:" .. doc.saga_id, function()
+                    ledger.a = ledger.a - 30
+                end)
+            end,
+            commit = function(doc)
+                return apply_once("commit:" .. doc.saga_id, function()
+                    ledger.b = ledger.b + 30
+                end)
+            end,
+        }
+
+        assert(saga.run(coll, "sag_trade", deps))
+        -- 重复驱动（可靠消息重投）：同一步再跑一次，账本不能变
+        assert(saga.run(coll, "sag_trade", deps))
+        t.expect(ledger.a).to.equal(70)
+        t.expect(ledger.b).to.equal(30)
+        t.expect(coll:find_one({ saga_id = "sag_trade" }).state).to.equal("COMMITTED")
+
+        -- 终态再驱动不再执行任何步骤
+        assert(saga.run(coll, "sag_trade", deps))
+        t.expect(ledger.a).to.equal(70)
+        t.expect(ledger.b).to.equal(30)
+    end)
+
+    t.it("compensates only once when the compensation ack is lost", function()
+        local coll = new_trade()
+        local refunds = 0
+        local deps = {
+            reserve = function()
+                return "COMMITTED"
+            end,
+            commit = function()
+                return "REJECTED"
+            end,
+            compensate = function()
+                refunds = refunds + 1
+                -- 第一次补偿结果未决（ACK 丢失），第二次才确认
+                return refunds == 1 and "UNKNOWN" or "COMMITTED"
+            end,
+        }
+
+        assert(saga.run(coll, "sag_trade", deps)) -- CREATED -> RESERVED
+        assert(saga.run(coll, "sag_trade", deps)) -- RESERVED -> COMPENSATING
+        -- 第一次补偿结果未决（ACK 丢失）：状态必须停在 COMPENSATING
+        assert(saga.run(coll, "sag_trade", deps))
+        t.expect(coll:find_one({ saga_id = "sag_trade" }).state).to.equal("COMPENSATING")
+        t.expect(refunds).to.equal(1)
+
+        -- 重跑同一步：补偿确认后才进入 COMPENSATED
+        assert(saga.run(coll, "sag_trade", deps))
+        t.expect(coll:find_one({ saga_id = "sag_trade" }).state).to.equal("COMPENSATED")
+        t.expect(refunds).to.equal(2)
+
+        -- 终态不再重复补偿
+        assert(saga.run(coll, "sag_trade", deps))
+        t.expect(refunds).to.equal(2)
+    end)
+
+    t.it("lets a new coordinator finish after the previous one crashed", function()
+        local coll = new_trade()
+        -- 第一个协调者认领后崩溃：什么都没推进
+        local claimed = assert(saga.claim(coll, "sag_trade", "coord-a", 1000, { now = 100 }))
+        t.expect(claimed).to.equal(true)
+        t.expect(coll:find_one({ saga_id = "sag_trade" }).owner).to.equal("coord-a")
+
+        -- 租约到期，第二个协调者接管并完成同一步
+        local reclaimed = assert(saga.claim(coll, "sag_trade", "coord-b", 2000, { now = 1500 }))
+        t.expect(reclaimed).to.equal(true)
+        local state = assert(saga.run(coll, "sag_trade", {
+            reserve = function()
+                return "COMMITTED"
+            end,
+        }, { owner = "coord-b", now = 1500 }))
+        t.expect(state).to.equal("RESERVED")
+    end)
+
+    t.it("refuses a second manual compensation for an already committed trade", function()
+        local coll = new_trade()
+        local deps = {
+            reserve = function()
+                return "COMMITTED"
+            end,
+            commit = function()
+                return "COMMITTED"
+            end,
+        }
+        assert(saga.run(coll, "sag_trade", deps))
+        assert(saga.run(coll, "sag_trade", deps))
+        t.expect(coll:find_one({ saga_id = "sag_trade" }).state).to.equal("COMMITTED")
+
+        assert(saga.compensate(coll, "sag_trade", { reason = "chargeback" }))
+        t.expect(coll:find_one({ saga_id = "sag_trade" }).state).to.equal("COMPENSATING")
+
+        local again, err = saga.compensate(coll, "sag_trade", { reason = "chargeback" })
+        t.expect(again).to.be_nil()
+        t.expect(err).to.equal("not committed")
+    end)
+end)

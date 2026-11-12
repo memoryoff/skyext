@@ -705,6 +705,10 @@ end
 -- 拆成两步是为了让 TRANSFER（送达）与 OWNER_HANDOFF（认领 + 安装）各自可观测、可重试；
 -- 合成一步的话，安装失败就分不清是没送到还是没认领上。
 local g_staged = {}
+-- 已被源端取消的迁移：entity_id -> { barrier_id, at }。
+-- 源端 abort 后可能仍有 commit/attach RPC 在路上（无超时的 cluster.call），
+-- 目标端必须据此拒绝接管，否则会出现「源端已放弃、目标端却完成了迁移」。
+local g_aborted_barriers = {}
 local STAGED_TTL = 60
 local STAGED_MAX = 64
 
@@ -717,6 +721,11 @@ local function prune_staged(now)
             count = count + 1
         end
     end
+    for id, entry in pairs(g_aborted_barriers) do
+        if now - entry.at > STAGED_TTL then
+            g_aborted_barriers[id] = nil
+        end
+    end
     return count
 end
 
@@ -725,11 +734,43 @@ function CMD.migration_stage(entity_id, payload)
         return false, "snapshot is required"
     end
     local now = os.time()
+    -- 同一 barrier 已经被源端取消：迟到的 stage 不能重新建立暂存
+    local aborted = g_aborted_barriers[entity_id]
+    if aborted then
+        if aborted.barrier_id == payload.barrier_id then
+            return false, "migration aborted"
+        end
+        -- 不同 barrier 说明是上一轮留下的标记，允许新轮次
+        g_aborted_barriers[entity_id] = nil
+    end
     -- 没有上限的话，一次异常就能把目标节点变成快照仓库
     if prune_staged(now) >= STAGED_MAX then
         return false, "too many staged snapshots"
     end
     g_staged[entity_id] = { payload = payload, at = now }
+    return true
+end
+
+-- 源端取消：目标端收到后必须拒绝同一 barrier 的后续 commit。
+-- 幂等；barrier 不匹配时不覆盖已有标记（避免旧请求取消新一轮）。
+function CMD.migration_abort(entity_id, barrier_id)
+    if type(barrier_id) ~= "string" or barrier_id == "" then
+        return false, "barrier_id is required"
+    end
+    local staged = g_staged[entity_id]
+    if staged and staged.payload and staged.payload.barrier_id ~= barrier_id then
+        -- 旧轮次的取消请求：不能让它误伤当前这一轮
+        return false, "barrier mismatch"
+    end
+    local current = g_aborted_barriers[entity_id]
+    if current and current.barrier_id ~= barrier_id then
+        return false, "barrier mismatch"
+    end
+    g_aborted_barriers[entity_id] = { barrier_id = barrier_id, at = os.time() }
+    if staged then
+        g_staged[entity_id] = nil
+    end
+    log.warn("migration aborted on target", "id", tostring(entity_id), "barrier", barrier_id)
     return true
 end
 
@@ -748,7 +789,15 @@ function CMD.migration_commit(entity_id)
     if not entitymgr then
         return false, "entity manager not ready"
     end
+    -- 源端已经取消这一轮：即使 commit RPC 迟到，也不能接管。
+    -- 先看取消标记再看暂存：abort 可能已经把暂存清掉了。
+    local aborted = g_aborted_barriers[entity_id]
     local staged = g_staged[entity_id]
+    if aborted and (not staged or not staged.payload or aborted.barrier_id == staged.payload.barrier_id) then
+        g_staged[entity_id] = nil
+        g_aborted_barriers[entity_id] = nil
+        return false, "migration aborted"
+    end
     if not staged then
         return false, "no staged snapshot"
     end

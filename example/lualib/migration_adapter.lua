@@ -147,7 +147,7 @@ function M.freeze(entity, barrier_id)
         return nil, tostring(err)
     end
     -- 屏障已经建立：从这里到 activate 之间无论失败还是取消，都必须有人解屏障
-    g_inflight[entity.id] = { id = entity.id, conn_id = entity.conn_id }
+    g_inflight[entity.id] = { id = entity.id, conn_id = entity.conn_id, barrier_id = barrier_id }
     return true
 end
 
@@ -188,6 +188,11 @@ function M.transfer(entity, snapshot)
         return nil, "stage failed: " .. tostring(serr)
     end
     entity._target = target
+    -- 记下目标：取消时要通知它拒绝同一 barrier 的迟到 commit
+    local info = g_inflight[entity.id]
+    if info then
+        info.target = target
+    end
     return true
 end
 
@@ -258,6 +263,24 @@ end
 -- 再发 RPC（kick 除外）。这是"让失败可恢复"，不是"取消长 RPC"——后者仍需要
 -- 给跨节点调用加 deadline，见 docs/review-2026-11-12-defect-register.md R-01。
 function M.abort(reason)
+    -- 先通知目标端：同一 barrier 的 commit/attach 必须被拒绝。
+    -- 此时 g_aborted 还没置位，call_agent 仍然可用。
+    for id, info in pairs(g_inflight) do
+        if info.target then
+            local called, err = pcall(call_agent, info.target, id, "migration_abort", id, info.barrier_id)
+            if not called then
+                log.error(
+                    "migration abort could not reach the target",
+                    "id",
+                    tostring(id),
+                    "target",
+                    tostring(info.target),
+                    "err",
+                    tostring(err)
+                )
+            end
+        end
+    end
     g_aborted = true
     local kicked, failed = 0, 0
     for id, info in pairs(g_inflight) do

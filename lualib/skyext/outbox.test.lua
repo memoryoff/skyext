@@ -293,7 +293,9 @@ t.describe("outbox 投递", function()
         t.expect(stats.failed).to.equal(1)
         t.expect(stats.enqueued).to.equal(0)
         t.expect(h.store.critical._critical_outbox_v1[EVENT].status).to.equal("PENDING")
-        t.expect(#(h.store.cas or {})).to.equal(0)
+        -- 失败要记一次投递尝试（毒事件隔离的依据），但状态仍是 PENDING
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].deliver_attempts).to.equal(1)
+        t.expect(#(h.store.cas or {})).to.equal(1)
     end)
 
     t.it("treats a raising deliver function as an unconfirmed delivery", function()
@@ -809,5 +811,126 @@ t.describe("outbox 投递闭环", function()
         h.seed({ { event_id = EVENT, status = "DELIVERED", updated_at = h.now, op_type = "mail.send" } }, 0)
         t.expect(h.outbox.cleanup(h.ctx, { now = h.now })).to.equal(0)
         t.expect(#(h.store.cas or {})).to.equal(0)
+    end)
+end)
+
+-- 一条永远送不出去的事件不能让同角色后面的事件全部饿死：
+-- pump 失败即 break 保序，队首不动，后面的就永远轮不到。
+t.describe("outbox 毒事件隔离", function()
+    local function eid(ch)
+        return "evt_" .. string.rep(ch, 64)
+    end
+
+    local function seed_two(h)
+        h.seed({
+            { event_id = eid("a"), status = "PENDING", created_at = h.now - 20, op_type = "mail.send" },
+            { event_id = eid("b"), status = "PENDING", created_at = h.now - 10, op_type = "mail.send" },
+        }, 2)
+    end
+
+    local function deliver(env)
+        -- 第一条永远失败，第二条正常
+        return env.event_id ~= eid("a")
+    end
+
+    t.it("keeps the poison event pending and preserves order before the limit", function()
+        local h = harness()
+        seed_two(h)
+        local stats = assert(h.outbox.pump(h.ctx, deliver, { now = h.now }))
+        t.expect(stats.failed).to.equal(1)
+        t.expect(stats.quarantined).to.equal(0)
+        local box = h.store.critical._critical_outbox_v1
+        t.expect(box[eid("a")].status).to.equal("PENDING")
+        t.expect(box[eid("a")].deliver_attempts).to.equal(1)
+        -- 保序：第一条没投出去，第二条不能被抢跑
+        t.expect(box[eid("b")].status).to.equal("PENDING")
+    end)
+
+    t.it("quarantines the poison event and lets the next one through", function()
+        local h = harness()
+        seed_two(h)
+        local last
+        for _ = 1, h.outbox.MAX_DELIVER_ATTEMPTS do
+            last = assert(h.outbox.pump(h.ctx, deliver, { now = h.now }))
+        end
+        t.expect(last.quarantined).to.equal(1)
+        local box = h.store.critical._critical_outbox_v1
+        t.expect(box[eid("a")].status).to.equal("FAILED")
+        t.expect(box[eid("a")].failed_reason).to.exist()
+        -- 隔离后同一轮继续投递，后续事件不再被饿死
+        t.expect(box[eid("b")].status).to.equal("ENQUEUED")
+        t.expect(h.store.critical._critical_outbox_pending_count).to.equal(0)
+    end)
+
+    t.it("stays pending when the attempt counter cannot be persisted", function()
+        local h = harness()
+        seed_two(h)
+        h.store.unknown = "mongo down"
+        local stats = assert(h.outbox.pump(h.ctx, deliver, { now = h.now }))
+        t.expect(stats.quarantined).to.equal(0)
+        t.expect(h.store.critical._critical_outbox_v1[eid("a")].status).to.equal("PENDING")
+    end)
+end)
+
+-- 只在 pending == 0 时清理，会让"一直有积压"的角色永远攒着终态记录
+t.describe("outbox 定期清理", function()
+    local function eid(ch)
+        return "evt_" .. string.rep(ch, 64)
+    end
+
+    t.it("cleans periodically even while events are still pending", function()
+        local h = harness()
+        h.outbox._reset_cleanup()
+        local week = 8 * 24 * 3600
+        h.seed({
+            { event_id = eid("a"), status = "PENDING", created_at = h.now - 20, op_type = "mail.send" },
+            { event_id = eid("b"), status = "DELIVERED", updated_at = h.now - week, op_type = "mail.send" },
+        }, 1)
+
+        local first = assert(h.outbox.pump(h.ctx, function()
+            return false
+        end, { now = h.now }))
+        t.expect(first.pending).to.equal(1)
+        t.expect(first.cleaned).to.equal(1)
+
+        -- 节流窗口内不重复清理
+        local second = assert(h.outbox.pump(h.ctx, function()
+            return false
+        end, { now = h.now + 10 }))
+        t.expect(second.cleaned).to.be_nil()
+
+        -- 超过窗口后再次清理（此时已没有可清的事件）
+        local third = assert(h.outbox.pump(h.ctx, function()
+            return false
+        end, { now = h.now + 70 }))
+        t.expect(third.cleaned).to.equal(0)
+    end)
+end)
+
+t.describe("outbox 因果排序", function()
+    local function eid(ch)
+        return "evt_" .. string.rep(ch, 64)
+    end
+
+    t.it("orders pending events by causal sequence when timestamps tie", function()
+        local h = harness()
+        h.seed({
+            { event_id = eid("b"), status = "PENDING", created_at = 100, causal_seq = 2, op_type = "mail.send" },
+            { event_id = eid("a"), status = "PENDING", created_at = 100, causal_seq = 1, op_type = "mail.send" },
+        }, 2)
+        local list = h.outbox.pending_events(h.store.critical, 10)
+        t.expect(list[1].event_id).to.equal(eid("a"))
+        t.expect(list[2].event_id).to.equal(eid("b"))
+    end)
+
+    t.it("falls back to creation time when no sequence exists", function()
+        local h = harness()
+        h.seed({
+            { event_id = eid("b"), status = "PENDING", created_at = 200, op_type = "mail.send" },
+            { event_id = eid("a"), status = "PENDING", created_at = 100, op_type = "mail.send" },
+        }, 2)
+        local list = h.outbox.pending_events(h.store.critical, 10)
+        t.expect(list[1].event_id).to.equal(eid("a"))
+        t.expect(list[2].event_id).to.equal(eid("b"))
     end)
 end)
