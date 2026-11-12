@@ -263,6 +263,17 @@ t.describe("pay_webhook 落单与发奖", function()
         t.expect(h.orders.store.docs[1].ack_result).to.equal("ACCEPTED")
     end)
 
+    -- INTERNAL_ERROR 是 validate 抛错（零写入）：不是契约失败，不能让渠道无限重推
+    t.it("acks an internal validation error and leaves reconciliation to close it", function()
+        local h = harness()
+        h.decision = { status = "INTERNAL_ERROR", reason = "validate raised" }
+        local out = h.webhook:handle(fake_req("/pay/wechat/callback", h.body))
+        t.expect(out.status).to.equal(200)
+        t.expect(out.body.status).to.equal("GRANTING")
+        t.expect(h.orders.store.docs[1].status).to.equal("GRANTING")
+        t.expect(h.orders.store.docs[1].ack_result).to.equal("ACCEPTED")
+    end)
+
     t.it("acks a business rejection and keeps it visible for compensation", function()
         local h = harness()
         h.decision = { status = "BUSINESS_REJECTED", reason = "role banned" }

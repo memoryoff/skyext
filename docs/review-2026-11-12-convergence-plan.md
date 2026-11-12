@@ -1,6 +1,8 @@
 # skyext 生产化验收与缺陷收敛计划（2026-11-12）
 
-> **状态：全部 P0 与 P1 已实施并通过全量测试；真实故障验证（P1-06 / P1-07）与压测数据仍待环境。**
+> **状态：代码侧缺陷已收敛，并由真实模块契约测试验证；真实故障验证（P1-06 / P1-07）与压测数据仍待环境。**
+> **修订（2026-11-12 复核）：** 第四批曾写"全部 P0 与 P1 已实施"，但 122 个用例测的是桩，
+> 迁移 export / attach 与 Outbox 回执在真实调用链上仍是断的（详见 §8）。该口径已撤回。
 > **核实基准：** 本仓库 `main` @ `6bfc9c5`，逐条回源码验证，不采信审查报告的行号与结论。
 > **本轮定位：** 不新增功能，只做缺陷收敛与真实故障验证。审查报告把"实施完善度"压到 80 分，
 > 与源码一致的部分见 §1，与源码不符或需要限定的部分也一并标出。
@@ -235,5 +237,43 @@ stylua --check .                       # 通过
 8. **P1-06 / P1-07**：真实副本集切主、真实迁移回环（这两项是"能不能上生产"的判据）
 9. **P1-04 数值 / P2-01~07**：压测数据、文档对齐、Saga 复杂交易用例
 
-**口径**：代码侧 P0/P1 已全部落地，但 P1-06 / P1-07 与压测数值仍缺，
-所以对外表述只能是"已实现，待生产验证"，不能写成"已验证"。
+**口径**：代码侧 P0/P1 已全部落地，**且经第五批（§8）的真实契约测试验证过跨模块链路**，
+但 P1-06 / P1-07 与压测数值仍缺，所以对外表述只能是"已实现，待生产验证"，
+不能写成"已验证"。
+
+---
+
+## 8. 第五批：真实契约断链修复（复核后）
+
+第四批的 122 个用例全绿，但 `migration_adapter.test.lua` 用假 `skynet.call` 直接返回快照、
+`launcher.test.lua` 用恒真的 `start` 桩、`entity_agent.test.lua` 用不做 epoch 校验的假
+`session`。三处跨模块契约因此从未被验证：
+
+| 断链 | 修复 |
+| --- | --- |
+| `session_export` 只在 `FRAMEWORK` 里，适配器直接当 CMD 调用必被 `cmd_api` 判为未知命令，export 阶段全部 FALLBACK | 新增 `CMD.session_export`（`in_entity` 包装），适配器补齐 `entity_id` 参数 |
+| `session_import` 提前把 `io_.owner_epoch` 推到目标代际，`session.attach` 传入自身 epoch 必然自拒，网关屏障无人解除 | 快照携带 `source_owner_epoch`；目标侧按源端代际装载，`migration_target_epoch` 留给 attach 认领一次；网关 `resume_owner(target)` |
+| 回执用 map 传 `router.reliable_send`，`entitymgr._deliver_one` 的 `table.unpack` 只解数组，handler 收到 `msg_id` 数字，`mark_delivered` 永远拒绝 | `ack_source` 改成数组 `{ { event_id } }`，与 `outbox_worker.default_deliver` 一致 |
+| `PRECHECK_REJECTED` 被当持久化终态 ACK（源端资产已扣、事件被删且永不重投） | 移出终态集合，抛错进死信人工可见；`INTERNAL_ERROR` 改走 `delivery.retryable` 受控重试（连续阈值会升级人工） |
+| `migration = { enabled = true }` 因 `x = x or {...}` 整表替换丢掉 adapter，节点启动失败 | `common.app.lua` 改为逐字段合并默认值 |
+| DELIVERED 保留期两套口径（容量腾挪隐式 0 秒）、触顶不发 80% 预警、归档驱动抛异常上抛、`archive_lag` 恒 >= 7 天 | 统一到 `OUTBOX_DELIVERED_RETENTION`；预警独立于腾挪；归档写加 `pcall` 转结构化失败；滞后改为"超期后的额外等待" |
+
+**验证（本批口径以测试为准）**：
+
+```bash
+./bin/skyext test                 # 124 files, 124 passed, 0 failed
+luacheck .                        # 309 files, 0 warnings
+stylua --check .                  # 通过
+lua scripts/ci/check_paths.lua .  # 通过
+make -C example lint              # 44 files, 0 warnings
+sdk/ts: npx tsc --noEmit          # 通过
+```
+
+新增 `lualib/skyext/fix_contract.test.lua`：用 `loadfile` 加载**真实模块源码**（只桩外部依赖），
+断言真实 CMD 表存在 `session_export`、真实适配器在该分发下能拿到快照、真实
+`session.attach` 接受严格前进的 epoch、真实回执链能把事件推进到 `DELIVERED`。
+新增 `example/etc/nodes/common.app.test.lua` 覆盖配置合并。其余回归断言同步更新。
+
+**本批未覆盖（如实列出）**：P1-03 的取消令牌只能停在阶段边界，卡在无超时
+`cluster.call` 里的协程仍无法打断；P1-06 副本集 `stepDown`、P1-07 双节点回环、
+压测数值、P2-02 Saga 复杂交易用例仍待真实环境。这些不是"已修复"。

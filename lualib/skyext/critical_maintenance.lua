@@ -24,13 +24,21 @@ M.DEFAULT_INTERVAL = 60
 local m_archive = metrics.counter("skyext_critical_maintenance_total", "Maintenance rounds by task", { "task" })
 local m_candidates =
     metrics.gauge("skyext_critical_maintenance_candidates", "Candidates found by the last maintenance scan", { "task" })
--- 归档滞后：最老一条待归档操作已经等了多久。这是容量预警的主指标——
--- 滞后持续上升说明归档吞吐跟不上写入，撞 MAX_OPS 只是时间问题
+-- 归档滞后：最老候选**超过保留期之后**又等了多久。候选本身必然已超保留期，
+-- 直接记 now - oldest 会恒定 >= retention 并在 0 与 7 天间跳变。
+-- 减去保留期后正常归档约等于 0，只有吞吐跟不上才持续上涨。
 local m_archive_lag = metrics.gauge(
     "skyext_critical_archive_lag_seconds",
-    "Age of the oldest critical op waiting to be archived",
+    "Extra delay past the retention window for the oldest op waiting to be archived",
     { "task" }
 )
+
+-- 归档滞后 = 超过保留期之后又等了多久。候选必然已经超期，所以不能直接用
+-- now - oldest（那会恒 >= retention，指标在 0 与 7 天之间跳变）。
+-- 抽成纯函数便于断言口径，正常归档约等于 0，吞吐跟不上才持续上涨。
+function M.archive_lag(oldest, now, retention)
+    return math.max(0, now - oldest - retention)
+end
 
 -- 归档候选：热账本最老条目已经超过保留期
 function M.scan_archive(role_coll, opts)
@@ -120,7 +128,11 @@ function M.run_once(deps, opts)
     end
     if oldest then
         local now = opts.now or os.time()
-        m_archive_lag:set(math.max(0, now - oldest), { task = "archive" })
+        -- 扫描只挑"已超过保留期"的候选，now - oldest 恒 >= retention；
+        -- 直接拿它当滞后会让指标在 0 与 >=7 天之间跳变。减去保留期后，
+        -- 正常归档约等于 0，只有吞吐跟不上（超期后还在等）才持续上涨。
+        local retention = opts.retention or critical.ARCHIVE_RETENTION
+        m_archive_lag:set(M.archive_lag(oldest, now, retention), { task = "archive" })
     else
         m_archive_lag:set(0, { task = "archive" })
     end

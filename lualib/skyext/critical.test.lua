@@ -1322,14 +1322,29 @@ t.describe("critical 源侧 Outbox", function()
     t.it("never evicts events that were not delivered yet", function()
         local h = harness()
         local now = 10000
+        -- 容量触顶时会显式放弃 DELIVERED 保留期
         local ids = h.critical.evictable_outbox_events({
             a = { status = "PENDING", created_at = now - 8 * 24 * 3600 },
             b = { status = "DELIVERED", updated_at = now - 1 },
             c = { status = "ENQUEUED", updated_at = now - 8 * 24 * 3600 },
-        }, now, 10)
+        }, now, 10, { delivered_retention = 0 })
         t.expect(#ids).to.equal(2)
         t.expect(ids[1]).to.equal("c")
         t.expect(ids[2]).to.equal("b")
+    end)
+
+    t.it("keeps freshly delivered events until their retention expires", function()
+        local h = harness()
+        local now = 10000
+        -- 默认调用（cleanup 口径）与 outbox.DELIVERED_RETENTION 同源，
+        -- 刚 ACK 的记录不能被静默删掉，否则迟到重复回执查不到审计痕迹
+        local ids = h.critical.evictable_outbox_events({
+            fresh = { status = "DELIVERED", updated_at = now - 1 },
+            old = { status = "DELIVERED", updated_at = now - 8 * 24 * 3600 },
+        }, now, 10)
+        t.expect(#ids).to.equal(1)
+        t.expect(ids[1]).to.equal("old")
+        t.expect(h.critical.OUTBOX_DELIVERED_RETENTION).to.equal(7 * 24 * 3600)
     end)
 end)
 
@@ -1393,6 +1408,29 @@ t.describe("critical 归档", function()
         t.expect(stats.archived).to.equal(0)
         t.expect(err).to.match("ledger")
         -- 冷账本没确认就删热条目 = 两边都没有，那个操作记录就永久消失了
+        t.expect(h.store.critical._critical_ops_v1[OP_A]).to_not.be_nil()
+    end)
+
+    t.it("keeps the hot record when the ledger driver raises", function()
+        local h = harness()
+        with_ops(h, {
+            [OP_A] = { status = "COMMITTED", op_type = "shop.buy", at = 100 },
+        }, 100)
+        local ledger = fake_ledger()
+        function ledger:critical_find_and_modify()
+            error("mongo down")
+        end
+
+        -- 驱动抛异常必须转成结构化失败，不能冒到维护服务里被吞成一轮静默失败
+        local called, stats, err = pcall(
+            h.critical.archive_ops,
+            h.entity,
+            { ledger = ledger },
+            { now = 1000, retention = 500 }
+        )
+        t.expect(called).to.equal(true)
+        t.expect(stats.archived).to.equal(0)
+        t.expect(err).to.match("raised")
         t.expect(h.store.critical._critical_ops_v1[OP_A]).to_not.be_nil()
     end)
 
@@ -1578,6 +1616,34 @@ t.describe("critical 容量预警", function()
         local h = harness()
         local box = {}
         for i = 1, 420 do
+            box[string.format("evt_%064x", i)] = { status = "DELIVERED", updated_at = h.now - 100 }
+        end
+        h.store.critical = { _critical_outbox_v1 = box, _critical_outbox_pending_count = 0 }
+        local result = h.critical.execute_client(h.entity, h.new_grant(), 1, "shop.buy", { amount = 1 }, h.handlers(), {
+            hmac_fn = HASH,
+            hash_fn = HASH,
+            equal_fn = EQ,
+            now = h.now,
+            outbox = {
+                {
+                    event_id = "evt_" .. string.rep("e", 64),
+                    target_type = "role",
+                    target_id = 9,
+                    op_type = "mail.send",
+                    param_hash = string.rep("a", 64),
+                    status = "PENDING",
+                },
+            },
+        })
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+        t.expect(h.entity.capacity_warned_outbox).to.equal(true)
+    end)
+
+    -- 真正触顶、开始腾挪时最需要预警：旧的 elseif 恰好漏掉这一刻
+    t.it("still warns when the outbox is full and eviction kicks in", function()
+        local h = harness()
+        local box = {}
+        for i = 1, h.critical.MAX_OUTBOX do
             box[string.format("evt_%064x", i)] = { status = "DELIVERED", updated_at = h.now - 100 }
         end
         h.store.critical = { _critical_outbox_v1 = box, _critical_outbox_pending_count = 0 }

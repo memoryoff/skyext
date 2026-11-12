@@ -131,7 +131,9 @@ end
 function M.export(entity, barrier_id)
     -- 目标 epoch 必须严格前进：网关用严格大于来拒绝旧 owner 的迟到下行
     local target_epoch = (entity.owner_epoch or 1) + 1
-    local ok, snapshot, err = call_agent(self_node(), entity.id, "session_export", barrier_id, target_epoch)
+    -- session_export 是 CMD 命令，第一参数必须是 entity_id（与其余 migration_* 一致）。
+    -- 少了它会把 barrier_id 当成实体 ID，命令存在也拿不到快照。
+    local ok, snapshot, err = call_agent(self_node(), entity.id, "session_export", entity.id, barrier_id, target_epoch)
     if not ok then
         return nil, tostring(snapshot)
     end

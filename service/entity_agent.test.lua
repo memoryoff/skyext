@@ -789,6 +789,8 @@ t.describe("entity_agent 会话迁移命令", function()
         -- 新 owner 的 epoch 必须严格前进，否则网关会继续放行旧 owner 的下行
         t.expect(exported.owner_epoch).to.equal(4)
         t.expect(exported.sent).to.equal(2)
+        -- 源端代际要随快照一起走：目标侧先按源端代际装载，attach 再推进一次
+        t.expect(exported.source_owner_epoch).to.equal(3)
         -- 导出即冻结源：之后不再追加 out_buf，否则目标拿到的是过期快照
         t.expect(source.entity.session_io.migrating).to.equal(true)
         -- 快照送出后不允许撤销冻结：源端继续写会让 sent 领先目标
@@ -798,7 +800,10 @@ t.describe("entity_agent 会话迁移命令", function()
         local imported_ok, result = target.CMD.entity_call(7, "session_import", exported)
         t.expect(imported_ok).to.equal(true)
         t.expect(result.sent).to.equal(2)
-        t.expect(result.owner_epoch).to.equal(4)
+        -- 安装后本地仍是源端代际；认领代际留给 session.attach，网关先认账再推进
+        t.expect(result.owner_epoch).to.equal(3)
+        t.expect(result.target_owner_epoch).to.equal(4)
+        t.expect(target.entity.migration_target_epoch).to.equal(4)
         t.expect(target.entity.session_io.out_buf[2]).to.equal("PACK-2")
         -- wire 上的会话身份必须保持不变
         t.expect(target.entity.session_io.session_epoch).to.equal(string.rep("a", 32))
@@ -933,7 +938,8 @@ t.describe("entity_agent 迁移接管", function()
         local h = harness()
         assert(h.CMD.migration_stage(7, exported()))
         t.expect(h.CMD.migration_commit(7)).to.equal(true)
-        t.expect(h.entity.session_io.owner_epoch).to.equal(4)
+        t.expect(h.entity.session_io.owner_epoch).to.equal(3)
+        t.expect(h.entity.migration_target_epoch).to.equal(4)
         -- 提交成功即清掉暂存：同一份快照不能被安装第二次
         local again, err = h.CMD.migration_commit(7)
         t.expect(again).to.equal(false)
@@ -968,7 +974,9 @@ t.describe("entity_agent 迁移接管", function()
         local conn = cid(3)
         t.expect(h.CMD.session_attach(7, conn)).to.equal(true)
         t.expect(h.attach_args.owner).to.equal(".entity_agent:role:1")
-        t.expect(h.attach_args.epoch).to.equal(3)
+        -- 没有装过快照时按当前代际 +1，绝不能把 io_.owner_epoch 原样传回去
+        t.expect(h.attach_args.epoch).to.equal(4)
+        t.expect(h.entity.session_io.owner_epoch).to.equal(4)
         t.expect(h.bound[conn]).to.equal(h.entity)
         t.expect(h.events).to.equal({ "attach", "replay" })
     end)

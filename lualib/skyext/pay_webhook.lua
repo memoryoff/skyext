@@ -229,9 +229,17 @@ function Webhook:handle(req)
         return { status = 200, body = { result = "accepted", status = charge_order.STATUS.GRANTED } }
     end
 
-    if status == "UNKNOWN" or status == "IN_PROGRESS" or status == "CAPACITY_EXCEEDED" then
+    if
+        status == "UNKNOWN"
+        or status == "IN_PROGRESS"
+        or status == "CAPACITY_EXCEEDED"
+        or status == "INTERNAL_ERROR"
+    then
         -- 结果未决/暂态：订单留在 GRANTING，ACK 之后由对账 worker 收尾。
-        -- 这里回 500 只会让渠道重推，制造更多重复回调而没有额外信息
+        -- INTERNAL_ERROR 是 validate 自身抛错，PREPARE 之前零写入，
+        -- critical.query 只会回 NOT_STARTED；它不是契约失败，回 500 让渠道
+        -- 反复重推同一个服务端 bug 只会制造重复回调，拿不到额外信息。
+        -- 对账侧会重投 grant，重投仍失败时按 RETRY 留待下一轮。
         self:ack(name, order, now)
         m_requests:inc(1, { result = "unknown" })
         return { status = 200, body = { result = "accepted", status = charge_order.STATUS.GRANTING } }

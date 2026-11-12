@@ -489,7 +489,32 @@ t.describe("outbox 接收方", function()
         t.expect(h.acks[1].cmd).to.equal("outbox_ack")
         t.expect(h.acks[1].type_name).to.equal("role")
         t.expect(h.acks[1].id).to.equal(9)
-        t.expect(h.acks[1].args.event_id).to.equal(EVENT)
+        -- 契约：可靠消息用 table.unpack(msg.args) 展开，args 必须是数组。
+        -- 传 map 会展开成 0 个参数，handler 只拿到 msg.msg_id，回执永远失效。
+        local unpacked = table.pack(table.unpack(h.acks[1].args))
+        t.expect(unpacked.n).to.equal(1)
+        t.expect(type(unpacked[1])).to.equal("table")
+        t.expect(unpacked[1].event_id).to.equal(EVENT)
+    end)
+
+    -- 纯读预检拒绝不是持久化终态：源端资产已扣，ACK 会让事件被删且永不重投
+    t.it("does not ack a pure precheck rejection and keeps it visible", function()
+        local h = receiver_harness()
+        h.holder.result = { status = "PRECHECK_REJECTED", reason = "mail module is not loaded" }
+        local ok, err = pcall(h.receiver.handle, h.receiver, h.entity, h.envelope(), {})
+        t.expect(ok).to.equal(false)
+        t.expect(tostring(err):find("precheck rejected", 1, true)).to_not.be_nil()
+        t.expect(#h.acks).to.equal(0)
+    end)
+
+    -- validate 抛错发生在 PREPARE 之前，零写入：按环境暂态受控重试，不能当毒消息
+    t.it("treats an internal validation error as a retryable fault", function()
+        local h = receiver_harness()
+        local delivery = require "skyext.entity.delivery"
+        h.holder.result = { status = "INTERNAL_ERROR", reason = "validate raised" }
+        local value = h.receiver:handle(h.entity, h.envelope(), {})
+        t.expect(delivery.is_retryable(value)).to.equal(true)
+        t.expect(#h.acks).to.equal(0)
     end)
 
     -- UNKNOWN 是环境暂态：转成 retryable，让可靠消息保留 pending 而不是进 DLQ

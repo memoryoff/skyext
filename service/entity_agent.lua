@@ -399,6 +399,10 @@ FRAMEWORK.session_export = function(entity, barrier_id, target_owner_epoch)
         bytes = bytes,
         session_epoch = io_.session_epoch,
         owner_epoch = target,
+        -- 目标侧安装快照时必须先保留源端代际：session.attach 要求传入的
+        -- owner_epoch 严格大于 io_.owner_epoch，网关 resume 才会认这次切换。
+        -- 一开始就把它写成 target 会让最后一跳永远拿不到可推进的代际。
+        source_owner_epoch = current,
         sent = io_.sent,
         acked = io_.acked,
         barrier_id = barrier_id,
@@ -433,8 +437,14 @@ FRAMEWORK.session_import = function(entity, payload)
     if entity.session_io and entity.session and entity.session_io.session_epoch ~= snapshot.session_epoch then
         return nil, "target already has a different live session"
     end
+    -- 快照里装的是源端会话，代际也停在源端；认领动作留给 session.attach：
+    -- 它必须先让网关 resume_owner(target) 成功，再把本地 epoch 推进到 target。
+    local source_epoch = math.tointeger(payload.source_owner_epoch) or (target - 1)
+    if source_epoch >= target then
+        return nil, "source owner epoch must be older than the target"
+    end
     local io_, rerr = snapshot_mod.restore(snapshot, payload.session_epoch, {
-        owner_epoch = target,
+        owner_epoch = source_epoch,
         -- 与 session.lua 的空闲回收同一条时钟（厘秒），不是 os.time()
         now = skynet.now(),
     })
@@ -442,9 +452,11 @@ FRAMEWORK.session_import = function(entity, payload)
         return nil, rerr
     end
     entity.session_io = io_
+    entity.migration_target_epoch = target
     return {
         session_epoch = io_.session_epoch,
         owner_epoch = io_.owner_epoch,
+        target_owner_epoch = target,
         sent = io_.sent,
         acked = io_.acked,
     }
@@ -460,10 +472,15 @@ FRAMEWORK.session_attach = function(entity, conn_id)
     if not io_ then
         return nil, "no session io"
     end
-    local ok, err = session.attach(conn_id, entity, self_service_name(), io_.owner_epoch)
+    -- 认领代际由 session_import 记录；直接调用（没有装过快照）时按当前值 +1。
+    -- 绝不能把 io_.owner_epoch 原样传回去：attach 要求严格前进，那样必然自拒，
+    -- 网关屏障也就永远没人解除。
+    local target = math.tointeger(entity.migration_target_epoch) or (io_.owner_epoch + 1)
+    local ok, err = session.attach(conn_id, entity, self_service_name(), target)
     if not ok then
         return nil, err
     end
+    entity.migration_target_epoch = nil
     if not session.replay(entity) then
         -- 重放缓冲有缺口：attach 已经把连接踢掉，客户端会重新登录
         return nil, "replay gap"
@@ -752,6 +769,26 @@ function CMD.session_attach(entity_id, conn_id)
         return false, tostring(err or "attach failed")
     end
     return true
+end
+
+-- 源端导出会话快照，供迁移适配器跨服务调用。
+-- FRAMEWORK.session_export 只能经 entity_call -> handler_of 到达；适配器如果直接
+-- skynet.call(..., "session_export", ...) 会被 cmd_api 当成未知命令并让整个
+-- export 阶段 FALLBACK。这里给出显式的 CMD 入口，参数形状与其余 migration_* 一致。
+function CMD.session_export(entity_id, barrier_id, target_owner_epoch)
+    if not entitymgr then
+        return false, "entity manager not ready"
+    end
+    local ok, result, err = in_entity(entity_id, function(entity)
+        return FRAMEWORK.session_export(entity, barrier_id, target_owner_epoch)
+    end)
+    if not ok then
+        return false, tostring(result)
+    end
+    if type(result) ~= "table" then
+        return false, tostring(err or "snapshot rejected")
+    end
+    return true, result
 end
 
 function CMD.start(conf)

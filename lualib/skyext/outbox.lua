@@ -39,7 +39,8 @@ M.DEFAULT_LIMIT = 16
 M.CAS_RETRY = 2
 -- 已投递事件的保留期：DELIVERED 只用于审计，过期就能删。
 -- 容量不足时不等保留期，直接腾（见 critical.commit_core）
-M.DELIVERED_RETENTION = 7 * 24 * 3600
+-- 与 critical 的容量腾挪共用同一份口径：不要在这里另写一个数字
+M.DELIVERED_RETENTION = critical.OUTBOX_DELIVERED_RETENTION
 -- 停在 ENQUEUED 多久算"送不到了"。可靠消息已经把消息持久化，
 -- 源端副本只用于观测；接收方长期不上线时，不能让这份副本把关键字段占满
 M.ENQUEUED_RETENTION = 7 * 24 * 3600
@@ -763,14 +764,11 @@ function RECEIVER_MT:handle(entity, envelope, handlers, opts)
             now = now,
         })
     local status = result.status
-    if
-        status == critical.STATUS.COMMITTED
-        or status == critical.STATUS.BUSINESS_REJECTED
-        or status == critical.STATUS.PRECHECK_REJECTED
-    then
-        -- 业务终态：已持久化的提交，或确定不会产生副作用的拒绝。
-        -- 回执给源端，让它把事件推进到 DELIVERED —— 没有这一步源角色的
-        -- `_critical_outbox_v1` 只增不减，最终会撞上容量上限
+    if status == critical.STATUS.COMMITTED or status == critical.STATUS.BUSINESS_REJECTED then
+        -- 只有**持久化终态**才能回执：这两种结果都写进了 _critical_ops_v1，
+        -- 重放同一个 service_op_id 会拿到相同结论。没有回执时源角色的
+        -- `_critical_outbox_v1` 只增不减，最终会撞上容量上限。
+        -- PRECHECK_REJECTED 不在此列：它是 PREPARE 之前的纯读拒绝，什么都没写。
         self:ack_source(envelope)
         return result
     end
@@ -778,10 +776,21 @@ function RECEIVER_MT:handle(entity, envelope, handlers, opts)
         status == critical.STATUS.UNKNOWN
         or status == critical.STATUS.IN_PROGRESS
         or status == critical.STATUS.CAPACITY_EXCEEDED
+        or status == critical.STATUS.INTERNAL_ERROR
     then
-        -- 未决或暂态容量不足：保留 pending 等重投，靠 service_op_id 回放已持久化结果。
+        -- 未决、暂态容量不足，或 validate 自身抛错（PREPARE 之前零写入）。
+        -- 后者不能算契约失败：它是环境/代码故障，修好后同一事件重投就能成功，
+        -- critical.query 也只会回 NOT_STARTED。delivery.retryable 保留 pending，
+        -- 连续达到阈值时由 note_retryable 升级人工，这就是"受控重试"。
         -- 绝不能 ACK——ACK 之后业务永不执行、也不再重投
         return delivery.retryable(result.reason)
+    end
+    if status == critical.STATUS.PRECHECK_REJECTED then
+        -- 纯读预检不通过：没写 PREPARE、没有 service_op_id，可能随实体状态变化。
+        -- 旧实现把它当终态 ACK，源端资产已在同一次 CAS 扣除，事件却被标成
+        -- DELIVERED 删除且永不重投。改为抛错让可靠消息计 attempts 进死信，
+        -- 人工可见并可补偿（与 pay_webhook 的业务拒绝口径一致）。
+        error("outbox event precheck rejected: " .. tostring(result.reason), 0)
     end
     -- 契约/鉴权类失败（同 op 换参数、cap 不符）：不是环境暂态，也不该静默 ACK。
     -- 抛出去让可靠消息按失败次数进死信队列，人工可见
@@ -805,8 +814,12 @@ function RECEIVER_MT:ack_source(envelope)
     end
     local called, ok = pcall(function()
         local router = require "skyext.entity.router"
+        -- args 必须是**数组**：entitymgr._deliver_one 用 table.unpack(msg.args)
+        -- 展开参数，末尾再追加 msg.msg_id。传 map 会展开成 0 个参数，handler
+        -- 只拿到一个 snowflake 数字，mark_delivered 必然拒绝，回执永远到不了
+        -- DELIVERED（对照 outbox_worker.default_deliver 的 { envelope } 写法）。
         return router.reliable_send(source_type, source_id, "outbox_ack", {
-            event_id = envelope.event_id,
+            { event_id = envelope.event_id },
         })
     end)
     if not called or not ok then

@@ -234,7 +234,10 @@ function M.evictable_outbox_events(outbox_table, now, need, opts)
     if type(need) ~= "number" or need <= 0 then
         return {}
     end
-    local delivered_retention = opts.delivered_retention or 0
+    -- 默认与 outbox.cleanup 共用同一份保留期。容量压力下由调用方显式传 0，
+    -- 不再靠"没传 opts"隐式把 DELIVERED 变成 0 秒即删（两套口径会让刚 ACK
+    -- 的审计记录立刻消失，迟到重复回执只能走 unknown event）。
+    local delivered_retention = opts.delivered_retention or M.OUTBOX_DELIVERED_RETENTION
     local enqueued_retention = opts.enqueued_retention or M.OUTBOX_ENQUEUED_RETENTION
     local list = {}
     for event_id, event in pairs(outbox_table or {}) do
@@ -571,7 +574,11 @@ local function commit_core(ctx, req, handlers)
             -- 先腾终态/超期事件：DELIVERED 只是审计，留着不如让新事件进来。
             -- 不这么做的话，事件只增不减，这个角色最终会被永久拒绝
             local need = existing_events + #new_events - M.MAX_OUTBOX
-            evicted_events = M.evictable_outbox_events(critical[M.OUTBOX_FIELD], req.now, need)
+            -- 触顶是有意放弃 DELIVERED 保留期：先腾终态再决定是否拒绝，
+            -- 但必须显式写出来，不能依赖"没传 opts 就当 0"的隐式行为
+            evicted_events = M.evictable_outbox_events(critical[M.OUTBOX_FIELD], req.now, need, {
+                delivered_retention = 0,
+            })
             existing_events = existing_events - #evicted_events
             if #evicted_events > 0 then
                 m_outbox_evicted:inc(#evicted_events, { reason = "capacity" })
@@ -583,8 +590,10 @@ local function commit_core(ctx, req, handlers)
                     #evicted_events
                 )
             end
-        elseif existing_events >= M.MAX_OUTBOX * M.CAPACITY_WARN_RATIO then
-            -- 预警只打一次（按实体）：80% 之后每条操作都刷一行会把日志淹掉
+        end
+        -- 预警必须独立于腾挪：真正触顶、开始删事件时最需要告警，
+        -- 挂在 elseif 上恰好把这一刻排除掉了。只按实体打一次，避免刷屏。
+        if existing_events >= M.MAX_OUTBOX * M.CAPACITY_WARN_RATIO then
             if ctx.entity and not ctx.entity.capacity_warned_outbox then
                 ctx.entity.capacity_warned_outbox = true
                 m_capacity_warn:inc(1, { kind = "outbox" })
@@ -1269,7 +1278,10 @@ function M.archive_ops(ctx_or_entity, deps, opts)
 
     local moved = {}
     for _, v in ipairs(victims) do
-        local state = ledger:critical_find_and_modify({
+        -- 驱动抛异常时不能向上冒泡：热条目还没删，异常传到维护服务只会被
+        -- 吞成一轮静默失败。转成与 "ledger unknown" 一样的结构化结果，
+        -- 保证"两边都没有"的情况永远不会发生。
+        local called, state = pcall(ledger.critical_find_and_modify, ledger, {
             query = { rid = ctx.rid, op_id = v.op_id },
             update = {
                 ["$setOnInsert"] = {
@@ -1288,6 +1300,10 @@ function M.archive_ops(ctx_or_entity, deps, opts)
             upsert = true,
             new = true,
         })
+        if not called then
+            m_archive:inc(1, { result = "raised" })
+            return { archived = #moved, pending = #victims - #moved }, "ledger write raised: " .. tostring(state)
+        end
         if state ~= "CONFIRMED" then
             -- 冷账本没确认就绝不删热条目：宁可两边都留一份，也不能两边都没有
             m_archive:inc(1, { result = tostring(state):lower() })

@@ -15,6 +15,16 @@ local function fake_coll(...)
     return coll
 end
 
+t.describe("critical_maintenance 归档滞后口径", function()
+    t.it("only measures the delay past the retention window", function()
+        -- 扫描候选必然已超期；now - oldest 会恒 >= retention，必须减掉保留期
+        t.expect(maintenance.archive_lag(100, 1000, 500)).to.equal(400)
+        t.expect(maintenance.archive_lag(500, 1000, 500)).to.equal(0)
+        -- 时钟回拨/异常候选不能产生负滞后
+        t.expect(maintenance.archive_lag(900, 1000, 500)).to.equal(0)
+    end)
+end)
+
 t.describe("critical_maintenance 扫描", function()
     t.it("queries roles whose oldest hot op is past the retention window", function()
         local coll = fake_coll({ { rid = 1, [critical.OPS_OLDEST_FIELD] = 100 } })

@@ -114,47 +114,60 @@ mongo_config = {
 -- 默认全部关闭：开启前必须确认 Mongo 集合可写、索引能建起来、支付渠道密钥已配好。
 -- launcher 会对每个 enabled 的服务调用 start，服务内部的索引门禁失败会让节点启动失败，
 -- 不会降级成"没有索引还一直全表扫描"的调度器。
--- 用 `x = x or {...}` 是为了让节点配置在 include 之前写的自定义值不被这里覆盖。
-outbox_worker = outbox_worker
-    or {
-        enabled = false,
-        type_name = "role",
-        interval = 5,
-        scan_limit = 64,
-        batch = 16,
-    }
-critical_maintenance = critical_maintenance
-    or {
-        enabled = false,
-        type_name = "role",
-        interval = 60,
-        scan_limit = 32,
-        archive_limit = 64,
-        retention = 7 * 24 * 3600,
-    }
-pay_callback = pay_callback
-    or {
-        enabled = false,
-        host = "0.0.0.0",
-        port = 8090,
-        role_type = "role",
-        orders = { db = "role", coll = "charge_order" },
-        -- 渠道模块需实现 verify(payload, headers) 与 parse(payload)，密钥放模块自己的配置里
-        providers = {},
-    }
+-- 节点配置只在 include 之前写**要覆盖的字段**，这里逐字段合并默认值。
+-- 用 `x = x or {...}` 是整表替换：运维最自然的一句 `migration = { enabled = true }`
+-- 会把 adapter / type_name / concurrency 全丢掉，CMD.start 直接拒绝、节点起不来。
+local function with_defaults(custom, defaults)
+    if type(custom) ~= "table" then
+        return defaults
+    end
+    local out = {}
+    for k, v in pairs(defaults) do
+        out[k] = v
+    end
+    for k, v in pairs(custom) do
+        out[k] = v
+    end
+    return out
+end
+
+outbox_worker = with_defaults(outbox_worker, {
+    enabled = false,
+    type_name = "role",
+    interval = 5,
+    scan_limit = 64,
+    batch = 16,
+})
+critical_maintenance = with_defaults(critical_maintenance, {
+    enabled = false,
+    type_name = "role",
+    interval = 60,
+    scan_limit = 32,
+    archive_limit = 64,
+    retention = 7 * 24 * 3600,
+})
+pay_callback = with_defaults(pay_callback, {
+    enabled = false,
+    host = "0.0.0.0",
+    port = 8090,
+    role_type = "role",
+    orders = { db = "role", coll = "charge_order" },
+    -- 渠道模块需实现 verify(payload, headers) 与 parse(payload)，密钥放模块自己的配置里
+    providers = {},
+})
 -- 计划内迁移（P15）。开启时必须同时给出 adapter：一个实现 list_entities / quiesce /
 -- freeze / export / transfer / handoff / activate 的模块名。协调器在启动时校验该模块与
 -- 全部阶段，缺一项就让节点启动失败——配置了迁移却静默退化成"卸载 + 全员重登"，
 -- 比直接起不来更危险。示例实现在 example/lualib/migration_adapter.lua。
-migration = migration
-    or {
-        enabled = false,
-        type_name = "role",
-        adapter = "migration_adapter",
-        -- 同时迁移的实体数。每个实体自己抢锁、自己的 conn 屏障，互不依赖；
-        -- 停服预算只有 timeout/2，串行迁几百个在线角色必然超时
-        concurrency = 4,
-    }
+-- 合并默认值后，只写 enabled = true 也会带上正确的 adapter。
+migration = with_defaults(migration, {
+    enabled = false,
+    type_name = "role",
+    adapter = "migration_adapter",
+    -- 同时迁移的实体数。每个实体自己抢锁、自己的 conn 屏障，互不依赖；
+    -- 停服预算只有 timeout/2，串行迁几百个在线角色必然超时
+    concurrency = 4,
+})
 
 -- 同一条可靠消息连续投递失败多少次后转入死信队列。
 -- 只有“错在消息本身”的失败才计数（没有对应 handler、handler 抛错）；
