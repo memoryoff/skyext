@@ -74,6 +74,26 @@ local function harness(opts)
         h.events[#h.events + 1] = "unload"
         return h.unload_ok ~= false
     end
+    -- 计划内迁移：枚举 / 冻结 / 撤销冻结 / 释放
+    function fake_mgr:list_loaded()
+        h.list_calls = (h.list_calls or 0) + 1
+        return h.loaded or { { id = 7, conn_id = "conn-7", owner_epoch = 3 } }
+    end
+    function fake_mgr:quiesce(id)
+        t.expect(id).to.equal(7)
+        h.events[#h.events + 1] = "quiesce"
+        return h.quiesce_ok ~= false, h.quiesce_err
+    end
+    function fake_mgr:unquiesce(id, reason)
+        t.expect(id).to.equal(7)
+        h.unquiesce_reason = reason
+        return h.unquiesce_ok ~= false, h.unquiesce_err
+    end
+    function fake_mgr:release_for_migration(id)
+        t.expect(id).to.equal(7)
+        h.events[#h.events + 1] = "release"
+        return h.release_ok ~= false, h.release_err
+    end
     function fake_mgr:deliver_pending(id, opts)
         t.expect(id).to.equal(7)
         h.deliveries = h.deliveries + 1
@@ -128,6 +148,23 @@ local function harness(opts)
     end
     function fake_session.replay()
         h.events[#h.events + 1] = "replay"
+        return h.replay_ok ~= false
+    end
+    -- 计划内迁移的接管：不重建 session_io，只挂连接并推进 owner_epoch
+    function fake_session.attach(conn_id, e, owner_service, owner_epoch)
+        if h.attach_ok == false then
+            return false, "gate rejected the new owner"
+        end
+        local parsed = assert(connection_id.parse(conn_id))
+        local key = fake_session.key(conn_id)
+        h.bound[key] = e
+        e.session = { conn_id = conn_id, gate_node = parsed.gate_node, gate_service = parsed.gate_service, key = key }
+        if e.session_io then
+            e.session_io.owner_epoch = owner_epoch
+        end
+        h.attach_args = { conn_id = conn_id, owner = owner_service, epoch = owner_epoch }
+        h.events[#h.events + 1] = "attach"
+        return true
     end
     fake_session.cmds = { ping = function() end }
     function fake_session.unbind(key)
@@ -231,7 +268,7 @@ local function harness(opts)
             end,
         },
         ["skyext.entity.session"] = fake_session,
-        ["skyext.log"] = { info = noop, warn = noop, error = noop },
+        ["skyext.log"] = { info = noop, warn = noop, error = noop, debug = noop },
         ["skyext.errcode"] = errcode,
         ["skynet.cluster"] = fake_cluster,
         ["entity_handler.role"] = h.handler,
@@ -754,6 +791,8 @@ t.describe("entity_agent 会话迁移命令", function()
         t.expect(exported.sent).to.equal(2)
         -- 导出即冻结源：之后不再追加 out_buf，否则目标拿到的是过期快照
         t.expect(source.entity.session_io.migrating).to.equal(true)
+        -- 快照送出后不允许撤销冻结：源端继续写会让 sent 领先目标
+        t.expect(source.entity.migration_exported).to.equal(true)
 
         local target = harness()
         local imported_ok, result = target.CMD.entity_call(7, "session_import", exported)
@@ -795,5 +834,192 @@ t.describe("entity_agent 会话迁移命令", function()
         t.expect(result).to.be_nil()
         t.expect(err).to_not.be_nil()
         t.expect(h.entity.session_io).to.be_nil()
+    end)
+end)
+
+-- P15：迁移适配器经 router / cluster 调用这四个命令，它们不在客户端协议里。
+-- 这里只验证接线与失败透传，真正的状态语义在 entitymgr 的单测里。
+t.describe("entity_agent 迁移接线", function()
+    t.it("exposes the loaded entity list of this agent", function()
+        local h = harness()
+        h.loaded = { { id = 7, conn_id = "conn-7", owner_epoch = 3, critical_unknown = true } }
+        local list = h.CMD.migration_list()
+        t.expect(h.list_calls).to.equal(1)
+        t.expect(list[1].conn_id).to.equal("conn-7")
+        t.expect(list[1].critical_unknown).to.equal(true)
+    end)
+
+    t.it("passes quiesce, unquiesce and release through to the manager", function()
+        local h = harness()
+        t.expect(h.CMD.migration_quiesce(7)).to.equal(true)
+        t.expect(h.CMD.migration_unquiesce(7, "barrier failed")).to.equal(true)
+        t.expect(h.unquiesce_reason).to.equal("barrier failed")
+        t.expect(h.CMD.migration_release(7)).to.equal(true)
+        t.expect(h.events).to.equal({ "quiesce", "release" })
+    end)
+
+    t.it("surfaces a refusal instead of reporting success", function()
+        local h = harness()
+        h.quiesce_ok = false
+        h.quiesce_err = "no session"
+        local ok, reason = h.CMD.migration_quiesce(7)
+        t.expect(ok).to.equal(false)
+        t.expect(reason).to.equal("no session")
+
+        h.release_ok = false
+        h.release_err = "snapshot not exported"
+        local released, rerr = h.CMD.migration_release(7)
+        t.expect(released).to.equal(false)
+        t.expect(rerr).to.equal("snapshot not exported")
+    end)
+
+    -- 冻结之后到达的上行必须丢弃而不是拒绝：拒绝会让没有 errcode 字段的协议走断连兜底，
+    -- 把"无感迁移"变成一次掉线
+    t.it("drops upstream for a migrating entity without rejecting it", function()
+        local h = harness()
+        local conn = cid(1)
+        h.bound[conn] = { id = 7, migrating = true }
+        h.CMD.client_msg(conn, "DATA")
+        t.expect(h.dispatched).to.be_nil()
+    end)
+
+    t.it("still dispatches upstream for a normal entity", function()
+        local h = harness()
+        local conn = cid(1)
+        h.bound[conn] = { id = 7 }
+        h.CMD.client_msg(conn, "DATA")
+        t.expect(h.dispatched.conn).to.equal(conn)
+    end)
+end)
+
+-- P15 目标侧：暂存 → 认领并安装 → 接管连接。三步分开是为了让失败可定位：
+-- 送不到、抢不到锁、网关不认账，三种降级路径不一样
+t.describe("entity_agent 迁移接管", function()
+    local function session_io()
+        return {
+            session_epoch = string.rep("a", 32),
+            session_mode = 1,
+            nonce = "nonce-bytes",
+            sent = 2,
+            acked = 1,
+            out_buf = { [2] = "PACK-2" },
+            out_bytes = 6,
+            resp_cache = {},
+            resp_order = { head = 1, tail = 0 },
+            resp_bytes = 0,
+            min_cached_req_id = 0,
+            owner_epoch = 3,
+            unresumable = false,
+            replaying = false,
+        }
+    end
+
+    local function exported()
+        local source = harness()
+        source.entity.session_io = session_io()
+        local ok, snapshot = source.CMD.entity_call(7, "session_export", "b1", 4)
+        assert(ok)
+        return snapshot
+    end
+
+    t.it("rejects a staged payload without snapshot bytes", function()
+        local h = harness()
+        local ok, err = h.CMD.migration_stage(7, { session_epoch = "x" })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("snapshot is required")
+    end)
+
+    t.it("installs a staged snapshot once the target claims the entity", function()
+        local h = harness()
+        assert(h.CMD.migration_stage(7, exported()))
+        t.expect(h.CMD.migration_commit(7)).to.equal(true)
+        t.expect(h.entity.session_io.owner_epoch).to.equal(4)
+        -- 提交成功即清掉暂存：同一份快照不能被安装第二次
+        local again, err = h.CMD.migration_commit(7)
+        t.expect(again).to.equal(false)
+        t.expect(err).to.equal("no staged snapshot")
+    end)
+
+    -- 安装失败要保留暂存，适配器才能在 FALLBACK 之前重试一次
+    t.it("keeps the staged snapshot when the import is rejected", function()
+        local h = harness()
+        local snapshot = exported()
+        snapshot.bytes = "SKXS" .. string.rep("\0", 60)
+        assert(h.CMD.migration_stage(7, snapshot))
+        local ok = h.CMD.migration_commit(7)
+        t.expect(ok).to.equal(false)
+        t.expect(h.entity.session_io).to.be_nil()
+        assert(h.CMD.migration_stage(7, exported()))
+        t.expect(h.CMD.migration_commit(7)).to.equal(true)
+    end)
+
+    t.it("reports a claim failure instead of installing on another owner", function()
+        local h = harness()
+        assert(h.CMD.migration_stage(7, exported()))
+        h.with_entity_error = "lock held"
+        local ok, err = h.CMD.migration_commit(7)
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("lock held")
+    end)
+
+    t.it("attaches the connection to the new owner and replays", function()
+        local h = harness()
+        h.entity.session_io = session_io()
+        local conn = cid(3)
+        t.expect(h.CMD.session_attach(7, conn)).to.equal(true)
+        t.expect(h.attach_args.owner).to.equal(".entity_agent:role:1")
+        t.expect(h.attach_args.epoch).to.equal(3)
+        t.expect(h.bound[conn]).to.equal(h.entity)
+        t.expect(h.events).to.equal({ "attach", "replay" })
+    end)
+
+    t.it("surfaces an attach refusal", function()
+        local h = harness()
+        h.entity.session_io = session_io()
+        h.attach_ok = false
+        local ok, err = h.CMD.session_attach(7, cid(3))
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("gate rejected the new owner")
+    end)
+end)
+
+-- Outbox 回执：源端把事件推进到 DELIVERED。回执晚到（事件已被清理）也算成功，
+-- 未决结果必须转 retryable，否则可靠消息会 ACK 掉一条没生效的回执
+t.describe("entity_agent Outbox 回执", function()
+    local function with_outbox(reply)
+        local calls = {}
+        local outbox = {
+            mark_delivered = function(ctx, event_id, opts)
+                calls[#calls + 1] = { ctx = ctx, event_id = event_id, opts = opts }
+                return reply[1], reply[2]
+            end,
+        }
+        local h = harness({ module_sources = { ["skyext.outbox"] = outbox } })
+        h.entity.db_coords = { dbname = "demo", dbcoll = "role", key = "rid", unique_id = 7 }
+        h.ack_calls = calls
+        return h
+    end
+
+    t.it("marks the event delivered through the framework command", function()
+        local h = with_outbox({ true })
+        local ok, value = h.CMD.entity_call(7, "outbox_ack", { event_id = "evt_x" })
+        t.expect(ok).to.equal(true)
+        t.expect(value).to.equal(true)
+        t.expect(h.ack_calls[1].event_id).to.equal("evt_x")
+        t.expect(h.ack_calls[1].ctx.unique_id).to.equal(7)
+    end)
+
+    t.it("treats an ack for a cleaned-up event as success", function()
+        local h = with_outbox({ false, "unknown event" })
+        local ok, value = h.CMD.entity_call(7, "outbox_ack", { event_id = "evt_gone" })
+        t.expect(ok).to.equal(true)
+        t.expect(value).to.equal(true)
+    end)
+
+    t.it("turns an undecided result into a retryable delivery fault", function()
+        local h = with_outbox({ nil, "UNKNOWN" })
+        local ok, value = h.CMD.entity_call(7, "outbox_ack", { event_id = "evt_x" })
+        t.expect(ok).to.equal(true)
+        t.expect(require("skyext.entity.delivery").is_retryable(value)).to.equal(true)
     end)
 end)

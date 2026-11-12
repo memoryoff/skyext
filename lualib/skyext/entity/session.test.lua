@@ -92,6 +92,9 @@ local function harness(opts)
             if cmd == "bind" then
                 return h.gate_bind_result ~= false
             end
+            if cmd == "resume_owner" then
+                return h.gate_resume_result ~= false
+            end
             return true
         end,
     }, { __index = skynet })
@@ -109,6 +112,9 @@ local function harness(opts)
             record_call("cluster", node, addr, cmd, ...)
             if cmd == "bind" then
                 return h.gate_bind_result ~= false
+            end
+            if cmd == "resume_owner" then
+                return h.gate_resume_result ~= false
             end
             return true
         end,
@@ -955,5 +961,101 @@ t.describe("owner epoch", function()
         -- 顶号/重登会重建 session_io，代际从头开始；网关的 bind 也会接受更高的新代际
         t.expect(h.session.bind(cid(11), h.entity, OWNER, h.session.MODE_LEGACY)).to.equal(true)
         t.expect(h.entity.session_io.owner_epoch).to.equal(1)
+    end)
+end)
+
+-- P15：目标侧接管。客户端全程没断线，所以不重建会话、不轮换 nonce，
+-- 只把连接挂到新 owner 上并推进 owner_epoch
+t.describe("session 迁移接管", function()
+    local function restored_io(epoch)
+        return {
+            session_epoch = "epoch-a",
+            session_mode = 1,
+            nonce = "nonce-from-source",
+            owner_epoch = epoch,
+            sent = 3,
+            acked = 1,
+            out_buf = { [2] = "PACK-2", [3] = "PACK-3" },
+            out_bytes = 12,
+            resp_cache = {},
+            resp_order = { head = 1, tail = 0 },
+            resp_bytes = 0,
+            min_cached_req_id = 0,
+            last_seen = 0,
+            unresumable = false,
+            replaying = false,
+        }
+    end
+
+    local function find_op(h, cmd)
+        for i = #h.gate_ops, 1, -1 do
+            local op = h.gate_ops[i]
+            local name = op[1] == "cluster" and op[3] or op[2]
+            if name == cmd then
+                return op
+            end
+        end
+    end
+
+    t.it("attaches the live connection and advances the owner epoch", function()
+        local h = harness()
+        h.entity.session_io = restored_io(3)
+        local key = cid(1)
+
+        local ok, err = h.session.attach(key, h.entity, OWNER, 4)
+        t.expect(err).to.be_nil()
+        t.expect(ok).to.equal(true)
+        t.expect(h.entity.session_io.owner_epoch).to.equal(4)
+        t.expect(h.entity.session.key).to.equal(key)
+        -- 网关先认账：resume_owner 带的是新 epoch 与新 owner
+        local op = find_op(h, "resume_owner")
+        t.expect(op[3]).to.equal(key)
+        t.expect(op[4]).to.equal(4)
+        t.expect(op[5]).to.equal(SELF_NODE)
+        t.expect(op[6]).to.equal(OWNER)
+        -- 重放前保持 replaying：新包必须排在旧包后面
+        t.expect(h.entity.session_io.replaying).to.equal(true)
+    end)
+
+    t.it("replays the unacknowledged packets after attaching", function()
+        local h = harness()
+        h.entity.session_io = restored_io(3)
+        assert(h.session.attach(cid(1), h.entity, OWNER, 4))
+        t.expect(h.session.replay(h.entity)).to.equal(true)
+        local out = pushes(h)
+        t.expect(#out).to.equal(2)
+        t.expect(out[1]).to.equal("PACK-2")
+        t.expect(out[2]).to.equal("PACK-3")
+        t.expect(h.entity.session_io.replaying).to.equal(false)
+    end)
+
+    t.it("refuses an epoch that does not advance", function()
+        local h = harness()
+        h.entity.session_io = restored_io(3)
+        local ok, err = h.session.attach(cid(1), h.entity, OWNER, 3)
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("owner epoch must advance")
+        -- 没推进代际就没有所有权切换，网关不该收到任何指令
+        t.expect(find_op(h, "resume_owner")).to.be_nil()
+        t.expect(h.entity.session).to.be_nil()
+    end)
+
+    t.it("leaves the local state untouched when the gate rejects the new owner", function()
+        local h = harness()
+        h.entity.session_io = restored_io(3)
+        h.gate_resume_result = false
+        local ok, err = h.session.attach(cid(1), h.entity, OWNER, 4)
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("gate rejected the new owner")
+        -- 网关不认账时本地不能推进 epoch，否则之后的下行全被当迟到包丢掉
+        t.expect(h.entity.session_io.owner_epoch).to.equal(3)
+        t.expect(h.entity.session).to.be_nil()
+    end)
+
+    t.it("needs a session io to attach to", function()
+        local h = harness()
+        local ok, err = h.session.attach(cid(1), h.entity, OWNER, 2)
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("no session io")
     end)
 end)

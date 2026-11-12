@@ -1,6 +1,6 @@
 # Transactional Outbox 与消息信封（v1）
 
-> **状态：Outbox、调度器、接收方与 Saga 协调者均已实现（P13）。**
+> **状态：Outbox、调度器、接收方、投递闭环（回执/DELIVERED/清理）与 Saga 协调者均已实现（P13）。**
 > 代码：`lualib/skyext/outbox.lua`、`lualib/skyext/outbox_worker.lua`、
 > `lualib/skyext/saga.lua`、`service/outbox_worker.lua`；
 > 用例：`outbox.test.lua`、`outbox_worker.test.lua`、`saga.test.lua`。
@@ -82,10 +82,55 @@ UNKNOWN 时**不隔离玩家资产缓存**。把它和 `CRITICAL_COMMIT_UNKNOWN`
 把 CAS miss 当成 UNKNOWN 会让每一次正常的并发推进都触发隔离；把 UNKNOWN 当成
 CAS miss 则会宣称一个可能没写成功的状态。
 
-`ENQUEUED` 只表示"可靠消息入队已确认"，**不等于接收方已入账**。只有接收方持久化
-ACK 才能推进 `DELIVERED` 或做安全清理；在那之前不能删除唯一可恢复的事件源。
+`ENQUEUED` 只表示"可靠消息入队已确认"，**不等于接收方已入账**。推进 `DELIVERED`
+只能靠接收方的持久化回执（§6.1）。
 
-## 6. 调度器（`outbox_worker`）
+## 6. 投递闭环：回执 → DELIVERED → 清理
+
+没有这一段时 `_critical_outbox_v1` 只增不减，角色撞上 `MAX_OUTBOX` 之后所有关键操作
+被永久拒绝。三个环节各管一件事：
+
+### 6.1 接收方回执
+
+接收方在 `COMMITTED` / `BUSINESS_REJECTED` / `PRECHECK_REJECTED` 之后，用
+`router.reliable_send(source_type, source_id, "outbox_ack", { event_id })` 回执。
+
+- **不轮询**：源端轮询要么得加载离线角色（抢锁、读库），要么在实体队列里跨实体调用，
+  两个角色互相等就是死锁。可靠消息天然持久化，源角色离线时随下次加载投递。
+- **只对终态回执**：`UNKNOWN` / `IN_PROGRESS` / 容量不足都不回执——回执意味着
+  "这件事永远不用再做了"。
+- 回执失败只记日志：业务终态已经落库，源端事件停在 `ENQUEUED`，由容量腾挪兜底。
+
+`outbox_ack` 是**框架命令**，可靠消息投递时经 `handler.resolve`（`handler_of`）解析，
+不只查 `handler.handlers`——否则它永远 "no handler" 并进死信队列。
+
+### 6.2 DELIVERED 回写
+
+`outbox.mark_delivered(ctx, event_id)`：一次 CAS 把状态推进到 `DELIVERED`。
+
+- 允许 `PENDING → DELIVERED`：可靠消息先落库、投递可能比本端状态 CAS 还快，
+  这时回执先到，`transition` 在离开 `PENDING` 时恰好把计数减一次。
+- 幂等：已经是 `DELIVERED` 直接返回成功，不写库。
+- 事件已被清理：回执晚到，同样算成功。
+- `UNKNOWN` 时回 `delivery.retryable`，让可靠消息重投。
+
+### 6.3 清理
+
+两个触发点，都不删 `PENDING`：
+
+| 触发 | 规则 |
+|---|---|
+| 容量不足（`commit_core`） | `DELIVERED` 立即腾；`ENQUEUED` 超过 `OUTBOX_ENQUEUED_RETENTION`（7d）也腾 |
+| `outbox.pump` 收尾（无待发事件） | 只腾超过 `DELIVERED_RETENTION`（7d）的终态事件 |
+
+容量腾挪**必须与新增事件在同一次 CAS**：单独先删会留下"事件没了、资产没提交"。
+删掉 `ENQUEUED` 事件不影响业务效果——可靠消息已经持久化，去重键由 `event_id` 派生，
+接收方照样只执行一次；源端副本只剩观测价值。
+
+指标：`skyext_outbox_acked_total{result}`、`skyext_outbox_delivered_seconds{op_type}`、
+`skyext_outbox_evicted_total{reason}`、`skyext_critical_outbox_evicted_total{reason}`。
+
+## 7. 调度器（`outbox_worker`）
 
 扫描与投递分离，**worker 从不直接写角色文档**：
 
@@ -111,7 +156,7 @@ scan  --(索引 _critical_outbox_pending_count > 0)--> [rid...]
 `skyext_outbox_pump_total{result}`、`skyext_outbox_pending_age_seconds{type}`、
 `skyext_outbox_cas_retry_total{op_type}`。
 
-## 7. 接收方（`outbox.new_receiver`）
+## 8. 接收方（`outbox.new_receiver`）
 
 游戏层的 `__apply_outbox_event` 只需要一行 `return receiver:handle(entity, envelope)`。
 框架在这一层做完四件事：
@@ -134,10 +179,13 @@ scan  --(索引 _critical_outbox_pending_count > 0)--> [rid...]
 `IN_PROGRESS` 和容量不足都是暂态：ACK 掉会让业务永不执行且不再重投，这是最隐蔽的
 丢事件方式。
 
+业务终态的三个分支还会顺带发一条 `outbox_ack` 回执（§6.1），把源端事件推进到
+`DELIVERED`。回执失败不影响本次业务结果，源端事件会停在 `ENQUEUED`。
+
 信封里的 `target_id` 与实体 `id` 用归一化比较（`outbox.id_key`）：BSON 往返后 int64
 会变成字符串，裸 `~=` 会把一个完全合法的信封判成"错投"并永久 ACK。
 
-## 8. Saga 协调者（`skyext.saga`）
+## 9. Saga 协调者（`skyext.saga`）
 
 ```text
 CREATED --reserve--> RESERVED --commit--> COMMITTED
@@ -159,17 +207,18 @@ CREATED --业务拒绝--> FAILED
   `state_lease` 索引。步骤实现（reserve/commit/compensate）由玩法在自己的进程里注入，
   框架不跨进程注册业务 handler。
 
-## 9. 未覆盖
+## 10. 未覆盖
 
 - 归档 worker 已实现（`critical.archive_ops` + `service/critical_maintenance`），
   但**归档吞吐**还没有压测数据；`MAX_OPS` 触顶时的受控拒绝行为只有单测覆盖。
+  预警线在 80%（`critical.CAPACITY_WARN_RATIO`），滞后看
+  `skyext_critical_archive_lag_seconds`。
 - `skyext_outbox_*` / `skyext_saga_*` 指标目前只在本 VM 累加，跨节点汇总依赖
   `.metrics` 抓取。
-- 接收方的 `DELIVERED` 回写（接收端 ACK 后清理源角色 Outbox 条目）尚未实现：
-  当前保留 `ENQUEUED` 条目，清理策略需要与归档 worker 一起设计，避免删掉唯一
-  可恢复事件源。
 - 同角色事件的先后顺序依赖 `created_at`（秒级）+ 本批"遇到失败即停"。同一秒内创建的
   多个事件没有严格顺序；需要严格因果的场景应把多个效果放进**同一次提交**，而不是
   依赖两条事件之间的顺序。
 - Outbox 扫描是 `skip` 分页 + `{pending_count:1}` 偏索引。积压规模很大时应改为
   `{pending_count:1, rid:1}` 复合索引 + keyset 分页。
+- 回执走可靠消息，意味着接收方每条事件多一次 `entity_msg` 写入。压测时要把它算进
+  接收方的写放大，而不是只算业务提交本身。

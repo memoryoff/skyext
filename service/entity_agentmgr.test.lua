@@ -111,6 +111,14 @@ local function new_harness(opts)
             if cmd == "start" then
                 h.agent_starts[#h.agent_starts + 1] = { addr = addr, conf = arg }
             end
+            if cmd == "migration_list" then
+                -- 每个 agent 各报一份已加载实体；"error" 模拟一个 agent 挂了
+                local reply = (h.migration_replies or {})[addr]
+                if reply == "error" then
+                    error("agent gone")
+                end
+                return reply or {}
+            end
             return true
         end,
         uniqueservice = function(name)
@@ -416,5 +424,40 @@ t.describe("entity_agentmgr 预加载", function()
         t.expect(h.preload_timer.cancelled).to.equal(true)
         h.preload_timer.fire()
         t.expect(h.activated).to.equal({ 11 })
+    end)
+end)
+
+-- P15：迁移枚举要跨 agent 聚合。适配器拿到的 `agent_index` 用于显式寻址——
+-- 跨节点迁移时实体还在源节点上，不能用 HRW 路由（那会转回源端）。
+t.describe("entity_agentmgr 迁移枚举", function()
+    t.it("aggregates the loaded entities of every agent", function()
+        local h = new_harness()
+        h.CMD.start()
+        t.expect(#h.agents).to.equal(2)
+        h.migration_replies = {
+            [h.agents[1]] = { { id = 7, conn_id = "conn-7" } },
+            [h.agents[2]] = { { id = 9, conn_id = "conn-9" } },
+        }
+
+        local list = h.CMD.migration_list()
+        t.expect(#list).to.equal(2)
+        t.expect(list[1].id).to.equal(7)
+        t.expect(list[1].agent_index).to.equal(1)
+        t.expect(list[2].id).to.equal(9)
+        t.expect(list[2].agent_index).to.equal(2)
+    end)
+
+    -- 一个 agent 失败只记日志：漏报的实体会按普通卸载处理，比整批枚举失败安全
+    t.it("keeps the rest of the list when one agent fails", function()
+        local h = new_harness()
+        h.CMD.start()
+        h.migration_replies = {
+            [h.agents[1]] = "error",
+            [h.agents[2]] = { { id = 9 } },
+        }
+
+        local list = h.CMD.migration_list()
+        t.expect(#list).to.equal(1)
+        t.expect(list[1].id).to.equal(9)
     end)
 end)

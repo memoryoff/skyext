@@ -31,6 +31,9 @@ local g_seq = 0
 -- 迟到旧 epoch 的下行/绑定计数：迁移期间应当有少量，持续增长说明有 owner 没换 epoch
 local g_stale_pushes = 0
 local g_stale_binds = 0
+-- 迁移屏障期间被丢弃的上行数。屏障窗口应该很短，持续增长说明某个会话卡在
+-- FROZEN 状态没被 resume
+local g_frozen_upstreams = 0
 local m_stale_pushes = metrics.counter(
     "skyext_gate_stale_pushes_total",
     "Downlink packets dropped because of a stale owner epoch",
@@ -38,6 +41,11 @@ local m_stale_pushes = metrics.counter(
 )
 local m_stale_binds =
     metrics.counter("skyext_gate_stale_binds_total", "Owner bind RPCs rejected because of a stale epoch", { "gate" })
+local m_frozen_upstreams = metrics.counter(
+    "skyext_gate_frozen_upstreams_total",
+    "Upstream packets dropped while the session is frozen",
+    { "gate" }
+)
 local m_connections = metrics.gauge("skyext_gate_connections", "Live connections on this gate", { "gate" })
 
 local g_self_node
@@ -100,6 +108,13 @@ function handler.message(fd, msg, sz)
     local conn_id = g_by_fd[fd]
     local session = conn_id and g_sessions[conn_id]
     if not session then
+        return
+    end
+    if not gate_owner.upstream_allowed(session) then
+        -- 迁移屏障期间的上行直接丢弃：这个 owner 已经把会话交出去了，
+        -- 再转给它就是让它在一个无权落库的实体上执行业务
+        g_frozen_upstreams = g_frozen_upstreams + 1
+        m_frozen_upstreams:inc(1, { gate = "tcp" })
         return
     end
     if session.owner_node then
@@ -240,7 +255,11 @@ end
 
 -- 只读观测：迟到包/绑定的累计次数
 function CMD.stats()
-    return { stale_pushes = g_stale_pushes, stale_binds = g_stale_binds }
+    return {
+        stale_pushes = g_stale_pushes,
+        stale_binds = g_stale_binds,
+        frozen_upstreams = g_frozen_upstreams,
+    }
 end
 
 -- 只读观测：fd 当前对应的 conn_id（测试需要，生产调用方不应依赖 fd）

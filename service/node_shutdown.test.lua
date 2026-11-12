@@ -28,12 +28,23 @@ local function harness(opts)
             end
             return true
         end,
+        -- 只记录、不等待：停服里的 cancel 是单向通知
+        send = function(addr, _, cmd, ...)
+            h.sent = h.sent or {}
+            h.sent[#h.sent + 1] = { addr, cmd, ... }
+        end,
+        sleep = function(ticks)
+            h.slept = (h.slept or 0) + (ticks or 0)
+        end,
         localname = function(name)
             return (opts.local_names or {})[name]
         end,
-        -- fork 默认内联执行；defer_fork 时只排队，模拟停服还在进行中
+        -- fork 默认内联执行；defer_fork 时全部排队，
+        -- defer_fork_after 只让第 N 个之后的排队（模拟某个钩子卡住不返回）
         fork = function(f, ...)
-            if h.defer_fork then
+            h.fork_count = (h.fork_count or 0) + 1
+            local defer = h.defer_fork or (h.defer_fork_after and h.fork_count > h.defer_fork_after)
+            if defer then
                 h.deferred = h.deferred or {}
                 h.deferred[#h.deferred + 1] = f
                 return
@@ -220,5 +231,28 @@ t.describe("node_shutdown 计划内迁移", function()
         h.CMD.shutdown()
         t.expect(h.aborted).to.equal(true)
         t.expect(logged(h, "warn:shutdown hook failed")).to.equal(true)
+    end)
+end)
+
+-- 迁移钩子超时后必须显式取消：只停止等待的话，迁移协程还在跑，
+-- 而卸载已经并行开始——源实体被卸掉之后迁移还在写
+t.describe("node_shutdown 迁移截止", function()
+    t.it("tells a stuck migrate hook to cancel when the deadline passes", function()
+        local h = harness()
+        h.CMD.add_hook("migrate", ":migration", "run")
+        -- 第 1 个 fork 是停服主流程，第 2 个是迁移钩子：让它卡住不返回
+        h.defer_fork_after = 1
+
+        h.CMD.shutdown(2)
+        t.expect(h.sent).to.equal({ { ":migration", "cancel", "shutdown deadline" } })
+        t.expect(#h.logs > 0).to.equal(true)
+    end)
+
+    t.it("does not send a cancel when the hook finishes in time", function()
+        local h = harness()
+        h.CMD.add_hook("migrate", ":migration", "run")
+
+        h.CMD.shutdown(2)
+        t.expect(h.sent).to.be_nil()
     end)
 end)

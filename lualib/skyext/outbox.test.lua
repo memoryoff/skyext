@@ -70,7 +70,7 @@ end
 local function harness(overrides)
     local doc = orm.new(role_schema(), { rid = 7, _version = 0, gold = 100 })
     local store = { doc = doc, critical = {} }
-    local h = { doc = doc, store = store, now = 1700000000 }
+    local h = { doc = doc, store = store, now = 1700000000, acks = {} }
     h.dbmgr = fake_dbmgr(store)
     h.critical_override = overrides and overrides.critical
     h.ctx = {
@@ -91,6 +91,15 @@ local function harness(overrides)
             end
             if name == "skyext.log" then
                 return { debug = function() end, info = function() end, warn = function() end, error = function() end }
+            end
+            -- 回执走可靠消息：单元测试里只记录，不碰数据库
+            if name == "skyext.entity.router" then
+                return {
+                    reliable_send = function(type_name, id, cmd, args)
+                        h.acks[#h.acks + 1] = { type_name = type_name, id = id, cmd = cmd, args = args }
+                        return "msg-ack"
+                    end,
+                }
             end
             return require(name)
         end,
@@ -474,6 +483,13 @@ t.describe("outbox 接收方", function()
         t.expect(call.opts.source_id).to.equal("role:9")
         -- cap 必须是真实签发的对象，字符串 source 不构成鉴权
         t.expect(require("skyext.capability").is_cap(call.opts.capability)).to.equal(true)
+
+        -- 业务终态必须回执：没有它源端事件永远停在 ENQUEUED，最终撞容量上限
+        t.expect(#h.acks).to.equal(1)
+        t.expect(h.acks[1].cmd).to.equal("outbox_ack")
+        t.expect(h.acks[1].type_name).to.equal("role")
+        t.expect(h.acks[1].id).to.equal(9)
+        t.expect(h.acks[1].args.event_id).to.equal(EVENT)
     end)
 
     -- UNKNOWN 是环境暂态：转成 retryable，让可靠消息保留 pending 而不是进 DLQ
@@ -483,6 +499,8 @@ t.describe("outbox 接收方", function()
         h.holder.result = { status = "UNKNOWN", reason = "mongo down" }
         local value = h.receiver:handle(h.entity, h.envelope(), {})
         t.expect(delivery.is_retryable(value)).to.equal(true)
+        -- 没有终态就不能回执：回执意味着"这件事永远不用再做了"
+        t.expect(#h.acks).to.equal(0)
     end)
 
     t.it("rejects an envelope addressed to another entity", function()
@@ -636,5 +654,82 @@ t.describe("outbox 接收方状态映射", function()
             h.receiver:handle(h.entity, h.envelope(), {})
         end)
         t.expect(ok).to.equal(false)
+    end)
+end)
+
+-- 投递闭环：接收方回执 -> DELIVERED -> 清理。
+-- 没有这一段时 `_critical_outbox_v1` 只增不减，角色撞上 MAX_OUTBOX 后
+-- 关键操作会被永久拒绝
+t.describe("outbox 投递闭环", function()
+    local function eid(ch)
+        return "evt_" .. string.rep(ch, 64)
+    end
+
+    t.it("marks an enqueued event delivered and stays idempotent", function()
+        local h = harness()
+        h.seed({
+            {
+                event_id = EVENT,
+                status = "ENQUEUED",
+                created_at = h.now - 10,
+                updated_at = h.now - 10,
+                op_type = "mail.send",
+            },
+        }, 0)
+
+        t.expect(h.outbox.mark_delivered(h.ctx, EVENT, { now = h.now })).to.equal(true)
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].status).to.equal("DELIVERED")
+        t.expect(#h.store.cas).to.equal(1)
+
+        -- 重复回执（可靠消息重投）：不再写库
+        t.expect(h.outbox.mark_delivered(h.ctx, EVENT, { now = h.now })).to.equal(true)
+        t.expect(#h.store.cas).to.equal(1)
+    end)
+
+    -- 回执可能比本端的状态 CAS 更早到：PENDING 直接到 DELIVERED，计数只减一次
+    t.it("acks an event that is still pending without double counting", function()
+        local h = harness()
+        h.seed({ { event_id = EVENT, status = "PENDING", created_at = h.now - 10, op_type = "mail.send" } }, 1)
+        assert(h.outbox.mark_delivered(h.ctx, EVENT, { now = h.now }))
+        t.expect(h.store.critical._critical_outbox_pending_count).to.equal(0)
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].status).to.equal("DELIVERED")
+    end)
+
+    t.it("treats an ack for a cleaned-up event as a late delivery", function()
+        local h = harness()
+        h.seed({}, 0)
+        local ok, err = h.outbox.mark_delivered(h.ctx, eid("f"), { now = h.now })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("unknown event")
+        t.expect(#(h.store.cas or {})).to.equal(0)
+    end)
+
+    t.it("cleans up delivered and expired events but never pending ones", function()
+        local week = 8 * 24 * 3600
+        local h = harness()
+        h.seed({
+            { event_id = eid("a"), status = "DELIVERED", updated_at = h.now - week, op_type = "mail.send" },
+            { event_id = eid("b"), status = "DELIVERED", updated_at = h.now - 60, op_type = "mail.send" },
+            { event_id = eid("c"), status = "ENQUEUED", updated_at = h.now - week, op_type = "mail.send" },
+            { event_id = eid("d"), status = "PENDING", created_at = h.now - week, op_type = "mail.send" },
+        }, 1)
+
+        local removed = h.outbox.cleanup(h.ctx, { now = h.now })
+        t.expect(removed).to.equal(2)
+        local box = h.store.critical._critical_outbox_v1
+        t.expect(box[eid("a")]).to.be_nil()
+        t.expect(box[eid("c")]).to.be_nil()
+        -- 刚投递的留着审计，没投出去的永远不删
+        t.expect(box[eid("b")]).to.exist()
+        t.expect(box[eid("d")]).to.exist()
+        -- 一批删除只推进一次 _version
+        t.expect(#h.store.cas).to.equal(1)
+    end)
+
+    t.it("does not write anything when there is nothing to clean", function()
+        local h = harness()
+        h.seed({ { event_id = EVENT, status = "DELIVERED", updated_at = h.now, op_type = "mail.send" } }, 0)
+        t.expect(h.outbox.cleanup(h.ctx, { now = h.now })).to.equal(0)
+        t.expect(#(h.store.cas or {})).to.equal(0)
     end)
 end)

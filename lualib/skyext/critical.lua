@@ -36,6 +36,10 @@ M.STATUS = {
     OP_CONFLICT = "OP_CONFLICT",
     EXPIRED = "EXPIRED",
     INTERNAL_AUTH_DENIED = "INTERNAL_AUTH_DENIED",
+    -- 纯读预检（validate）自身抛错：**没有**进入 PREPARE，也没有任何持久化写入。
+    -- 不能复用 UNKNOWN —— 那是"可能写了"，会触发隔离与恢复任务，而查询侧只会看到
+    -- NOT_STARTED，调用方拿到的两个答案互相矛盾
+    INTERNAL_ERROR = "INTERNAL_ERROR",
     UNKNOWN = "UNKNOWN",
     -- 只出现在 query 结果里
     NOT_STARTED = "NOT_STARTED",
@@ -61,6 +65,15 @@ M.ARCHIVE_SETTLED = {
 -- 和 `_critical_ops_v1` 共享 512 KiB 的关键字段预算，无上限增长会让角色
 -- 在下次加载时直接 fail-closed
 M.MAX_OUTBOX = 512
+
+-- 已投递 / 停在 ENQUEUED 的事件的保留期。到达上限时**不等**保留期：
+-- 先腾掉这些事件让新事件进来（见 evictable_outbox_events）
+M.OUTBOX_DELIVERED_RETENTION = 7 * 24 * 3600
+M.OUTBOX_ENQUEUED_RETENTION = 7 * 24 * 3600
+
+-- 容量预警线：到 80% 就告警，给归档与清理留出反应时间。
+-- 触顶是受控拒绝（不是自动扩容），所以必须提前看到趋势
+M.CAPACITY_WARN_RATIO = 0.8
 
 -- 与 sproto_api 的缓存处置保持同一组字面量：PRECHECK_REJECTED / UNKNOWN 是瞬时结果，
 -- 一旦进 L1 就会被固定成"永远拒绝"或"永远未知"
@@ -100,6 +113,16 @@ local m_decisions =
 local m_quarantined =
     metrics.counter("skyext_critical_quarantined_total", "Critical caches quarantined by reason", { "reason" })
 local m_archive = metrics.counter("skyext_critical_archive_total", "Critical op archive attempts", { "result" })
+local m_outbox_evicted = metrics.counter(
+    "skyext_critical_outbox_evicted_total",
+    "Outbox events evicted from the source document to make room",
+    { "reason" }
+)
+local m_capacity_warn = metrics.counter(
+    "skyext_critical_capacity_warning_total",
+    "Entities that crossed the critical capacity warning line",
+    { "kind" }
+)
 local m_same_owner_resume = metrics.counter(
     "skyext_critical_same_owner_resume_total",
     "Critical operations resumed by the same owner after a PREPARE",
@@ -199,6 +222,47 @@ local function validate_outbox_events(events)
     return true
 end
 M.validate_outbox_events = validate_outbox_events
+
+-- 容量不足时可以腾掉哪些事件（最老的在前，最多 need 个）：
+--   DELIVERED  终态，只用于审计，随时可删
+--   ENQUEUED   超过保留期说明接收方长期没上线；可靠消息已经把消息持久化，
+--              源端副本删掉不影响业务效果（去重键由 event_id 派生）
+--   PENDING    永不腾：它还没投出去
+-- 状态字面量来自 skyext.outbox.STATUS；这里不 require outbox，避免循环依赖
+function M.evictable_outbox_events(outbox_table, now, need, opts)
+    opts = opts or {}
+    if type(need) ~= "number" or need <= 0 then
+        return {}
+    end
+    local delivered_retention = opts.delivered_retention or 0
+    local enqueued_retention = opts.enqueued_retention or M.OUTBOX_ENQUEUED_RETENTION
+    local list = {}
+    for event_id, event in pairs(outbox_table or {}) do
+        if type(event) == "table" then
+            local age = now - (event.updated_at or event.created_at or now)
+            local evict
+            if event.status == "DELIVERED" then
+                evict = age >= delivered_retention
+            elseif event.status == "ENQUEUED" then
+                evict = age >= enqueued_retention
+            end
+            if evict then
+                list[#list + 1] = { id = event_id, age = age }
+            end
+        end
+    end
+    table.sort(list, function(a, b)
+        if a.age ~= b.age then
+            return a.age > b.age
+        end
+        return a.id < b.id
+    end)
+    local out = {}
+    for i = 1, math.min(#list, need) do
+        out[i] = list[i].id
+    end
+    return out
+end
 
 -- ---------------------------------------------------------------------------
 -- 上下文与决策
@@ -470,10 +534,29 @@ local function commit_core(ctx, req, handlers)
         log.error("critical op ledger is full", "rid", tostring(ctx.rid), "count", op_count, "max", M.MAX_OPS)
         return decision(M.STATUS.CAPACITY_EXCEEDED, nil, M.NO_CACHE, { reason = "critical op ledger is full" })
     end
+    if op_count >= M.MAX_OPS * M.CAPACITY_WARN_RATIO then
+        -- 只告警一次（按实体）：否则 80% 之后每条操作都刷一行
+        if ctx.entity and not ctx.entity.capacity_warned_ops then
+            ctx.entity.capacity_warned_ops = true
+            m_capacity_warn:inc(1, { kind = "ops" })
+            log.warn(
+                "critical op ledger is approaching capacity",
+                "rid",
+                tostring(ctx.rid),
+                "count",
+                op_count,
+                "max",
+                M.MAX_OPS
+            )
+        end
+    end
 
     -- 源侧 Outbox：与资产增量进同一次 CAS。形状/容量在 PREPARE 之前校验，
     -- 免得把一条投递端永远解析不了的事件写进文档
     local new_events = req.outbox
+    -- 容量不足时腾掉的事件：必须和 COMMIT 写在同一次 CAS 里，
+    -- 单独先删会让"删了事件但资产没提交"变成一个新的不一致
+    local evicted_events
     if new_events ~= nil then
         local ok, oerr = validate_outbox_events(new_events)
         if not ok then
@@ -483,6 +566,38 @@ local function commit_core(ctx, req, handlers)
         local existing_events = 0
         for _ in pairs(critical[M.OUTBOX_FIELD] or {}) do
             existing_events = existing_events + 1
+        end
+        if existing_events + #new_events > M.MAX_OUTBOX then
+            -- 先腾终态/超期事件：DELIVERED 只是审计，留着不如让新事件进来。
+            -- 不这么做的话，事件只增不减，这个角色最终会被永久拒绝
+            local need = existing_events + #new_events - M.MAX_OUTBOX
+            evicted_events = M.evictable_outbox_events(critical[M.OUTBOX_FIELD], req.now, need)
+            existing_events = existing_events - #evicted_events
+            if #evicted_events > 0 then
+                m_outbox_evicted:inc(#evicted_events, { reason = "capacity" })
+                log.warn(
+                    "outbox is at capacity, evicting settled events",
+                    "rid",
+                    tostring(ctx.rid),
+                    "evicted",
+                    #evicted_events
+                )
+            end
+        elseif existing_events >= M.MAX_OUTBOX * M.CAPACITY_WARN_RATIO then
+            -- 预警只打一次（按实体）：80% 之后每条操作都刷一行会把日志淹掉
+            if ctx.entity and not ctx.entity.capacity_warned_outbox then
+                ctx.entity.capacity_warned_outbox = true
+                m_capacity_warn:inc(1, { kind = "outbox" })
+                log.warn(
+                    "critical outbox is approaching capacity",
+                    "rid",
+                    tostring(ctx.rid),
+                    "count",
+                    existing_events,
+                    "max",
+                    M.MAX_OUTBOX
+                )
+            end
         end
         if existing_events + #new_events > M.MAX_OUTBOX then
             log.error(
@@ -502,8 +617,10 @@ local function commit_core(ctx, req, handlers)
     if handlers.validate then
         local ok, pass, rejection = pcall(handlers.validate, ctx.entity, req.params)
         if not ok then
+            -- 这里还没进 PREPARE，库里的状态仍然是"没执行过"。报 UNKNOWN 会让调用方
+            -- 去查恢复任务、隔离缓存，而 critical.query 只会回 NOT_STARTED
             log.error("critical validate raised", "op_id", req.op_id, "err", pass)
-            return decision(M.STATUS.UNKNOWN, nil, M.NO_CACHE, { reason = "validate raised" })
+            return decision(M.STATUS.INTERNAL_ERROR, nil, M.NO_CACHE, { reason = "validate raised" })
         end
         if pass ~= true then
             return decision(M.STATUS.PRECHECK_REJECTED, rejection, M.NO_CACHE)
@@ -607,6 +724,12 @@ local function commit_core(ctx, req, handlers)
             end
             write["$set"][M.OUTBOX_PENDING_FIELD] = (critical[M.OUTBOX_PENDING_FIELD] or 0) + #new_events
         end
+        if evicted_events and #evicted_events > 0 then
+            -- 与新增事件同一次写入：容量腾挪不能单独提交
+            for _, event_id in ipairs(evicted_events) do
+                write["$unset"][M.OUTBOX_FIELD .. "." .. event_id] = true
+            end
+        end
         -- 归档扫描的索引字段：只增不减的最小值。归档自己会重算，
         -- 这里只需要保证"还有一条老操作没归档"时它不会被漏掉
         local oldest = critical[M.OPS_OLDEST_FIELD]
@@ -693,6 +816,12 @@ local function commit_core(ctx, req, handlers)
             critical[M.OUTBOX_FIELD][ev.event_id] = copy_value(ev, 3)
         end
         critical[M.OUTBOX_PENDING_FIELD] = (critical[M.OUTBOX_PENDING_FIELD] or 0) + #new_events
+    end
+    if applied == true and evicted_events and #evicted_events > 0 and critical[M.OUTBOX_FIELD] then
+        -- 内存副本也要删：库里已经 $unset，留着会让下一次容量判断少腾一条
+        for _, event_id in ipairs(evicted_events) do
+            critical[M.OUTBOX_FIELD][event_id] = nil
+        end
     end
     dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, critical, ctx.handle)
     local ended, end_err = dbmgr.end_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, ctx.handle, true)
@@ -879,8 +1008,16 @@ function M.query(entity, op_id, opts)
     local op = lookup_op(critical, op_id)
     if not op and opts.ledger then
         -- 热条目已经被归档：不查冷账本就会把"已提交"报成"没执行"，
-        -- 那会让调用方重放一次本该只执行一次的操作
-        local archived, aerr = opts.ledger:critical_find({ rid = ctx.rid, op_id = op_id }, { _id = false })
+        -- 那会让调用方重放一次本该只执行一次的操作。
+        -- 驱动抛错与返回 err 一样处理：读失败不等于没有记录，必须回结构化 UNKNOWN
+        -- （提交路径的同一处查询用的是 pcall，这里不能比它更弱）
+        local called, archived, aerr = pcall(opts.ledger.critical_find, opts.ledger, {
+            rid = ctx.rid,
+            op_id = op_id,
+        }, { _id = false })
+        if not called then
+            return { status = M.STATUS.UNKNOWN, reason = "ledger read raised: " .. tostring(archived) }
+        end
         if archived == nil and aerr ~= nil then
             -- 读失败不等于没有记录
             return { status = M.STATUS.UNKNOWN, reason = "ledger read failed: " .. tostring(aerr) }

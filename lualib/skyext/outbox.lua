@@ -37,6 +37,12 @@ M.DEFAULT_LIMIT = 16
 -- 状态 CAS 的读后像重试次数。CAS 未命中是版本/条件冲突，不是 UNKNOWN，
 -- 但也不能无限重试：有界退让后保持 PENDING，交给下一轮扫描
 M.CAS_RETRY = 2
+-- 已投递事件的保留期：DELIVERED 只用于审计，过期就能删。
+-- 容量不足时不等保留期，直接腾（见 critical.commit_core）
+M.DELIVERED_RETENTION = 7 * 24 * 3600
+-- 停在 ENQUEUED 多久算"送不到了"。可靠消息已经把消息持久化，
+-- 源端副本只用于观测；接收方长期不上线时，不能让这份副本把关键字段占满
+M.ENQUEUED_RETENTION = 7 * 24 * 3600
 
 local m_enqueued =
     metrics.counter("skyext_outbox_enqueued_total", "Outbox events whose reliable message was confirmed", { "op_type" })
@@ -51,6 +57,14 @@ local m_cas_retry = metrics.counter(
     "Outbox status CAS retried after a version/condition conflict",
     { "op_type" }
 )
+local m_acked = metrics.counter("skyext_outbox_acked_total", "Outbox events acknowledged by the receiver", { "result" })
+local m_delivered_age = metrics.histogram(
+    "skyext_outbox_delivered_seconds",
+    "Seconds from outbox event creation to receiver ack",
+    { "op_type" }
+)
+local m_evicted =
+    metrics.counter("skyext_outbox_evicted_total", "Outbox events removed from the source document", { "reason" })
 
 local function hex(bytes)
     return (bytes:gsub(".", function(c)
@@ -343,7 +357,7 @@ function M.pump(ctx, deliver, opts)
         m_pending:set(0, { type = ctx.dbcoll })
         stats.pending = 0
         stats.oldest_age = 0
-        return stats
+        return M._finish_pump(ctx, now, stats)
     end
     m_pending:set(M.count_pending(critical_table), { type = ctx.dbcoll })
 
@@ -387,6 +401,20 @@ function M.pump(ctx, deliver, opts)
     stats.pending = M.count_pending(critical_table)
     stats.oldest_age = M.oldest_age(critical_table, now)
     m_pending:set(stats.pending, { type = ctx.dbcoll })
+    return M._finish_pump(ctx, now, stats)
+end
+
+-- 一轮收尾：没有待发事件时顺手清一次终态事件，活跃角色不会攒下一堆 DELIVERED。
+-- 清理失败不影响本轮投递结果，下一轮再试
+function M._finish_pump(ctx, now, stats)
+    if stats.pending == 0 then
+        local cleaned, cerr = M.cleanup(ctx, { now = now })
+        if cleaned then
+            stats.cleaned = cleaned
+        elseif cerr then
+            log.warn("outbox cleanup skipped", "err", tostring(cerr))
+        end
+    end
     return stats
 end
 
@@ -465,6 +493,165 @@ function M._advance(ctx, event, critical_table, now, max_retry, stats)
     stats.failed = stats.failed + 1
     log.warn("outbox status cas retries exhausted", "event", event.event_id)
     return nil, "REJECTED"
+end
+
+-- ---------------------------------------------------------------------------
+-- 投递闭环：接收方回执 -> DELIVERED -> 清理
+--
+-- 没有这一段时 `_critical_outbox_v1` 只增不减，撞上 MAX_OUTBOX 之后该角色的
+-- 关键操作会被永久拒绝（CAPACITY_EXCEEDED）。
+-- ---------------------------------------------------------------------------
+
+-- 可清理的事件，最老的在前。
+--   DELIVERED  终态，随时可删（`delivered_retention` 只是给审计留的时间）
+--   ENQUEUED   超过保留期说明接收方长期没上线；可靠消息已经持久化，源端副本删掉
+--              不影响业务效果（去重键由 event_id 派生，接收方照样只执行一次）
+--   PENDING    永不删：它还没投出去
+function M.evictable(critical_table, now, opts)
+    opts = opts or {}
+    -- 定期清理按保留期来；容量压力下由 critical.evictable_outbox_events 传 0
+    local delivered_retention = opts.delivered_retention or M.DELIVERED_RETENTION
+    local enqueued_retention = opts.enqueued_retention or M.ENQUEUED_RETENTION
+    local outbox = outbox_of(critical_table)
+    if not outbox then
+        return {}
+    end
+    local list = {}
+    for event_id, event in pairs(outbox) do
+        if type(event) == "table" then
+            local age = now - (event.updated_at or event.created_at or now)
+            local evict
+            if event.status == M.STATUS.DELIVERED then
+                evict = age >= delivered_retention
+            elseif event.status == M.STATUS.ENQUEUED then
+                evict = age >= enqueued_retention
+            end
+            if evict then
+                list[#list + 1] = { event_id = event_id, status = event.status, age = age }
+            end
+        end
+    end
+    table.sort(list, function(a, b)
+        if a.age ~= b.age then
+            return a.age > b.age
+        end
+        return a.event_id < b.event_id
+    end)
+    return list
+end
+
+-- 接收方回执：把事件推进到 DELIVERED（终态），可重复调用。
+--
+-- 允许 PENDING -> DELIVERED：可靠消息先落库、投递可能比本端的状态 CAS 还快，
+-- 这时回执先到，`transition` 会在离开 PENDING 时恰好把 pending_count 减一次。
+function M.mark_delivered(ctx, event_id, opts)
+    opts = opts or {}
+    if type(event_id) ~= "string" then
+        return nil, "event_id is required"
+    end
+    local now = opts.now or os.time()
+    for _ = 1, M.CAS_RETRY + 1 do
+        local critical_table = dbmgr.cached_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id)
+        if not critical_table then
+            return nil, "document not loaded"
+        end
+        local event = (critical_table[M.FIELD] or {})[event_id]
+        if type(event) ~= "table" then
+            -- 回执晚到：事件已经被清理。终态早已确定，没有副作用
+            m_acked:inc(1, { result = "gone" })
+            return false, "unknown event"
+        end
+        if event.status == M.STATUS.DELIVERED then
+            m_acked:inc(1, { result = "already" })
+            return true
+        end
+        local next_table = M.transition(critical_table, event_id, M.STATUS.DELIVERED, now)
+        if not next_table then
+            return false, "unknown event"
+        end
+        local state, detail = dbmgr.critical_update(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, ctx.doc._version, {
+            ["$set"] = {
+                [M.FIELD .. "." .. event_id] = next_table[M.FIELD][event_id],
+                [M.PENDING_COUNT_FIELD] = next_table[M.PENDING_COUNT_FIELD],
+            },
+        }, {
+            handle = ctx.handle,
+            -- 元数据状态，不是资产提交：UNKNOWN 不能把玩家资产隔离掉
+            metadata_only = true,
+            extra_query = { [M.FIELD .. "." .. event_id .. ".status"] = event.status },
+        })
+        if state == "CONFIRMED" then
+            dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, next_table, ctx.handle)
+            m_acked:inc(1, { result = "confirmed" })
+            if math.type(event.created_at) == "integer" and math.type(now) == "integer" then
+                m_delivered_age:observe(math.max(0, now - event.created_at), { op_type = event.op_type or "unknown" })
+            end
+            return true
+        end
+        if state == "UNKNOWN" then
+            -- 写入可能已经生效：回执本身幂等，让可靠消息重投即可
+            local refreshed, rerr =
+                dbmgr.refresh_critical(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, { handle = ctx.handle })
+            if not refreshed then
+                log.error("outbox ack refresh failed", "event", event_id, "err", tostring(rerr))
+            end
+            return nil, "UNKNOWN"
+        end
+        if not CAS_MISS[detail] then
+            log.error("outbox ack blocked", "event", event_id, "detail", tostring(detail))
+            return nil, "BLOCKED"
+        end
+        m_cas_retry:inc(1, { op_type = event.op_type or "unknown" })
+    end
+    return nil, "CAS retries exhausted"
+end
+
+-- 删掉过期事件。返回删除数量；没东西可删时返回 0（不写库）。
+-- 一次 CAS 删一批：逐条删会把 `_version` 推进多次，和业务提交抢版本
+function M.cleanup(ctx, opts)
+    opts = opts or {}
+    local now = opts.now or os.time()
+    local critical_table = dbmgr.cached_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id)
+    if not critical_table then
+        return nil, "document not loaded"
+    end
+    local victims = M.evictable(critical_table, now, opts)
+    if #victims == 0 then
+        return 0
+    end
+    local unset = {}
+    local next_field = {}
+    for event_id, event in pairs(critical_table[M.FIELD] or {}) do
+        next_field[event_id] = event
+    end
+    for _, victim in ipairs(victims) do
+        unset[M.FIELD .. "." .. victim.event_id] = true
+        next_field[victim.event_id] = nil
+    end
+    local state, detail = dbmgr.critical_update(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, ctx.doc._version, {
+        ["$unset"] = unset,
+    }, {
+        handle = ctx.handle,
+        metadata_only = true,
+    })
+    if state ~= "CONFIRMED" then
+        if state == "UNKNOWN" then
+            dbmgr.refresh_critical(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, { handle = ctx.handle })
+            return nil, "UNKNOWN"
+        end
+        return nil, tostring(detail)
+    end
+    local next_table = {}
+    for k, v in pairs(critical_table) do
+        next_table[k] = v
+    end
+    next_table[M.FIELD] = next_field
+    dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, next_table, ctx.handle)
+    for _, victim in ipairs(victims) do
+        m_evicted:inc(1, { reason = victim.status == M.STATUS.DELIVERED and "delivered" or "enqueued_expired" })
+    end
+    log.info("outbox events cleaned up", "count", #victims)
+    return #victims
 end
 
 -- ---------------------------------------------------------------------------
@@ -581,7 +768,10 @@ function RECEIVER_MT:handle(entity, envelope, handlers, opts)
         or status == critical.STATUS.BUSINESS_REJECTED
         or status == critical.STATUS.PRECHECK_REJECTED
     then
-        -- 业务终态：已持久化的提交，或确定不会产生副作用的拒绝
+        -- 业务终态：已持久化的提交，或确定不会产生副作用的拒绝。
+        -- 回执给源端，让它把事件推进到 DELIVERED —— 没有这一步源角色的
+        -- `_critical_outbox_v1` 只增不减，最终会撞上容量上限
+        self:ack_source(envelope)
         return result
     end
     if
@@ -596,6 +786,42 @@ function RECEIVER_MT:handle(entity, envelope, handlers, opts)
     -- 契约/鉴权类失败（同 op 换参数、cap 不符）：不是环境暂态，也不该静默 ACK。
     -- 抛出去让可靠消息按失败次数进死信队列，人工可见
     error("outbox event rejected: " .. tostring(status) .. " (" .. tostring(result.reason) .. ")", 0)
+end
+
+-- 回执：走可靠消息发给源实体，源端在 outbox_ack 里把事件推进到 DELIVERED。
+--
+-- 为什么不用"源端轮询接收方"：那要么让源端加载离线角色（抢锁、读库），要么在
+-- 实体队列里跨实体调用，两个角色互相等就成了死锁。可靠消息天然持久化，
+-- 源角色离线时随下次加载投递。
+--
+-- 回执失败只记日志：业务终态已经落库，源端事件会停在 ENQUEUED，
+-- 由容量腾挪与保留期清理兜底，不影响这次业务结果。
+function RECEIVER_MT:ack_source(envelope)
+    local source_type = envelope.source_type
+    local source_id = envelope.source_id
+    if type(source_type) ~= "string" or source_type == "" or source_id == nil then
+        -- 旧信封没有来源信息：无法回执，只能靠保留期清理
+        return false
+    end
+    local called, ok = pcall(function()
+        local router = require "skyext.entity.router"
+        return router.reliable_send(source_type, source_id, "outbox_ack", {
+            event_id = envelope.event_id,
+        })
+    end)
+    if not called or not ok then
+        log.warn(
+            "outbox ack could not be queued",
+            "event",
+            tostring(envelope.event_id),
+            "source",
+            tostring(source_type) .. ":" .. tostring(source_id),
+            "err",
+            tostring(ok)
+        )
+        return false
+    end
+    return true
 end
 
 return M

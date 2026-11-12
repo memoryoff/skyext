@@ -28,6 +28,9 @@ local function harness(opts)
                 if cmd == "start" then
                     return opts.start_ok ~= false, opts.start_err
                 end
+                if cmd == "is_ready" then
+                    return opts.ready ~= false
+                end
                 return true
             end,
             kill = function(addr)
@@ -83,6 +86,7 @@ t.describe("launcher 可选服务接线", function()
     t.it("starts nothing optional without an explicit enable", function()
         local h = harness({ conf = { outbox_worker = { interval = 1 }, pay_callback = { port = 8090 } } })
         h.launcher.launcher_node()
+        h.launcher.launch_optional_services()
         t.expect(h.services).to.equal({ "metrics", "gm", "hotfix", "mongo_index" })
         t.expect(started_optional(h)).to.equal({})
         t.expect(h.shutdown_started).to.equal(true)
@@ -97,6 +101,7 @@ t.describe("launcher 可选服务接线", function()
             },
         })
         h.launcher.launcher_node()
+        h.launcher.launch_optional_services()
         t.expect(h.services).to.equal({
             "metrics",
             "gm",
@@ -110,6 +115,40 @@ t.describe("launcher 可选服务接线", function()
         t.expect(h.calls[#h.calls - 1].args[1].interval).to.equal(5)
     end)
 
+    -- P0-03：依赖实体路由的后台服务不能先于实体系统启动，否则第一轮全部扫不到 owner
+    t.it("keeps the optional services out of launcher_node", function()
+        local h = harness({
+            conf = {
+                outbox_worker = { enabled = true },
+                critical_maintenance = { enabled = true },
+                pay_callback = { enabled = true },
+                migration = { enabled = true, adapter = "game.migration_adapter" },
+            },
+        })
+        h.launcher.launcher_node()
+        t.expect(h.services).to.equal({ "metrics", "gm", "hotfix", "mongo_index" })
+        t.expect(started_optional(h)).to.equal({})
+    end)
+
+    t.it("brings up every entity type and waits for readiness before returning", function()
+        local h = harness({ conf = { gate_port = 9001 } })
+        h.launcher.launcher_entities({ "role", "rank" })
+        t.expect(h.services).to.equal({ "entity_agentmgr", "entity_agentmgr" })
+        local cmds = {}
+        for _, call in ipairs(h.calls) do
+            cmds[#cmds + 1] = call.cmd
+        end
+        t.expect(cmds).to.equal({ "start", "is_ready", "start", "is_ready" })
+    end)
+
+    t.it("refuses to report an entity system that is not ready", function()
+        local h = harness({ ready = false })
+        t.expect(function()
+            h.launcher.launcher_entities({ "role" })
+        end).to
+            .throw("entity system role is not ready after start")
+    end)
+
     t.it("refuses to bring the node up when an enabled service fails its index gate", function()
         local h = harness({
             conf = { outbox_worker = { enabled = true } },
@@ -117,7 +156,7 @@ t.describe("launcher 可选服务接线", function()
             start_err = "index gate failed",
         })
         t.expect(function()
-            h.launcher.launcher_node()
+            h.launcher.launch_optional_services()
         end).to
             .throw("index gate failed")
         t.expect(#h.errors > 0).to.equal(true)

@@ -242,6 +242,26 @@ function CMD.is_ready()
     return g_ready
 end
 
+-- 计划内迁移（P15）：把本节点各 agent 的已加载实体聚合成一份列表。
+-- `agent_index` 让适配器能显式寻址到具体 agent（跨节点迁移时不能用 HRW 路由，
+-- 实体此刻还在源节点上）。单个 agent 失败只记日志：漏报一个实体比整批失败安全，
+-- 漏掉的那些会按普通卸载处理。
+function CMD.migration_list()
+    local list = {}
+    for i, agent in ipairs(g_agents) do
+        local ok, part = pcall(skynet.call, agent, "lua", "migration_list")
+        if not ok then
+            log.error("migration list failed", "type", type_name, "index", i, "err", tostring(part))
+        elseif type(part) == "table" then
+            for _, entity in ipairs(part) do
+                entity.agent_index = i
+                list[#list + 1] = entity
+            end
+        end
+    end
+    return list
+end
+
 function CMD.agents()
     return table.move(g_agents, 1, #g_agents, 1, {})
 end

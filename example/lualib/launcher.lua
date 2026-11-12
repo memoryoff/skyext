@@ -9,6 +9,10 @@ local M = {}
 -- 默认**不启动**：它们依赖 Mongo 索引门禁、实体类型的 critical_ledger/critical_jobs
 -- 配置，以及支付渠道密钥。配置表存在且 enabled = true 才起，避免"没配好就静默跑起来"。
 -- start 里会跑 ensure_indexes；失败必须让节点启动失败，不能降级成全表扫描的调度器。
+--
+-- 这些服务全都通过实体路由干活，因此**必须在 launcher_entities 之后**启动：
+-- Outbox Worker 和 Critical Maintenance 一起来就扫 Mongo，支付回调一起来就开 HTTP 端口，
+-- 实体系统还没 READY 时它们只会拿到"找不到 owner"，第一轮全部空转。
 M.OPTIONAL_SERVICES = {
     { config_key = "outbox_worker", service = "outbox_worker" },
     { config_key = "critical_maintenance", service = "critical_maintenance" },
@@ -31,6 +35,32 @@ function M.launch_optional_services()
     end
 end
 
+-- 启动本节点的实体系统。返回即表示每个类型都已 READY：agentmgr 的 start 会创建全部
+-- agent、注册服务发现，最后才返回。再问一次 is_ready 是为了拦住"start 返回了但没就绪"
+-- 的实现（比如未来把 start 改成异步），别让调用方以为实体已经能接请求。
+--
+-- 顺序契约（role 节点）：launcher_node -> launcher_entities -> launch_optional_services -> launcher_gate
+-- 依赖实体的后台服务不能先于实体系统启动，客户端入口更不能。
+function M.launcher_entities(type_names)
+    local started = {}
+    for _, type_name in ipairs(type_names or {}) do
+        local mgr = skynet.newservice("entity_agentmgr", type_name)
+        local ok, err = skynet.call(mgr, "lua", "start")
+        if not ok then
+            error("entity system " .. tostring(type_name) .. " failed to start: " .. tostring(err))
+        end
+        local ready = skynet.call(mgr, "lua", "is_ready")
+        if ready ~= true then
+            error("entity system " .. tostring(type_name) .. " is not ready after start")
+        end
+        started[#started + 1] = mgr
+        log.info("entity system ready", "type", type_name)
+    end
+    return started
+end
+
+-- 基础设施：metrics、GM、热更、停服编排、区服目录与 Mongo 索引门禁。
+-- 这里**不启动**依赖实体的可选服务，也不开放客户端入口。
 function M.launcher_node()
     log.info("launcher_node begin")
     -- metrics 先起：业务服务首次声明指标时就会去找 .metrics，晚一步它们得走重试
@@ -48,9 +78,6 @@ function M.launcher_node()
     assert(all_ok, "auto create indexes failed")
     skynet.kill(mongo_index)
     log.info("auto create indexes success")
-
-    -- 索引与实体服务都就绪之后再起关键链路调度器：它们会立刻扫 Mongo
-    M.launch_optional_services()
 end
 
 -- 客户端接入：网关管连接，login 处理还没绑定的会话。

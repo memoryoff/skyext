@@ -37,7 +37,9 @@ end
 
 -- 带截止时间的钩子。迁移要跨节点 RPC，卡住的话停服会永久停在卸载之前，
 -- 而 g_running 已置位、再发一次 shutdown 只会得到 "already shutting down"。
--- 超时后只记错误并继续：迁移失败退化成"卸载 + 重登"，不能拖死进程。
+-- 超时后先给每个钩子发 cancel 让它在阶段边界停下，再继续卸载：
+-- 只停止等待是不够的，迁移协程会和卸载并行跑，源实体被卸掉之后还在写。
+-- migrate 阶段的钩子必须实现 cancel（migration_coordinator 实现了）。
 local function run_hooks_with_deadline(phase, timeout_sec)
     local hooks = g_hooks[phase]
     if #hooks == 0 then
@@ -60,6 +62,12 @@ local function run_hooks_with_deadline(phase, timeout_sec)
     end
     if pending > 0 then
         log.error("shutdown hook timed out", "phase", phase, "pending", pending, "timeout", timeout_sec)
+        for _, hook in ipairs(hooks) do
+            local cancelled, cerr = pcall(skynet.send, hook.addr, "lua", "cancel", "shutdown deadline")
+            if not cancelled then
+                log.warn("shutdown hook cancel failed", "phase", phase, "addr", hook.addr, "err", cerr)
+            end
+        end
     end
 end
 

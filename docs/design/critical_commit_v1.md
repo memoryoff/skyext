@@ -57,6 +57,7 @@ Mongo 字段名：不含 NUL、不含 `.`、不以 `$` 开头。`field_name_safe
 | `COMMITTED` | 是（COMMIT CAS） | `CACHEABLE` |
 | `BUSINESS_REJECTED` | 是（只写拒绝结果，不改 ORM） | `CACHEABLE` |
 | `PRECHECK_REJECTED` | **否** | `NO_CACHE` |
+| `INTERNAL_ERROR`（`validate` 自身抛错） | **否**，也未进入 PREPARE | `NO_CACHE` |
 | `OP_CONFLICT` / `EXPIRED` / `INTERNAL_AUTH_DENIED` | 否 | `CACHEABLE` / `NO_CACHE` |
 | `UNKNOWN` | 可能已写 | `NO_CACHE` |
 | `IN_PROGRESS` | 否 | `NO_CACHE` |
@@ -64,6 +65,25 @@ Mongo 字段名：不含 NUL、不含 `.`、不以 `$` 开头。`field_name_safe
 
 `PRECHECK_REJECTED` 是"这次条件不满足"，**不是该 op_id 的持久化终态**：不写意图、
 不声明持久化拒绝、不进 L1。条件变化后同一 `op_id` 可以重新预检。
+
+`INTERNAL_ERROR` 是 `validate` 自己抛错的专用结果：纯读预检发生在 PREPARE 之前，
+库里没有任何写入，因此**不能**复用 `UNKNOWN`——`UNKNOWN` 的语义是"可能已写"，
+会触发缓存隔离与恢复任务，而 `critical.query` 对同一次操作只会回 `NOT_STARTED`，
+调用方拿到的两个答案互相矛盾。这条路径只记错误日志、不进 L1、允许受控重试。
+
+### 4.1 容量：预警、腾挪、清理
+
+两个硬上限：`MAX_OPS = 512`（热账本）与 `MAX_OUTBOX = 512`（未清理事件）。触顶是
+**受控拒绝**，不会自动扩容，所以两条线都要提前看到趋势：
+
+- 80%（`CAPACITY_WARN_RATIO`）开始告警，按实体只打一次
+  （`skyext_critical_capacity_warning_total{kind}`），避免刷日志；
+- 归档滞后看 `skyext_critical_archive_lag_seconds`（维护扫描里最老一条待归档操作的年龄）。
+
+Outbox 触顶时先腾事件而不是直接拒绝：`DELIVERED` 立即腾，
+`ENQUEUED` 超过 `OUTBOX_ENQUEUED_RETENTION`（7d）也腾——可靠消息已经持久化，
+源端副本只剩观测价值。腾挪与新增事件在**同一次 CAS**里完成，不能先删后写。
+`PENDING` 永远不腾。
 
 `BUSINESS_REJECTED` 是持久化终态：`apply` 在 PREPARE 之后判定拒绝时，必须在同一个
 CAS 里写下拒绝结果并清掉意图，否则后续操作会永远被 `IN_PROGRESS` 挡住。

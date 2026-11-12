@@ -108,6 +108,17 @@ function M.resume(session, new_epoch, owner_node, owner_service)
     return true
 end
 
+-- 上行过滤。屏障的语义是"这条会话正在换 owner"，两个方向都得停：
+-- 只断下行不断上行的话，屏障到 resume 之间的包会落到一个已经交出所有权的实体上，
+-- 它此刻既不能落库也不该回包。丢弃不通知客户端：客户端按超时重传同一个 req_id，
+-- 重传会落到新 owner 上，由迁过去的幂等缓存回应。
+function M.upstream_allowed(session)
+    if session.frozen_epoch then
+        return nil, M.ERR.FROZEN
+    end
+    return true
+end
+
 -- 只读观测
 function M.state(session)
     return {

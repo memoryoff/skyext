@@ -266,3 +266,146 @@ t.describe("migration 依赖与忙碌", function()
         t.expect(stats.fallback).to.equal(1)
     end)
 end)
+
+-- 停服截止时间到达后必须停：只停止等待会让迁移和卸载并行跑
+t.describe("migration 取消", function()
+    t.it("stops at the next phase boundary once cancelled", function()
+        local d = deps()
+        local cancelled = false
+        -- 第一阶段执行完就取消：下一个阶段边界必须停下
+        local quiesce = d.quiesce
+        d.quiesce = function(entity, barrier_id)
+            local ok = quiesce(entity, barrier_id)
+            cancelled = true
+            return ok
+        end
+        local status, reason = migration.migrate_entity(d, entity(), {
+            is_cancelled = function()
+                return cancelled
+            end,
+        })
+        t.expect(status).to.equal("FALLBACK")
+        t.expect(reason).to.match("cancelled")
+        t.expect(d.calls).to.equal({ "quiesce" })
+    end)
+
+    t.it("does not start any entity when already cancelled", function()
+        local d = deps()
+        d.list_entities = function()
+            return { entity({ id = 7 }), entity({ id = 8 }) }
+        end
+        local stats = assert(migration.run(d, {
+            is_cancelled = function()
+                return true
+            end,
+        }))
+        t.expect(stats.total).to.equal(2)
+        t.expect(stats.cancelled).to.equal(2)
+        t.expect(stats.ready).to.equal(0)
+        t.expect(d.calls).to.equal({})
+    end)
+
+    -- 取消只影响还没开始的实体；已经迁移完的照常计数，剩下的交给卸载
+    t.it("keeps the entities it already migrated and skips the rest", function()
+        local d = deps()
+        local migrated = 0
+        d.list_entities = function()
+            return { entity({ id = 7 }), entity({ id = 8 }), entity({ id = 9 }) }
+        end
+        local activate = d.activate
+        d.activate = function(entity, barrier_id)
+            local ok = activate(entity, barrier_id)
+            migrated = migrated + 1
+            return ok
+        end
+        local stats = assert(migration.run(d, {
+            is_cancelled = function()
+                return migrated >= 1
+            end,
+        }))
+        t.expect(stats.ready).to.equal(1)
+        t.expect(stats.cancelled).to.equal(2)
+        t.expect(stats.fallback).to.equal(0)
+    end)
+end)
+
+-- 停服预算只有 timeout/2：串行迁几百个在线角色必然超时。
+-- 实体之间互不依赖（各自的锁、各自的 conn 屏障），可以并行
+t.describe("migration 并发", function()
+    t.it("spreads the batch over the requested number of workers", function()
+        local d = deps()
+        d.list_entities = function()
+            local list = {}
+            for i = 1, 10 do
+                list[i] = entity({ id = i })
+            end
+            return list
+        end
+        local workers
+        d.parallel = function(tasks)
+            workers = #tasks
+            -- 顺序执行每个 worker：测试只关心分片数量与最终统计
+            for _, task in ipairs(tasks) do
+                task()
+            end
+        end
+
+        local stats = assert(migration.run(d, { concurrency = 3 }))
+        t.expect(workers).to.equal(3)
+        t.expect(stats.total).to.equal(10)
+        t.expect(stats.ready).to.equal(10)
+        t.expect(stats.cancelled).to.equal(0)
+    end)
+
+    t.it("never starts more workers than entities", function()
+        local d = deps()
+        d.list_entities = function()
+            return { entity({ id = 1 }), entity({ id = 2 }) }
+        end
+        local workers
+        d.parallel = function(tasks)
+            workers = #tasks
+            for _, task in ipairs(tasks) do
+                task()
+            end
+        end
+        assert(migration.run(d, { concurrency = 8 }))
+        t.expect(workers).to.equal(2)
+    end)
+
+    -- 没有 parallel 注入时退化成串行：测试与单进程部署不引入协程依赖
+    t.it("stays sequential without a parallel hook", function()
+        local d = deps()
+        d.list_entities = function()
+            return { entity({ id = 1 }), entity({ id = 2 }) }
+        end
+        local stats = assert(migration.run(d, { concurrency = 4 }))
+        t.expect(stats.ready).to.equal(2)
+        t.expect(#d.calls).to.equal(12)
+    end)
+
+    -- 一个实体的失败只降级它自己，剩下的继续迁
+    t.it("keeps the rest of the batch when one entity fails", function()
+        local d = deps()
+        d.list_entities = function()
+            return { entity({ id = 1 }), entity({ id = 2 }), entity({ id = 3 }) }
+        end
+        local boom = true
+        d.quiesce = function(entity)
+            if entity.id == 1 and boom then
+                boom = false
+                error("worker bug")
+            end
+            return true
+        end
+        d.parallel = function(tasks)
+            for _, task in ipairs(tasks) do
+                task()
+            end
+        end
+
+        local stats = assert(migration.run(d, { concurrency = 2 }))
+        t.expect(stats.ready).to.equal(2)
+        t.expect(stats.total).to.equal(3)
+    end)
+end)

@@ -182,7 +182,16 @@ local function entity_lease_ok(entity)
 end
 
 function M:_deliver_one(entity, msg)
-    local handler_func = self.handler.handlers and self.handler.handlers[msg.cmd]
+    -- 优先用 handler.resolve（框架命令 + 业务 handler 的统一解析）：
+    -- Outbox 回执 outbox_ack 是框架命令，只查 handler.handlers 会让它永远
+    -- "no handler" 并进死信队列
+    local handler_func
+    if type(self.handler.resolve) == "function" then
+        local resolved, fn = pcall(self.handler.resolve, msg.cmd)
+        handler_func = resolved and fn or nil
+    else
+        handler_func = self.handler.handlers and self.handler.handlers[msg.cmd]
+    end
     if not handler_func then
         return false, string.format("no handler for command %s", tostring(msg.cmd)), true
     end
@@ -931,9 +940,17 @@ end
 
 -- 数据已经落库、dbmgr 缓存也已清掉，只剩释放锁。失败时必须保留实体（handle 不能丢），
 -- 否则没有人能再去释放这把锁。
-function M:_release_lock(entity)
+--
+-- `detach`（或实体上已标记的 release_detach）：计划内迁移。解除实体与连接的绑定，
+-- 但**不断开客户端**——连接要继续为迁移后的新 owner 服务，踢了就变成一次掉线。
+function M:_release_lock(entity, opts)
     local entity_id = entity.id
-    self:_kick_client(entity, "entity unloaded")
+    local detach = (opts and opts.detach) or entity.release_detach
+    if detach then
+        self:_detach_session(entity)
+    else
+        self:_kick_client(entity, "entity unloaded")
+    end
     if not distributed_lock.is_valid(entity.handle) then
         -- 租约已经失效，key 会随租约被 etcd 回收，这里再持有实体没有意义，
         -- 数据此前已在有效租约下落库，直接丢掉内存对象是安全的
@@ -949,6 +966,29 @@ function M:_release_lock(entity)
     self:_forget_entity(entity)
     log.info("entity unloaded", "type", self.type_name, "id", entity_id)
     return true
+end
+
+-- 只解除实体侧的绑定，不通知网关断开连接：会话快照已经交给目标节点，
+-- 这条连接接下来由目标节点接管
+function M:_detach_session(entity)
+    local conn = entity.session
+    if not conn then
+        return
+    end
+    local ok, err = pcall(function()
+        require("skyext.entity.session").unbind(conn.key)
+    end)
+    if not ok then
+        log.error(
+            "failed to detach a session for migration",
+            "type",
+            self.type_name,
+            "id",
+            tostring(entity.id),
+            "err",
+            tostring(err)
+        )
+    end
 end
 
 -- 卸载实体本体，调用者必须已经持有该实体的 gate
@@ -1047,6 +1087,147 @@ function M:count()
         n = n + 1
     end
     return n
+end
+
+-- ---------------------------------------------------------------------------
+-- 计划内迁移（P15）：枚举 / 冻结 / 释放
+--
+-- 这三步只做"实体侧"的动作，跨节点的事（目标选择、快照传输、网关重指向）由游戏层
+-- 的迁移适配器负责。契约见 docs/design/migration_v1.md。
+-- ---------------------------------------------------------------------------
+
+-- 关键操作未决的实体禁止无感移交：它可能有一个 PREPARE 过、COMMIT 结果未知的意图，
+-- 换 owner 之前必须走多数派 Fence 恢复。字段名只在 critical 里定义一次
+local g_intent_field
+local function intent_field()
+    if not g_intent_field then
+        g_intent_field = require("skyext.critical").INTENT_FIELD
+    end
+    return g_intent_field
+end
+
+-- 枚举本进程已加载的实体，以及迁移分流需要的状态。只读、不 yield、不改任何字段。
+-- `busy` 只表示"已经在迁移或正在卸载"：普通在途请求由 QUIESCING 阶段靠实体队列排空，
+-- 不需要在这里猜，猜错只会让本该成功的迁移降级。
+function M:list_loaded()
+    local list = {}
+    for id, entity in pairs(self.entities) do
+        local io_ = entity.session_io
+        local conn = entity.session
+        list[#list + 1] = {
+            id = id,
+            conn_id = conn and conn.key or nil,
+            owner_epoch = io_ and io_.owner_epoch or nil,
+            session_epoch = io_ and io_.session_epoch or nil,
+            critical_unknown = self:_has_pending_intent(entity),
+            busy = entity.migrating == true or entity.unloading == true,
+            persistent = entity.persistent ~= false,
+        }
+    end
+    table.sort(list, function(a, b)
+        return tostring(a.id) < tostring(b.id)
+    end)
+    return list
+end
+
+function M:_has_pending_intent(entity)
+    local tc = self.type_config
+    if not tc or not tc.db_name or not tc.db_coll then
+        return false
+    end
+    local critical = dbmgr.cached_critical(tc.db_name, tc.db_coll, entity.id)
+    return critical ~= nil and critical[intent_field()] ~= nil
+end
+
+-- 冻结：停止这个实体的上行执行与下行追加，准备导出快照。
+-- 必须在实体队列里执行——排在它前面的请求先跑完（队列排空），排在它后面的上行
+-- 由 entity_agent 在入口处丢弃，不会落到一个已经交出所有权的实体上。
+function M:quiesce(entity_id)
+    return self:_with_gate(entity_id, function()
+        local entity = self.entities[entity_id]
+        if not entity then
+            return false, "not loaded"
+        end
+        if entity.unloading then
+            return false, "unloading"
+        end
+        if entity.migrating then
+            -- 重复冻结是幂等的：适配器重试不该被自己上一次的调用挡住
+            return true
+        end
+        if entity.persistent == false then
+            return false, "ephemeral"
+        end
+        if not entity.session_io then
+            return false, "no session"
+        end
+        if not entity_lease_ok(entity) then
+            return false, "lease lost"
+        end
+        entity.migrating = true
+        -- 这里**不**冻结下行：QUIESCING 到 TRANSFER 之间业务推送（定时器、邮件）还会
+        -- 产生下行，它们必须能进 out_buf 才会被快照带走。真正的冻结点是 session_export
+        -- ——它在编码前把 io_.migrating 置上，之后追加的包才会让目标的 sent 落后
+        -- 迁移期间不能让空闲计时器把实体卸掉：那会在快照送出后释放锁
+        self:_cancel_unload_timer(entity)
+        log.info("entity quiesced for migration", "type", self.type_name, "id", entity_id)
+        return true
+    end)
+end
+
+-- 撤销冻结（迁移失败、实体留在本节点继续服务）。快照一旦送出就不能撤销：
+-- 放开源端只会让 sent/out_buf 领先目标，客户端 ACK 越界后整个会话只能重登
+function M:unquiesce(entity_id, reason)
+    return self:_with_gate(entity_id, function()
+        local entity = self.entities[entity_id]
+        if not entity or not entity.migrating then
+            return true
+        end
+        -- 已经落库或正在卸载的实体不能"解冻后继续服务"：数据在库里、dbmgr 缓存已清，
+        -- 继续接请求只会在下一次回存时报 not cached。释放失败（锁没解开）就走这条路径，
+        -- 它已经安排了卸载重试，正确结果是继续卸载而不是回到服务状态
+        if entity.persisted or entity.unloading then
+            return false, "entity is being unloaded"
+        end
+        if entity.migration_exported then
+            return false, "snapshot already exported"
+        end
+        entity.migrating = nil
+        if entity.session_io then
+            -- 正常情况下 io_.migrating 由 session_export 置上；走到这里说明还没导出，
+            -- 清一次是防御（例如上一次迁移中途失败留下的标记）
+            entity.session_io.migrating = nil
+        end
+        if not entity.session then
+            -- 断线中的实体靠 unload_delay 计时器回收，撤销冻结要把这个窗口还回去
+            self:_start_unload_timer(entity)
+        end
+        log.info("entity migration aborted", "type", self.type_name, "id", entity_id, "reason", tostring(reason))
+        return true
+    end)
+end
+
+-- 释放：落库、释放锁、解除实体与连接的绑定，但**不踢客户端、不销毁会话**。
+-- 没有导出过快照就拒绝：那会把客户端留在一条没有 owner 的连接上，比直接卸载更糟。
+-- 失败时保留实体并安排重试（和普通卸载一致），重试会带着 release_detach 继续。
+function M:release_for_migration(entity_id)
+    return self:_with_gate(entity_id, function()
+        local entity = self.entities[entity_id]
+        if not entity then
+            return false, "not loaded"
+        end
+        if not entity.migrating then
+            return false, "not quiesced"
+        end
+        if not entity.migration_exported then
+            return false, "snapshot not exported"
+        end
+        entity.release_detach = true
+        if entity.persisted then
+            return self:_release_lock(entity, { detach = true })
+        end
+        return self:_unload_entity(entity)
+    end)
 end
 
 -- 停服：从此不再加载新实体，并把已加载的实体全部卸载（落库、释放锁、断开客户端）。

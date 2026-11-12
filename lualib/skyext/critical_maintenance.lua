@@ -24,6 +24,13 @@ M.DEFAULT_INTERVAL = 60
 local m_archive = metrics.counter("skyext_critical_maintenance_total", "Maintenance rounds by task", { "task" })
 local m_candidates =
     metrics.gauge("skyext_critical_maintenance_candidates", "Candidates found by the last maintenance scan", { "task" })
+-- 归档滞后：最老一条待归档操作已经等了多久。这是容量预警的主指标——
+-- 滞后持续上升说明归档吞吐跟不上写入，撞 MAX_OPS 只是时间问题
+local m_archive_lag = metrics.gauge(
+    "skyext_critical_archive_lag_seconds",
+    "Age of the oldest critical op waiting to be archived",
+    { "task" }
+)
 
 -- 归档候选：热账本最老条目已经超过保留期
 function M.scan_archive(role_coll, opts)
@@ -104,6 +111,19 @@ function M.run_once(deps, opts)
         return nil, aerr
     end
     m_candidates:set(#candidates, { task = "archive" })
+    -- 滞后用扫描结果里的 oldest 算：不用等归档跑完就能看出积压
+    local oldest = nil
+    for _, entry in ipairs(candidates) do
+        if math.type(entry.oldest) == "integer" and (oldest == nil or entry.oldest < oldest) then
+            oldest = entry.oldest
+        end
+    end
+    if oldest then
+        local now = opts.now or os.time()
+        m_archive_lag:set(math.max(0, now - oldest), { task = "archive" })
+    else
+        m_archive_lag:set(0, { task = "archive" })
+    end
     for _, entry in ipairs(candidates) do
         if type(deps.archive) ~= "function" then
             stats.skipped = stats.skipped + 1

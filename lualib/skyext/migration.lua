@@ -73,6 +73,17 @@ local function fail(status, detail)
     return status, detail
 end
 
+-- 取消令牌：停服编排在截止时间到达后置位，迁移必须在阶段边界停下来。
+-- 不检查的话，超时后迁移协程还在跑，而卸载已经并行开始——源实体被卸掉之后
+-- 迁移还在写，或者目标刚装好源端又清了一次
+local function cancelled(opts)
+    if type(opts) == "table" and type(opts.is_cancelled) == "function" then
+        return opts.is_cancelled() == true
+    end
+    return false
+end
+M.cancelled = cancelled
+
 -- 单个实体走完六阶段。返回 M.STATUS.*，以及失败原因。
 --
 -- deps 里的每个函数返回 true 表示这一步已确认；返回 nil, reason 表示这一步失败。
@@ -87,6 +98,9 @@ function M.migrate_entity(deps, entity, opts)
     -- 缺依赖一律 fail-closed：把"没配 export"当成成功，会得到一个宣称迁移完成、
     -- 但快照从未送达的会话
     local function step(phase, fn)
+        if cancelled(opts) then
+            return nil, "cancelled before " .. phase
+        end
         if type(fn) ~= "function" then
             return nil, phase .. " is not configured"
         end
@@ -117,6 +131,9 @@ function M.migrate_entity(deps, entity, opts)
     end
 
     -- TRANSFER：导出快照并送达目标。快照含二进制 hash/nonce/pack，只能走可信通道
+    if cancelled(opts) then
+        return fail(M.STATUS.FALLBACK, "cancelled before export")
+    end
     if type(deps.export) ~= "function" then
         return fail(M.STATUS.FALLBACK, "export is not configured")
     end
@@ -124,6 +141,11 @@ function M.migrate_entity(deps, entity, opts)
     local exported_ok, snapshot, eerr = pcall(deps.export, entity, barrier_id)
     if not exported_ok or type(snapshot) ~= "table" then
         return fail(M.STATUS.FALLBACK, "export: " .. tostring(eerr or snapshot or "no snapshot"))
+    end
+    -- 导出之后取消最危险：源端已经冻结下行，而目标还没接住。
+    -- 交给 fallback（踢客户端重连）比继续把快照送出去更安全
+    if cancelled(opts) then
+        return fail(M.STATUS.FALLBACK, "cancelled before transfer")
     end
     if type(deps.transfer) ~= "function" then
         return fail(M.STATUS.FALLBACK, "transfer is not configured")
@@ -169,8 +191,10 @@ function M.run(deps, opts)
         return nil, tostring(lerr or "list_entities returned no list")
     end
 
-    local stats = { total = #entities, ready = 0, fallback = 0, critical_unknown = 0, busy = 0 }
-    for _, entity in ipairs(entities) do
+    local stats = { total = #entities, ready = 0, fallback = 0, critical_unknown = 0, busy = 0, cancelled = 0 }
+    local started = 0
+
+    local function migrate_one(entity)
         local status, reason
         if entity.critical_unknown then
             -- 关键操作未决：禁止无感移交。留下持久化 PREPARED/记录后走降级路径，
@@ -189,6 +213,8 @@ function M.run(deps, opts)
                 status, reason = M.migrate_entity(deps, entity, {
                     barrier_id = opts.barrier_id,
                     now = now_of(opts),
+                    -- 令牌要传下去：取消发生在实体中途时，下一个阶段边界就会停
+                    is_cancelled = opts.is_cancelled,
                 })
             end
             if status == M.STATUS.READY then
@@ -208,6 +234,46 @@ function M.run(deps, opts)
             end
         end
     end
+
+    -- 并发：实体之间互不依赖（各自的实体锁、各自的 conn 屏障），停服预算又只有
+    -- timeout/2，串行时几百个在线角色就会吃满。并发度由调用方给，框架不猜
+    local concurrency = math.tointeger(opts.concurrency) or 1
+    if concurrency > 1 and type(deps.parallel) == "function" and #entities > 1 then
+        local index = 0
+        local tasks = {}
+        for _ = 1, math.min(concurrency, #entities) do
+            tasks[#tasks + 1] = function()
+                while not cancelled(opts) do
+                    index = index + 1
+                    local entity = entities[index]
+                    if not entity then
+                        return
+                    end
+                    started = started + 1
+                    local ok, err = pcall(migrate_one, entity)
+                    if not ok then
+                        -- 单个实体的意外错误不能带走整批：剩下的还要继续迁
+                        log.error("migration worker failed", "id", tostring(entity.id), "err", tostring(err))
+                    end
+                end
+            end
+        end
+        deps.parallel(tasks)
+    else
+        for _, entity in ipairs(entities) do
+            if cancelled(opts) then
+                break
+            end
+            started = started + 1
+            migrate_one(entity)
+        end
+    end
+
+    if cancelled(opts) then
+        -- 停服截止时间已到：没开始的交给卸载（客户端重连），已经开始的会自己走到 FALLBACK
+        stats.cancelled = #entities - started
+        log.warn("migration cancelled", "remaining", stats.cancelled, "started", started)
+    end
     log.info(
         "migration round finished",
         "total",
@@ -217,7 +283,9 @@ function M.run(deps, opts)
         "fallback",
         stats.fallback,
         "critical_unknown",
-        stats.critical_unknown
+        stats.critical_unknown,
+        "cancelled",
+        stats.cancelled
     )
     return stats
 end

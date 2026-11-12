@@ -113,6 +113,10 @@ local function harness(opts)
         h.dirty = false
         return true
     end
+    -- 关键账本缓存：迁移枚举用它判断有没有未决意图
+    function fake_db.cached_critical(_, _, id)
+        return h.critical and h.critical[id] or nil
+    end
     -- 真实实现：成功和 superseded 都会清掉缓存，其余失败保留缓存等下一轮重试
     function fake_db.recover(_, _, _, id, old_handle, new_handle)
         record("recover")
@@ -213,6 +217,18 @@ local function harness(opts)
         end
         return true
     end
+    -- 计划内迁移只解除绑定，不通知网关断开。和真实实现一样按连接表判断，
+    -- 重复解绑是空操作（释放重试会再走一遍）
+    function fake_session.unbind(key)
+        h.unbound_keys = h.unbound_keys or {}
+        if h.unbound_keys[key] then
+            return
+        end
+        h.unbound_keys[key] = true
+        record("unbind:" .. tostring(key))
+        h.unbound = h.unbound or {}
+        h.unbound[#h.unbound + 1] = key
+    end
 
     local fake_timer = {}
     function fake_timer.timeout(name, _, callback)
@@ -246,6 +262,8 @@ local function harness(opts)
         },
         ["skyext.entity.reliable_msg"] = fake_msg,
         ["skyext.entity.session"] = fake_session,
+        -- 只用到字段名；不把整个 critical 模块（连带 orm/mongo）拉进这个单测
+        ["skyext.critical"] = { INTENT_FIELD = "_critical_intent_v1" },
     }
     local env = setmetatable({
         require = function(name)
@@ -1578,5 +1596,209 @@ t.describe("临时实体", function()
         t.expect(h.mgr:ensure_loaded(7)).to.equal(true)
         t.expect(#h.handles).to.equal(1)
         t.expect(h.loads).to.equal(1)
+    end)
+end)
+
+-- 计划内迁移（P15）的三个实体侧动作：枚举 / 冻结 / 释放。
+-- 契约要求"客户端连接不断、会话不销毁、锁要真的还回去"，任何一条破了就不是无感迁移。
+t.describe("entitymgr 计划内迁移", function()
+    local function with_session(h, id)
+        local entity = h.mgr.entities[id]
+        entity.session = { key = "conn-" .. id }
+        entity.session_io = { owner_epoch = 3, session_epoch = "epoch-a" }
+        return entity
+    end
+
+    t.it("lists loaded entities with the state the adapter needs", function()
+        local h = harness()
+        assert(h.mgr:ensure_loaded(7))
+        assert(h.mgr:ensure_loaded(8))
+        with_session(h, 7)
+        h.critical = { [8] = { _critical_intent_v1 = { op_id = "op-1" } } }
+
+        local list = h.mgr:list_loaded()
+        t.expect(#list).to.equal(2)
+        t.expect(list[1].id).to.equal(7)
+        t.expect(list[1].conn_id).to.equal("conn-7")
+        t.expect(list[1].owner_epoch).to.equal(3)
+        t.expect(list[1].session_epoch).to.equal("epoch-a")
+        t.expect(list[1].critical_unknown).to.equal(false)
+        t.expect(list[1].busy).to.equal(false)
+        -- 8 号没有会话，但有未决意图：禁止无感移交
+        t.expect(list[2].id).to.equal(8)
+        t.expect(list[2].conn_id).to.be_nil()
+        t.expect(list[2].critical_unknown).to.equal(true)
+    end)
+
+    t.it("freezes upstream and stops the idle unload timer on quiesce", function()
+        local h = harness()
+        assert(h.mgr:ensure_loaded(7))
+        local entity = with_session(h, 7)
+        local timer = entity.unload_timer
+        t.expect(timer ~= nil).to.equal(true)
+
+        t.expect(h.mgr:quiesce(7)).to.equal(true)
+        t.expect(entity.migrating).to.equal(true)
+        -- 下行不能在这里冻：QUIESCING 到 TRANSFER 之间业务推送还要进 out_buf，
+        -- 才会被随后的快照带走。真正的冻结点是 session_export
+        t.expect(entity.session_io.migrating).to.be_nil()
+        t.expect(timer.cancelled).to.equal(true)
+        -- 幂等：适配器重试不该被自己上一次的调用挡住
+        t.expect(h.mgr:quiesce(7)).to.equal(true)
+        t.expect(h.mgr:list_loaded()[1].busy).to.equal(true)
+    end)
+
+    t.it("refuses to quiesce something that cannot be handed over", function()
+        local h = harness()
+        t.expect(h.mgr:quiesce(7)).to.equal(false)
+
+        assert(h.mgr:ensure_loaded(7))
+        local no_session = h.mgr:quiesce(7)
+        t.expect(no_session).to.equal(false)
+
+        local entity = with_session(h, 7)
+        entity.persistent = false
+        t.expect(h.mgr:quiesce(7)).to.equal(false)
+    end)
+
+    t.it("restores the entity on unquiesce but never after the snapshot left", function()
+        local h = harness()
+        assert(h.mgr:ensure_loaded(7))
+        local entity = with_session(h, 7)
+        assert(h.mgr:quiesce(7))
+
+        t.expect(h.mgr:unquiesce(7, "transfer failed")).to.equal(true)
+        t.expect(entity.migrating).to.be_nil()
+        t.expect(entity.session_io.migrating).to.be_nil()
+
+        assert(h.mgr:quiesce(7))
+        -- 模拟 session_export：导出即冻结下行，并把 exported 标记上
+        entity.session_io.migrating = true
+        entity.migration_exported = true
+        local ok, reason = h.mgr:unquiesce(7, "too late")
+        t.expect(ok).to.equal(false)
+        t.expect(reason).to.equal("snapshot already exported")
+        -- 已经送出的快照不能再撤销冻结，否则 sent 会领先目标
+        t.expect(entity.session_io.migrating).to.equal(true)
+    end)
+
+    t.it("persists and releases the lock without kicking the client", function()
+        local h = harness()
+        assert(h.mgr:ensure_loaded(7))
+        with_session(h, 7)
+        assert(h.mgr:quiesce(7))
+        h.mgr.entities[7].migration_exported = true
+        h.events = {}
+
+        t.expect(h.mgr:release_for_migration(7)).to.equal(true)
+        t.expect(index_of(h.events, "persist")).to.be_type("number")
+        t.expect(index_of(h.events, "persist")).to.be_lt(index_of(h.events, "unlock"))
+        -- 连接留给目标节点：不踢、只解绑
+        t.expect(#h.kicked).to.equal(0)
+        t.expect(h.unbound).to.equal({ "conn-7" })
+        t.expect(h.mgr:get(7)).to.be_nil()
+    end)
+
+    t.it("refuses to release before quiesce or before the snapshot exists", function()
+        local h = harness()
+        assert(h.mgr:ensure_loaded(7))
+        with_session(h, 7)
+
+        local ok, reason = h.mgr:release_for_migration(7)
+        t.expect(ok).to.equal(false)
+        t.expect(reason).to.equal("not quiesced")
+
+        assert(h.mgr:quiesce(7))
+        ok, reason = h.mgr:release_for_migration(7)
+        t.expect(ok).to.equal(false)
+        t.expect(reason).to.equal("snapshot not exported")
+        -- 没有快照就释放，会把客户端留在一条没有 owner 的连接上
+        t.expect(h.mgr:get(7)).to.exist()
+    end)
+
+    -- 释放失败要能被普通卸载重试接着做完，而且重试时同样不能踢人
+    t.it("keeps the no-kick intent across a release retry", function()
+        local h = harness()
+        assert(h.mgr:ensure_loaded(7))
+        with_session(h, 7)
+        assert(h.mgr:quiesce(7))
+        h.mgr.entities[7].migration_exported = true
+        h.unlock_fail = "retry"
+
+        t.expect(h.mgr:release_for_migration(7)).to.equal(false)
+        t.expect(h.mgr.entities[7].release_detach).to.equal(true)
+
+        h.unlock_fail = nil
+        h.events = {}
+        t.expect(h.mgr:unload(7)).to.equal(true)
+        t.expect(#h.kicked).to.equal(0)
+        t.expect(h.unbound).to.equal({ "conn-7" })
+    end)
+end)
+
+-- 释放失败（锁没解开）时实体已经落库、dbmgr 缓存已清，还安排了卸载重试。
+-- 这时"解冻后继续服务"是个陷阱：下一次回存会报 not cached
+t.describe("entitymgr 迁移释放失败", function()
+    t.it("refuses to unquiesce an entity that is already being unloaded", function()
+        local h = harness()
+        assert(h.mgr:ensure_loaded(7))
+        local entity = h.mgr.entities[7]
+        entity.session = { key = "conn-7" }
+        entity.session_io = { owner_epoch = 3 }
+        assert(h.mgr:quiesce(7))
+        -- 模拟 session_export + 落库成功、解锁失败
+        entity.migration_exported = true
+        h.unlock_fail = "retry"
+        t.expect(h.mgr:release_for_migration(7)).to.equal(false)
+        t.expect(entity.persisted).to.equal(true)
+        t.expect(entity.unloading).to.equal(true)
+
+        local ok, reason = h.mgr:unquiesce(7, "release failed")
+        t.expect(ok).to.equal(false)
+        t.expect(reason).to.equal("entity is being unloaded")
+        -- 冻结标记留着：它仍归卸载重试管，不能回到服务状态
+        t.expect(entity.migrating).to.equal(true)
+    end)
+end)
+
+-- 可靠消息也要能投递框架命令：Outbox 回执 outbox_ack 不在 handler.handlers 里，
+-- 只查业务表会让它永远 "no handler" 并进死信队列
+t.describe("entitymgr 框架命令投递", function()
+    t.it("resolves framework commands through handler.resolve", function()
+        local h = harness()
+        local seen = {}
+        h.handler.handlers.change = function() end
+        h.handler.resolve = function(cmd)
+            if cmd == "outbox_ack" then
+                return function(_, args, msg_id)
+                    seen[#seen + 1] = { args = args, msg_id = msg_id }
+                    return true
+                end
+            end
+            return h.handler.handlers[cmd]
+        end
+        h.pending = {
+            { msg_id = 21, seq = 1, cmd = "outbox_ack", args = { { event_id = "evt_x" } } },
+        }
+
+        t.expect(h.mgr:deliver_pending(7)).to.equal(true)
+        t.expect(#seen).to.equal(1)
+        t.expect(seen[1].args.event_id).to.equal("evt_x")
+        -- msg_id 仍然作为最后一个参数传进去（业务侧靠它去重）
+        t.expect(seen[1].msg_id).to.equal(21)
+        t.expect(h.pending[1].delivered).to.equal(true)
+    end)
+
+    -- 未知命令仍然进死信队列，不能因为加了 resolve 就静默吞掉
+    t.it("keeps unknown commands dead-lettered", function()
+        local h = harness()
+        h.handler.resolve = function(cmd)
+            error("unknown entity command: " .. tostring(cmd))
+        end
+        h.pending = { { msg_id = 22, seq = 1, cmd = "no_such_command", args = {} } }
+        h.max_attempts = 1
+
+        h.mgr:deliver_pending(7)
+        t.expect(h.pending[1].dead).to.equal(true)
     end)
 end)

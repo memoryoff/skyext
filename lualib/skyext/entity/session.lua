@@ -395,6 +395,70 @@ function M.resume(conn_id, entity, owner_service, nonce, recv, opts)
     return errcode.OK, io_.nonce, io_.sent, io_.session_epoch, io_.session_mode
 end
 
+-- 计划内迁移的最后一跳：把一条**仍然活着**的连接接到新 owner 上。
+--
+-- 与 bind / resume 的区别，三条都不能混：
+--   * 不重建 session_io：快照刚从源节点装进来，nonce / sent / out_buf / resp_cache 都要留；
+--   * 不轮换 nonce：客户端没断线，没有重新认证这回事；
+--   * owner_epoch 由调用方给出（必须严格大于快照里的值），并同步给网关。
+--
+-- 顺序是硬约束：**先让网关认账，再改本地**。反过来的话网关拒绝时本地 epoch 已经推进，
+-- 之后所有下行都会被当成迟到包丢掉，而且没有任何回滚路径。
+--
+-- 必须在实体队列里调用；重放由调用方接着做（session.replay）。
+function M.attach(conn_id, entity, owner_service, owner_epoch)
+    local parsed, perr = connection_id.parse(conn_id)
+    if not parsed then
+        log.warn("reject invalid conn_id on attach", "err", perr)
+        return false, perr
+    end
+    local io_ = entity.session_io
+    if not io_ then
+        return false, "no session io"
+    end
+    local target = math.tointeger(owner_epoch)
+    if not target or target <= (io_.owner_epoch or 0) then
+        return false, "owner epoch must advance"
+    end
+    -- resume_owner 同时解除屏障并把之后的上行、下行都指向新 owner
+    local called, accepted = pcall(
+        gate_call,
+        parsed.gate_node,
+        parsed.gate_service,
+        "resume_owner",
+        conn_id,
+        target,
+        self_node(),
+        owner_service
+    )
+    if not called then
+        return false, tostring(accepted)
+    end
+    if not accepted then
+        -- 网关已经不认这条会话（客户端断开、或 epoch 被别处推进过）
+        return false, "gate rejected the new owner"
+    end
+    io_.owner_epoch = target
+    -- 快照里的 io_ 可能带着源端的冻结标记（迁移重试时会复用同一个实体对象）。
+    -- 新 owner 不冻结：再冻着就永远不发下行了
+    io_.migrating = nil
+    io_.replaying = true
+    local conn = install_conn(conn_id, parsed, entity)
+    io_.last_seen = skynet.now()
+    log.info(
+        "session attached to a new owner",
+        "type",
+        entity.type_name,
+        "id",
+        entity.id,
+        "session",
+        conn.key,
+        "epoch",
+        target
+    )
+    return true
+end
+
 -- 重放客户端还没收到的下行包，然后解除 replaying。
 -- 必须在 on_resume_client 之前调用：回调里业务多半会推状态，那些新包要排在旧包后面，
 -- 否则客户端的收包顺序和实际顺序对不上。

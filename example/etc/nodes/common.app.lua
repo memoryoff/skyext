@@ -142,10 +142,19 @@ pay_callback = pay_callback
         -- 渠道模块需实现 verify(payload, headers) 与 parse(payload)，密钥放模块自己的配置里
         providers = {},
     }
-migration = migration or {
-    enabled = false,
-    type_name = "role",
-}
+-- 计划内迁移（P15）。开启时必须同时给出 adapter：一个实现 list_entities / quiesce /
+-- freeze / export / transfer / handoff / activate 的模块名。协调器在启动时校验该模块与
+-- 全部阶段，缺一项就让节点启动失败——配置了迁移却静默退化成"卸载 + 全员重登"，
+-- 比直接起不来更危险。示例实现在 example/lualib/migration_adapter.lua。
+migration = migration
+    or {
+        enabled = false,
+        type_name = "role",
+        adapter = "migration_adapter",
+        -- 同时迁移的实体数。每个实体自己抢锁、自己的 conn 屏障，互不依赖；
+        -- 停服预算只有 timeout/2，串行迁几百个在线角色必然超时
+        concurrency = 4,
+    }
 
 -- 同一条可靠消息连续投递失败多少次后转入死信队列。
 -- 只有“错在消息本身”的失败才计数（没有对应 handler、handler 抛错）；

@@ -41,14 +41,17 @@
 | I28 | 冷账本写入未确认 | 热条目原样保留，不出现"两边都没有" | `critical.test.lua` |
 | I29 | 热条目已归档后查询 | 回落冷账本；读失败报 UNKNOWN 而非"没执行" | `critical.test.lua` |
 | I30 | PREPARED 但没有恢复任务 | 维护扫描补建任务 | `critical_maintenance.test.lua` |
-| I27 | 迁移钩子卡住 | 截止时间到后继续卸载，不永久阻塞 | `node_shutdown.test.lua` |
+| I27 | 迁移钩子卡住 | 截止时间到后给钩子发 `cancel` 并继续卸载，不永久阻塞 | `node_shutdown.test.lua`、`migration.test.lua` |
+| I31 | 接收方回执丢失/重复 | 事件停在 ENQUEUED 由容量腾挪兜底；重复回执幂等，不重复减计数 | `outbox.test.lua`、`entity_agent.test.lua` |
+| I32 | 停服时迁移被取消 | 阶段边界停下，已开始的走 FALLBACK，未开始的交给卸载 | `migration.test.lua`、`migration_coordinator.test.lua` |
+| I33 | Outbox 撞上 512 上限 | 先腾 DELIVERED/超期事件再决定是否拒绝；PENDING 永不腾 | `critical.test.lua` |
 
 **未覆盖的注入**（需要真实依赖，见 §3）：真实副本集 `stepDown`、Mongo 网络分区、
 etcd 租约抖动、网关进程 kill、跨节点 RPC 超时。
 
 **还没埋点的指标**：`skyext_critical_reconcile_jobs{state}`（恢复任务需要一个扫描口径，
-现在只有任务表本身可查）与 `skyext_ws_handshake_inflight`（WS 六状态机里没有单独的
-握手计数）。这两项在压测前需要补，否则"MANUAL_REVIEW 堆积"和"握手洪峰"只能靠日志看。
+现在只有任务表本身可查）。压测前需要补，否则"MANUAL_REVIEW 堆积"只能靠日志看。
+`skyext_ws_handshake_inflight` 已在 `gate_ws` 里埋好。
 
 ## 2. 压测清单
 
@@ -67,6 +70,11 @@ etcd 租约抖动、网关进程 kill、跨节点 RPC 超时。
 | `skyext_migration_phase_seconds{phase}`、`skyext_migration_fallback_total{reason}` | 迁移耗时与降级率 | 单阶段 P95、降级原因分布 |
 | `skyext_session_dedup_hit_total{mode}` | 上行幂等命中 | 客户端重传趋势 |
 | `skyext_gate_connections`、`skyext_gate_stale_binds_total` | 网关连接与迟到绑定 | 连接泄漏 |
+| `skyext_gate_frozen_upstreams_total` | 迁移屏障期间丢弃的上行 | 持续增长=会话卡在 FROZEN |
+| `skyext_critical_archive_lag_seconds` | 最老一条待归档操作的年龄 | 持续上升=归档吞吐跟不上 |
+| `skyext_critical_capacity_warning_total{kind}` | 触到 80% 预警线的实体数 | 早期容量信号 |
+| `skyext_critical_outbox_evicted_total{reason}`、`skyext_outbox_evicted_total{reason}` | 腾挪次数 | 频繁=上限或保留期不合理 |
+| `skyext_outbox_acked_total{result}`、`skyext_outbox_delivered_seconds` | 回执结果与投递时延 | `gone` 多=回执晚到，时延高=接收方慢 |
 
 **场景**（按依赖顺序）：
 
@@ -77,10 +85,15 @@ etcd 租约抖动、网关进程 kill、跨节点 RPC 超时。
 3. **Outbox 吞吐**：制造积压后观察排空速率与 `pending_age` 曲线，确认扫描不吃满 Mongo。
 4. **支付回调**：并发重复回调同一单号，确认只发一次奖（看 `skyext_pay_grant_total`）。
 5. **迁移**：整节点迁移 K 个在线角色，采集 `migration_phase_seconds` 与降级率。
+6. **容量**：单角色 1k / 5k / 10k 次关键操作（含 Outbox 事件），记录
+   `_critical_ops_v1` 与 `_critical_outbox_v1` 的 BSON 大小、归档滞后、80% 预警触发点、
+   腾挪次数与腾挪原因。`MAX_OPS` / `archive_limit` / 保留期这三个值目前是**初始配置**，
+   要按这一组数据定，不要凭感觉调大。
 
 **通过标准（初值，需按硬件校准）**：关键操作 P99 不随在线人数线性上升；
 `critical_quarantined_total` 为 0；`outbox_pending_age` 在压测结束后 5 分钟内归零；
 迁移降级率 < 1% 且没有 `CRITICAL_UNKNOWN` 之外的降级原因。
+第 6 组（容量）**目前没有任何数据**，`MAX_OPS = 512` 与保留期 7d 都是保守取值。
 
 ## 3. 需要在集成环境执行的部分（待跑）
 

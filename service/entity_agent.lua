@@ -280,6 +280,26 @@ FRAMEWORK.outbox_pump = function(entity, limit)
     return outbox_worker.pump_entity(entity, { limit = limit })
 end
 
+-- 接收方回执：把源事件推进到 DELIVERED。由可靠消息投递进来（源角色离线时随下次加载）。
+-- 事件已经被清理、或已经 DELIVERED，都算成功：回执是幂等的
+FRAMEWORK.outbox_ack = function(entity, args)
+    local outbox = require "skyext.outbox"
+    local ctx, cerr = require("skyext.critical").coords_of(entity)
+    if not ctx then
+        return nil, cerr
+    end
+    local event_id = type(args) == "table" and args.event_id or args
+    local ok, err = outbox.mark_delivered(ctx, event_id, { now = os.time() })
+    if ok then
+        return true
+    end
+    if err == "unknown event" then
+        return true
+    end
+    -- 未决/环境问题：保留 pending 等重投，不能悄悄丢掉回执
+    return require("skyext.entity.delivery").retryable(err)
+end
+
 FRAMEWORK.critical_status = function(entity, op_id)
     local ledger = config_collection(type_config.critical_ledger)
     if not ledger then
@@ -372,6 +392,9 @@ FRAMEWORK.session_export = function(entity, barrier_id, target_owner_epoch)
         io_.migrating = false
         return nil, err
     end
+    -- 快照一旦送出就不能再撤销冻结：源端继续写 out_buf 会让 sent 领先目标，
+    -- 客户端 ACK 越界后整个会话只能重登。unquiesce 据此拒绝
+    entity.migration_exported = true
     return {
         bytes = bytes,
         session_epoch = io_.session_epoch,
@@ -419,6 +442,32 @@ FRAMEWORK.session_import = function(entity, payload)
         return nil, rerr
     end
     entity.session_io = io_
+    return {
+        session_epoch = io_.session_epoch,
+        owner_epoch = io_.owner_epoch,
+        sent = io_.sent,
+        acked = io_.acked,
+    }
+end
+
+-- 迁移（P15）最后一跳：把连接接到新 owner 上并重放未确认下行。
+-- 必须在 session_import 之后调用：只装 session_io 不建连接记录，目标就没有下行出口
+FRAMEWORK.session_attach = function(entity, conn_id)
+    if not session then
+        return nil, "no session layer"
+    end
+    local io_ = entity.session_io
+    if not io_ then
+        return nil, "no session io"
+    end
+    local ok, err = session.attach(conn_id, entity, self_service_name(), io_.owner_epoch)
+    if not ok then
+        return nil, err
+    end
+    if not session.replay(entity) then
+        -- 重放缓冲有缺口：attach 已经把连接踢掉，客户端会重新登录
+        return nil, "replay gap"
+    end
     return {
         session_epoch = io_.session_epoch,
         owner_epoch = io_.owner_epoch,
@@ -542,6 +591,15 @@ function CMD.client_msg(conn_id, data)
         log.warn("drop a package with an invalid conn_id")
         return
     end
+    -- 迁移冻结：QUIESCING 之后到达的上行一律丢弃，既不执行也不回包。
+    -- 不回包是有意的——客户端按超时重传同一个 req_id，重传落到新 owner 上会命中
+    -- 随快照迁过去的幂等缓存，拿到的还是第一次执行的结果；而在协议层回一个"拒绝"
+    -- 会让没有 errcode 字段的协议走断连兜底，把无感迁移变成一次掉线。
+    local entity = session.get_entity(conn_id)
+    if entity and entity.migrating then
+        log.debug("drop upstream while the entity is migrating", "type", type_name, "id", tostring(entity.id))
+        return
+    end
     require("skyext.sproto_api").dispatch_message(conn_id, data)
 end
 
@@ -577,6 +635,125 @@ function CMD.session_closed(conn_id)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- 计划内迁移（P15）：实体侧三个动作，由游戏层的迁移适配器经 router / cluster 调用，
+-- 不在客户端协议里暴露。编排与失败分流见 skyext.migration。
+-- ---------------------------------------------------------------------------
+
+-- 枚举本 agent 已加载的实体（含迁移分流状态）。适配器用它决定哪些实体能无感移交
+function CMD.migration_list()
+    if not entitymgr then
+        return {}
+    end
+    return entitymgr:list_loaded()
+end
+
+-- QUIESCING：冻结实体，排空队列。返回 true 表示可以继续导出快照
+function CMD.migration_quiesce(entity_id)
+    if not entitymgr then
+        return false, "entity manager not ready"
+    end
+    return entitymgr:quiesce(entity_id)
+end
+
+-- 迁移失败、实体留在本节点继续服务。快照已送出的实体不允许撤销
+function CMD.migration_unquiesce(entity_id, reason)
+    if not entitymgr then
+        return false, "entity manager not ready"
+    end
+    return entitymgr:unquiesce(entity_id, reason)
+end
+
+-- 落库 + 释放锁 + 解除绑定，但不断开客户端：连接要留给目标节点接管
+function CMD.migration_release(entity_id)
+    if not entitymgr then
+        return false, "entity manager not ready"
+    end
+    return entitymgr:release_for_migration(entity_id)
+end
+
+-- 迁移中转：快照先落到目标进程，再由 migration_commit 在实体队列里安装。
+-- 拆成两步是为了让 TRANSFER（送达）与 OWNER_HANDOFF（认领 + 安装）各自可观测、可重试；
+-- 合成一步的话，安装失败就分不清是没送到还是没认领上。
+local g_staged = {}
+local STAGED_TTL = 60
+local STAGED_MAX = 64
+
+local function prune_staged(now)
+    local count = 0
+    for id, entry in pairs(g_staged) do
+        if now - entry.at > STAGED_TTL then
+            g_staged[id] = nil
+        else
+            count = count + 1
+        end
+    end
+    return count
+end
+
+function CMD.migration_stage(entity_id, payload)
+    if type(payload) ~= "table" or type(payload.bytes) ~= "string" then
+        return false, "snapshot is required"
+    end
+    local now = os.time()
+    -- 没有上限的话，一次异常就能把目标节点变成快照仓库
+    if prune_staged(now) >= STAGED_MAX then
+        return false, "too many staged snapshots"
+    end
+    g_staged[entity_id] = { payload = payload, at = now }
+    return true
+end
+
+-- 在实体队列里执行，异常转成失败返回而不是把 RPC 打崩
+local function in_entity(entity_id, fn)
+    local called, ok, result, err = pcall(entitymgr.with_entity, entitymgr, entity_id, fn)
+    if not called then
+        return false, tostring(ok)
+    end
+    return ok, result, err
+end
+
+-- OWNER_HANDOFF：认领 + 安装。with_entity 里的 ensure_loaded 就是 Fence 认领——
+-- 源端已经释放锁，这里抢到的是新租约（fence 严格前进）。抢不到说明别的节点已经接管。
+function CMD.migration_commit(entity_id)
+    if not entitymgr then
+        return false, "entity manager not ready"
+    end
+    local staged = g_staged[entity_id]
+    if not staged then
+        return false, "no staged snapshot"
+    end
+    local ok, result, err = in_entity(entity_id, function(entity)
+        return FRAMEWORK.session_import(entity, staged.payload)
+    end)
+    if not ok then
+        return false, tostring(result)
+    end
+    if type(result) ~= "table" then
+        return false, tostring(err or "snapshot rejected")
+    end
+    g_staged[entity_id] = nil
+    return true
+end
+
+-- REPLAYING：把连接交给新 owner 并重放。失败时快照仍留在实体上，
+-- 客户端重新登录会走 bind 重建会话，不会带着半截状态继续跑
+function CMD.session_attach(entity_id, conn_id)
+    if not entitymgr then
+        return false, "entity manager not ready"
+    end
+    local ok, result, err = in_entity(entity_id, function(entity)
+        return FRAMEWORK.session_attach(entity, conn_id)
+    end)
+    if not ok then
+        return false, tostring(result)
+    end
+    if type(result) ~= "table" then
+        return false, tostring(err or "attach failed")
+    end
+    return true
+end
+
 function CMD.start(conf)
     local modules_path = conf.modules_path
 
@@ -603,6 +780,9 @@ function CMD.start(conf)
     end
 
     handler = require("entity_handler." .. type_name)
+    -- 可靠消息投递也走同一套命令解析：Outbox 回执这类框架命令不在 handler.handlers 里，
+    -- 只查业务表会让它们永远 "no handler" 并进死信队列
+    handler.resolve = handler_of
     entitymgr = entitymgr_mod.new(type_name, type_config, handler, g_data_modules, g_module_order)
 
     if session then

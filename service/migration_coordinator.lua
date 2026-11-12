@@ -2,13 +2,19 @@
 --
 -- 为什么阶段实现要由适配器注入：实体枚举、网关屏障、快照传输都跨越部署边界
 -- （哪些节点参与、哪台网关存活、屏障怎么确认），框架替它猜一套只会得到一个
--- "看起来迁移成功、实际丢了包"的实现。没注入适配器时本服务返回空实体列表，
--- 停服流程退化为普通卸载 —— 安全，但明确不是无感迁移。
+-- "看起来迁移成功、实际丢了包"的实现。
+--
+-- 但"注入"不等于"允许空跑"：运维把 migration.enabled 打开，就必须得到一次真的迁移。
+-- 因此 CMD.start 会校验适配器（模块名或 set_adapter 注入）与全部必需阶段，
+-- 缺一项就拒绝启动、让节点启动失败 —— 而不是在停服那一刻才发现没有适配器，
+-- 把全员掉线伪装成"迁移已完成"。
 --
 -- 适配器契约见 lualib/skyext/migration.lua 的 deps：
 --   list_entities() -> { { id, conn_id, owner_epoch, critical_unknown, busy }, ... }
---   quiesce / freeze / export / transfer / handoff / activate(entity) -> true | false, reason
---   fallback(entity, reason)
+--   quiesce / freeze / export / transfer / handoff / activate(entity, barrier_id) -> true | nil, reason
+--   probe(entity) -> bool     可选，BUSY 实体的限时等待
+--   fallback(entity, reason)  可选，降级通知（提示续接或重登）
+--   init(conf)                可选，拿到本服务的配置表
 local skynet = require "skynet"
 local cmd_api = require "skyext.cmd_api"
 local log = require "skyext.log"
@@ -18,8 +24,13 @@ local node_shutdown_api = require "skyext.node_shutdown_api"
 local CMD = {}
 
 local g_adapter
+local g_conf
+local g_started = false
+-- 停服截止时间到达后由 node_shutdown 置位：迁移在每个阶段边界检查它
+local g_cancelled = false
 
-local DEP_NAMES = {
+-- 六个阶段一个都不能少：缺哪一步都会得到一个"宣称迁移成功、会话没送到"的假象
+local REQUIRED_DEPS = {
     "list_entities",
     "quiesce",
     "freeze",
@@ -27,10 +38,26 @@ local DEP_NAMES = {
     "transfer",
     "handoff",
     "activate",
+}
+
+-- 可选阶段：probe 只影响 BUSY 实体的等待策略，fallback 只影响降级提示
+local OPTIONAL_DEPS = {
+    "probe",
     "fallback",
 }
 
--- 由节点启动流程或游戏层在停服前注入。只接受函数字段，缺项由 migration.run 报错
+local function missing_deps(adapter)
+    local missing = {}
+    for _, name in ipairs(REQUIRED_DEPS) do
+        if type(adapter[name]) ~= "function" then
+            missing[#missing + 1] = name
+        end
+    end
+    return missing
+end
+
+-- 同进程注入（测试、以及把协调器和游戏层放在一个服务里的部署）。
+-- 跨服务调用传不了函数，正式接线走 conf.adapter 模块名。
 function CMD.set_adapter(adapter)
     if adapter ~= nil and type(adapter) ~= "table" then
         return false, "adapter must be a table"
@@ -39,23 +66,114 @@ function CMD.set_adapter(adapter)
     return true
 end
 
-local function default_adapter()
-    -- 空列表：没有实体需要迁移，停服继续走 unload。绝不假装完成了一次无感迁移
-    return {
-        list_entities = function()
-            return {}
-        end,
-    }
+-- 启动。返回 false 时 launcher 会让节点启动失败：配置了迁移却没有可用的适配器，
+-- 唯一安全的做法是立刻告诉运维，而不是等到停服时静默退化成"全员重登"。
+function CMD.start(conf)
+    if g_started then
+        return true
+    end
+    if type(conf) ~= "table" then
+        return false, "migration config must be a table"
+    end
+    if conf.enabled ~= true then
+        return false, "migration is not enabled"
+    end
+
+    local adapter = g_adapter
+    if not adapter then
+        local module_name = conf.adapter
+        if type(module_name) ~= "string" or module_name == "" then
+            return false, "migration.adapter (module name) is required when migration is enabled"
+        end
+        local loaded_ok, loaded = pcall(require, module_name)
+        if not loaded_ok then
+            return false, "cannot load migration adapter '" .. module_name .. "': " .. tostring(loaded)
+        end
+        adapter = loaded
+    end
+    if type(adapter) ~= "table" then
+        return false, "migration adapter must be a table"
+    end
+    local missing = missing_deps(adapter)
+    if #missing > 0 then
+        return false, "migration adapter is missing: " .. table.concat(missing, ", ")
+    end
+    if type(adapter.init) == "function" then
+        local init_ok, init_err = pcall(adapter.init, conf)
+        if not init_ok then
+            return false, "migration adapter init failed: " .. tostring(init_err)
+        end
+    end
+
+    -- 注册失败不能吞：否则停服时不会跑迁移，运维以为开了
+    local hook_ok, hook_err = pcall(node_shutdown_api.add_hook, "migrate", "run")
+    if not hook_ok then
+        return false, "cannot register the migrate shutdown hook: " .. tostring(hook_err)
+    end
+
+    g_adapter = adapter
+    g_conf = conf
+    g_started = true
+    log.info(
+        "migration coordinator ready",
+        "type",
+        tostring(conf.type_name or "?"),
+        "adapter",
+        tostring(conf.adapter or "<injected>")
+    )
+    return true
 end
 
--- 停服钩子会以 CMD 命令的形式调用这里（node_shutdown 的 migrate 阶段）
+-- 停服钩子会以 CMD 命令的形式调用这里（node_shutdown 的 migrate 阶段）。
+-- 没 start 过就明确失败：空实体列表会让停服流程"成功"地什么都不做。
 function CMD.run(opts)
-    local adapter = g_adapter or default_adapter()
-    local deps = {}
-    for _, name in ipairs(DEP_NAMES) do
-        deps[name] = adapter[name]
+    if not g_started or not g_adapter then
+        log.error("migration coordinator is not started")
+        return false, "migration coordinator is not started"
     end
-    local ok, stats, err = pcall(migration.run, deps, opts or {})
+    g_cancelled = false
+    local deps = {}
+    for _, name in ipairs(REQUIRED_DEPS) do
+        deps[name] = g_adapter[name]
+    end
+    for _, name in ipairs(OPTIONAL_DEPS) do
+        deps[name] = g_adapter[name]
+    end
+    local run_opts = {}
+    for k, v in pairs(opts or {}) do
+        run_opts[k] = v
+    end
+    -- 取消令牌：node_shutdown 超时后调 CMD.cancel，迁移在下一个阶段边界停下。
+    -- 只停止等待是不够的——迁移协程会和卸载并行跑，源实体被卸掉之后还在写
+    run_opts.is_cancelled = function()
+        return g_cancelled
+    end
+    -- 并发：每个实体自己抢锁、自己的 conn 屏障，互不依赖。停服预算只有 timeout/2，
+    -- 串行迁几百个在线角色必然超时
+    run_opts.concurrency = (g_conf and g_conf.concurrency) or 1
+    run_opts.parallel = function(tasks)
+        local pending = #tasks
+        if pending == 0 then
+            return
+        end
+        local waiter = {}
+        for _, task in ipairs(tasks) do
+            skynet.fork(function()
+                local ok, err = pcall(task)
+                if not ok then
+                    log.error("migration worker raised", "err", tostring(err))
+                end
+                pending = pending - 1
+                if pending == 0 then
+                    skynet.wakeup(waiter)
+                end
+            end)
+        end
+        if pending > 0 then
+            skynet.wait(waiter)
+        end
+    end
+    local ok, stats, err = pcall(migration.run, deps, run_opts)
     if not ok then
         log.error("migration coordinator raised", "err", tostring(stats))
         return false, stats
@@ -64,18 +182,32 @@ function CMD.run(opts)
         log.error("migration coordinator failed", "err", tostring(err))
         return false, err
     end
+    if g_cancelled then
+        log.warn("migration round ended by cancellation", "ready", stats.ready, "cancelled", stats.cancelled)
+    end
     return true, stats
 end
 
+-- 停服截止时间到达：让正在跑的迁移在阶段边界停下
+function CMD.cancel(reason)
+    if g_cancelled then
+        return true
+    end
+    g_cancelled = true
+    log.warn("migration cancelled", "reason", tostring(reason))
+    return true
+end
+
+-- 只读观测：没就绪时 installed = false，抓取端据此判断"迁移到底开没开"
 function CMD.stats()
-    return g_adapter ~= nil
+    return {
+        installed = g_started,
+        type_name = g_conf and g_conf.type_name or nil,
+        adapter = g_conf and g_conf.adapter or nil,
+        cancelled = g_cancelled,
+    }
 end
 
 skynet.start(function()
     cmd_api.dispatch(CMD)
-    -- 注册失败不能吞：否则停服时不会跑迁移，运维以为开了
-    local ok, err = pcall(node_shutdown_api.add_hook, "migrate", "run")
-    if not ok then
-        log.error("migration coordinator failed to register the migrate hook", "err", tostring(err))
-    end
 end)

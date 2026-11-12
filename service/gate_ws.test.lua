@@ -620,3 +620,37 @@ t.describe("ws owner epoch", function()
         t.expect(h.CMD.owner_state(id).owner_epoch).to.be_nil()
     end)
 end)
+
+-- 屏障的语义是"这条会话正在换 owner"，上行也要停：
+-- 只断下行的话，屏障到 resume 之间的包会落到一个已经交出所有权的实体上
+t.describe("ws 迁移屏障上行", function()
+    t.it("stops forwarding upstream while the session is frozen", function()
+        local h = harness()
+        h.connect(9)
+        local id = h.cid(9)
+        h.CMD.bind(id, "node1", ".entity_agent:role:1", 2)
+        h.sent = {}
+        h.handler.message(9, "BYTES", "binary")
+        t.expect(#h.sent).to.equal(1)
+
+        h.CMD.freeze_owner(id, 2, "barrier-1")
+        h.handler.message(9, "LATE", "binary")
+        t.expect(#h.sent).to.equal(1)
+        t.expect(h.CMD.stats().frozen_upstreams).to.equal(1)
+    end)
+
+    -- 解冻之后上行要恢复：否则客户端在迁移完成后永远发不出请求
+    t.it("forwards upstream again once a newer owner takes over", function()
+        local h = harness()
+        h.connect(9)
+        local id = h.cid(9)
+        h.CMD.bind(id, "node1", ".entity_agent:role:1", 2)
+        h.CMD.freeze_owner(id, 2, "barrier-1")
+        h.CMD.resume_owner(id, 3, "node2", ".entity_agent:role:1")
+
+        h.sent = {}
+        h.handler.message(9, "BYTES", "binary")
+        t.expect(#h.sent).to.equal(1)
+        t.expect(h.sent[1][1]).to.equal("node2!.entity_agent:role:1")
+    end)
+end)

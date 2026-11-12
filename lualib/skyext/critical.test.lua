@@ -323,6 +323,33 @@ t.describe("critical 客户端入口", function()
         t.expect(h.applied).to.equal(1)
     end)
 
+    -- validate 抛错发生在 PREPARE 之前：库里什么都没写，报 UNKNOWN 会让调用方
+    -- 去查恢复任务，而查询侧只会回 NOT_STARTED —— 两个答案互相矛盾
+    t.it("reports a validation error without pretending the write is unknown", function()
+        local h = harness()
+        local handlers = h.handlers({
+            validate = function()
+                error("nil field in params")
+            end,
+        })
+        local result = h.critical.execute_client(h.entity, h.new_grant(), 1, "shop.buy", { amount = 1 }, handlers, {
+            hmac_fn = HASH,
+            hash_fn = HASH,
+            equal_fn = EQ,
+            now = h.now,
+        })
+        t.expect(result.status).to.equal(h.critical.STATUS.INTERNAL_ERROR)
+        t.expect(result.cache_policy).to.equal(h.critical.NO_CACHE)
+        t.expect(result.recovery_id).to.be_nil()
+        -- 没有任何持久化写入，也不该隔离缓存
+        t.expect(#h.store.updates).to.equal(0)
+        t.expect(h.store.critical._critical_intent_v1).to.be_nil()
+        t.expect(h.store.state).to.equal("NORMAL")
+        t.expect(h.applied).to.equal(0)
+        -- 查询侧与提交侧一致：这次操作确实没开始
+        t.expect(h.critical.query(h.entity, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0001").status).to.equal("NOT_STARTED")
+    end)
+
     t.it("persists a business rejection decided during apply", function()
         local h = harness()
         local handlers = h.handlers({
@@ -627,6 +654,33 @@ t.describe("critical 查询与恢复", function()
         h.store.critical = nil
         local q = h.critical.query(h.entity, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0001")
         t.expect(q.status).to.equal(h.critical.STATUS.UNKNOWN)
+    end)
+
+    -- 冷账本读取必须和提交路径一样有 pcall：驱动抛错时不能把异常抛给对账调用方，
+    -- 否则支付对账会因为一次连接抖动直接崩在查询上
+    t.it("turns a raising ledger read into a structured UNKNOWN", function()
+        local h = harness()
+        local ledger = {
+            critical_find = function()
+                error("driver closed")
+            end,
+        }
+        local q = h.critical.query(h.entity, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0001", { ledger = ledger })
+        t.expect(q.status).to.equal(h.critical.STATUS.UNKNOWN)
+        t.expect(q.reason:find("ledger read raised", 1, true) ~= nil).to.equal(true)
+    end)
+
+    t.it("still reports the archived record when the ledger answers", function()
+        local h = harness()
+        local ledger = {
+            critical_find = function()
+                return { status = "COMMITTED", response = { gold = 7 } }
+            end,
+        }
+        local q = h.critical.query(h.entity, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0001", { ledger = ledger })
+        t.expect(q.status).to.equal("COMMITTED")
+        t.expect(q.archived).to.equal(true)
+        t.expect(q.response.gold).to.equal(7)
     end)
 
     -- 取消未决意图：一次 CAS 同时写 ABORTED 与清意图，不能只做 $unset
@@ -1231,6 +1285,52 @@ t.describe("critical 源侧 Outbox", function()
         t.expect(result.status).to.equal(h.critical.STATUS.CAPACITY_EXCEEDED)
         t.expect(h.applied).to.equal(0)
     end)
+
+    -- 事件只增不减会让角色被永久拒绝：到上限时先腾终态事件，再决定是否拒绝
+    t.it("evicts settled events instead of refusing the new one", function()
+        local h = harness()
+        local existing = {}
+        for i = 1, h.critical.MAX_OUTBOX do
+            existing[string.format("evt_%064x", i)] = {
+                status = "DELIVERED",
+                created_at = h.now - 1000,
+                updated_at = h.now - 1000,
+                op_type = "mail.send",
+            }
+        end
+        h.store.critical = { _critical_outbox_v1 = existing, _critical_outbox_pending_count = 0 }
+
+        local result, event = internal(h)
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+        local commit = h.store.updates[#h.store.updates].update
+        t.expect(commit["$set"]["_critical_outbox_v1." .. event.event_id]).to.equal(event)
+
+        -- 腾挪必须与新增在同一次写入里：单独先删会留下"事件没了、资产没提交"
+        local unset = commit["$unset"] or {}
+        local removed = 0
+        for key in pairs(unset) do
+            if key:find("^_critical_outbox_v1%.") then
+                removed = removed + 1
+            end
+        end
+        t.expect(removed).to.equal(1)
+        -- 内存副本同步：否则下一次容量判断会少腾一条
+        t.expect(h.store.critical._critical_outbox_v1[event.event_id].status).to.equal("PENDING")
+    end)
+
+    -- 没投出去的事件永远不腾：删了就是业务效果永久丢失
+    t.it("never evicts events that were not delivered yet", function()
+        local h = harness()
+        local now = 10000
+        local ids = h.critical.evictable_outbox_events({
+            a = { status = "PENDING", created_at = now - 8 * 24 * 3600 },
+            b = { status = "DELIVERED", updated_at = now - 1 },
+            c = { status = "ENQUEUED", updated_at = now - 8 * 24 * 3600 },
+        }, now, 10)
+        t.expect(#ids).to.equal(2)
+        t.expect(ids[1]).to.equal("c")
+        t.expect(ids[2]).to.equal("b")
+    end)
 end)
 
 -- 归档：热 _critical_ops_v1 -> 冷 op_ledger
@@ -1452,5 +1552,52 @@ t.describe("critical 归档后重放", function()
         local result = call(h, nil)
         t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
         t.expect(h.applied).to.equal(1)
+    end)
+end)
+
+-- 触顶是受控拒绝，不会自动扩容：必须在 80% 就看到趋势。
+-- 预警按实体只打一次，否则 80% 之后每条操作都刷一行日志
+t.describe("critical 容量预警", function()
+    local function many_ops(h, n)
+        local ops = {}
+        for i = 1, n do
+            ops[string.format("srv_%064x", i)] = { status = "COMMITTED", at = h.now - 100000 }
+        end
+        return ops
+    end
+
+    t.it("warns once when the op ledger crosses the warning line", function()
+        local h = harness()
+        h.store.critical = { _critical_ops_v1 = many_ops(h, 420) }
+        local result = h.client(1)
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+        t.expect(h.entity.capacity_warned_ops).to.equal(true)
+    end)
+
+    t.it("warns once when the outbox crosses the warning line", function()
+        local h = harness()
+        local box = {}
+        for i = 1, 420 do
+            box[string.format("evt_%064x", i)] = { status = "DELIVERED", updated_at = h.now - 100 }
+        end
+        h.store.critical = { _critical_outbox_v1 = box, _critical_outbox_pending_count = 0 }
+        local result = h.critical.execute_client(h.entity, h.new_grant(), 1, "shop.buy", { amount = 1 }, h.handlers(), {
+            hmac_fn = HASH,
+            hash_fn = HASH,
+            equal_fn = EQ,
+            now = h.now,
+            outbox = {
+                {
+                    event_id = "evt_" .. string.rep("e", 64),
+                    target_type = "role",
+                    target_id = 9,
+                    op_type = "mail.send",
+                    param_hash = string.rep("a", 64),
+                    status = "PENDING",
+                },
+            },
+        })
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+        t.expect(h.entity.capacity_warned_outbox).to.equal(true)
     end)
 end)
