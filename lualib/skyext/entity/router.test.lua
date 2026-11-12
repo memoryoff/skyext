@@ -240,6 +240,22 @@ t.describe("entity.router", function()
             t.expect(h.warned).to.exist()
             t.expect(h.warned.msg).to.match("retry on load")
         end)
+
+        -- 回执是通知性质：只通知已加载实体，绝不为它加载离线的源角色
+        t.it("lazy 模式只通知已加载实体，不触发加载", function()
+            local h = harness({ msg_id = 55 })
+            local msg_id = h.router.reliable_send("role", 2, "outbox_ack", {}, { lazy = true })
+            t.expect(msg_id).to.equal(55)
+            t.expect(h.calls[1].tag).to.equal("skynet.send")
+            t.expect(h.calls[1][3]).to.equal("deliver_reliable_loaded")
+        end)
+
+        t.it("lazy 唤醒失败仍然返回 msg_id 并记告警", function()
+            local h = harness({ msg_id = 56, remote_send_error = "node down" })
+            local msg_id = h.router.reliable_send("role", 1, "outbox_ack", {}, { lazy = true })
+            t.expect(msg_id).to.equal(56)
+            t.expect(h.warned.msg).to.match("retry on load")
+        end)
     end)
 end)
 

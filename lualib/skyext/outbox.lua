@@ -850,6 +850,10 @@ function RECEIVER_MT:ack_source(envelope, entity)
                 receiver_type = entity and entity.type_name or nil,
                 receiver_id = entity and entity.id or nil,
             },
+        }, {
+            -- 回执必须可靠送达（重投仍要再发，ACK 可能丢），但不需要为了唤醒
+            -- 一条回执去加载离线的源角色；在线实体照样立即处理
+            lazy = true,
         })
     end)
     if not called or not ok then

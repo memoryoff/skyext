@@ -17,6 +17,10 @@ M.DEFAULT_SCAN = 16
 M.DEFAULT_LEASE = 30
 
 local m_outcome = metrics.counter("skyext_critical_reconciler_total", "Reconcile job outcomes", { "outcome" })
+-- 扫描口径：任务表本身只能逐条查，MANUAL_REVIEW / RETRY_WAIT 堆积没有趋势可看。
+-- 每轮按状态把本轮看到的 due 任务数暴露出去，压测和告警都靠它。
+local m_due =
+    metrics.gauge("skyext_critical_reconcile_due_jobs", "Due reconcile jobs observed by the last scan", { "state" })
 
 local STATES = critical.JOB_STATE
 local DUE_STATES = { STATES.PENDING, STATES.CLAIMING_FENCE, STATES.RETRY_WAIT }
@@ -50,6 +54,7 @@ function M.run_once(deps, opts)
         retry = 0,
         conflict = 0,
         failed = 0,
+        due = {},
     }
 
     -- 只扫租约到期的可认领任务；索引是 {state:1, lease_until:1}
@@ -71,6 +76,9 @@ function M.run_once(deps, opts)
     end
 
     for _, job in ipairs(jobs) do
+        if type(job) == "table" and type(job.state) == "string" then
+            stats.due[job.state] = (stats.due[job.state] or 0) + 1
+        end
         if type(job) ~= "table" or job.rid == nil or type(job.op_id) ~= "string" then
             stats.failed = stats.failed + 1
         else
@@ -118,6 +126,9 @@ function M.run_once(deps, opts)
                 end
             end
         end
+    end
+    for state, count in pairs(stats.due) do
+        m_due:set(count, { state = state })
     end
     return stats
 end

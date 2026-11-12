@@ -85,6 +85,39 @@ local function started_optional(h)
     return out
 end
 
+-- 启用却没配关键字段，比"没启用"更难排查：必须在启动日志里说清楚
+t.describe("launcher 启动自检", function()
+    t.it("reports enabled and disabled services without inventing problems", function()
+        local h = harness({ conf = {} })
+        local report = h.launcher.self_check()
+        t.expect(#report.enabled).to.equal(0)
+        t.expect(#report.disabled).to.equal(4)
+        t.expect(#report.problems).to.equal(0)
+    end)
+
+    t.it("flags an enabled migration that is missing type_name and adapter", function()
+        local h = harness({ conf = { migration = { enabled = true } } })
+        local report = h.launcher.self_check()
+        t.expect(report.enabled[1]).to.equal("migration")
+        t.expect(#report.problems).to.equal(2)
+        t.expect(report.problems[1]).to.match("type_name")
+        t.expect(report.problems[2]).to.match("adapter")
+    end)
+
+    t.it("flags a payment callback enabled without any provider", function()
+        local h = harness({ conf = { pay_callback = { enabled = true, role_type = "role", providers = {} } } })
+        local report = h.launcher.self_check()
+        t.expect(#report.problems).to.equal(1)
+        t.expect(report.problems[1]).to.match("providers")
+    end)
+
+    t.it("logs the problems during node startup", function()
+        local h = harness({ conf = { pay_callback = { enabled = true, role_type = "role", providers = {} } } })
+        h.launcher.launcher_node()
+        t.expect(#h.errors > 0).to.equal(true)
+    end)
+end)
+
 t.describe("launcher 可选服务接线", function()
     t.it("starts nothing optional without an explicit enable", function()
         local h = harness({ conf = { outbox_worker = { interval = 1 }, pay_callback = { port = 8090 } } })

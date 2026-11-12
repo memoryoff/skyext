@@ -132,9 +132,39 @@ function M.scoped_send(type_name, value, cmd, ...)
     return M.send(type_name, types.scoped_id(type_name, value), cmd, ...)
 end
 
-function M.reliable_send(type_name, entity_id, cmd, args)
+-- 只通知**已经在内存里**的实体去读 pending：实体不在就什么都不做。
+-- 给 Outbox 回执这类"通知性质"的消息用：消息已经持久化，源角色离线时
+-- 下次加载会补上，没必要为一条回执把它从库里捞起来（抢锁 + 读库）。
+function M.notify_reliable_loaded(type_name, entity_id)
+    local node, service_name = get_target(type_name, entity_id)
+    if node == self_node() then
+        return (pcall(skynet.send, service_name, "lua", "deliver_reliable_loaded", entity_id))
+    end
+    return (pcall(cluster.send, node, service_name, "deliver_reliable_loaded", entity_id))
+end
+
+function M.reliable_send(type_name, entity_id, cmd, args, opts)
     local reliable_msg = require "skyext.entity.reliable_msg"
     local msg_id = reliable_msg.save(type_name, entity_id, cmd, args)
+
+    if opts and opts.lazy then
+        -- 消息已落库：在线实体立即投，离线实体等下次加载，不为了唤醒而加载
+        if not M.notify_reliable_loaded(type_name, entity_id) then
+            local log = require "skyext.log"
+            log.warn(
+                "reliable_send lazy notify failed, will retry on load",
+                "type",
+                type_name,
+                "id",
+                entity_id,
+                "cmd",
+                cmd,
+                "msg_id",
+                msg_id
+            )
+        end
+        return msg_id
+    end
 
     if not M.poke_reliable(type_name, entity_id) then
         local log = require "skyext.log"

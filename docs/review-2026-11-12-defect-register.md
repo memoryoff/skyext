@@ -20,9 +20,9 @@
 
 | 分类 | 数量 | 说明 |
 | --- | --- | --- |
-| 已修复并验证（第五批 + 第六批） | 13 | 跨模块契约断链、语义缺陷、取消兜底、回执归属，124 files / 124 passed |
-| 代码层待修 | 9 | 本文件 §3，均有明确的测试验收标准 |
-| 部分完成 | 1 | R-07 指标：迁移取消/兜底已埋点，恢复任务与 PREPARED 时长仍缺 |
+| 已修复并验证（第五 ~ 七批） | 15 | 契约断链、取消兜底、回执归属、启动自检、回执唤醒，124 files / 124 passed |
+| 代码层待修 | 7 | 本文件 §3，均有明确的测试验收标准 |
+| 部分完成 | 1 | R-07 指标：迁移取消/兜底、恢复任务 due 已埋点，PREPARED 时长仍缺 |
 | 需真实环境验证 | 7 | 本文件 §4，不是代码写错，是没跑过 |
 | 设计权衡（记录不改） | 4 | 本文件 §5，改了反而更危险 |
 | 后续优化 | 3 | P2 类，不阻塞生产验收 |
@@ -57,13 +57,16 @@
 
 ## 3. 代码层待修（可在本地闭环，按优先级）
 
-### 3.0 第六批已修（本轮，工作区未提交）
+### 3.0 第六 / 七批已修（第七批在工作区，未提交）
 
 | 编号 | 修复 | 验证 |
 | --- | --- | --- |
 | R-01（部分） | 适配器新增 `begin_round` / `abort`：登记「已冻结但未 activate」的实体，`CMD.cancel` 时主动 `kick` 让网关会话连同 `frozen_epoch` 一起销毁；`call_agent` / `call_gate` 在取消后拒绝新的阶段 RPC（kick 除外）；`node_shutdown` 超时发 cancel 后加 10 tick 宽限。协调器 `CMD.run` 复位适配器状态，`CMD.stats().abort` 可观测，新增 `skyext_migration_cancelled_total` / `skyext_migration_abort_clients_total` | `migration_adapter.test.lua` 5 例、`migration_coordinator.test.lua` 2 例；124 files / 124 passed |
 | R-02 | `outbox.is_valid_event_id` 在边界拒绝畸形 ID（含可靠消息追加的数字 `msg_id`），`FRAMEWORK.outbox_ack` 对畸形/错投回执抛错进 DLQ；回执携带 `receiver_type/receiver_id`，`mark_delivered` 用 `expect_target` 校验事件归属；`ack_source` 带接收方坐标 | `outbox.test.lua` 3 例、`entity_agent.test.lua` 3 例；124 files / 124 passed |
 | R-11 | `launcher_entities` 用 `pcall(skynet.call, ...)` 统一「抛异常 / 返回 false」两种失败形态，错误信息带实体类型名与原因，删掉死分支 | `launcher.test.lua` 2 例；124 files / 124 passed |
+| R-05 | `router.reliable_send` 新增 `opts.lazy`：回执仍持久化、重投仍再发（ACK 可能丢），但只通知**已加载**的源实体，不为一条回执加载离线角色；新增 `notify_reliable_loaded` 走 `deliver_reliable_loaded` | `router.test.lua` 2 例、`outbox.test.lua` 1 例断言 lazy；124 files / 124 passed |
+| R-06 | `launcher.self_check()` 输出 enabled/disabled/problems 结构化摘要，`launcher_node` 在索引门禁后打印；启用但缺 `type_name`/`adapter`/`providers` 会 `log.error` | `launcher.test.lua` 4 例；124 files / 124 passed |
+| R-07（部分） | `critical_reconciler` 每轮按状态统计 due 任务并 `set` 到 `skyext_critical_reconcile_due_jobs{state}`，`stats.due` 可断言；PREPARED 时长仍未埋点 | `critical_reconciler.test.lua` 2 例；124 files / 124 passed |
 
 > R-01 只做到**兜底清理**，没有给跨节点 RPC 加 deadline；卡在 `cluster.call` 里的协程仍无法中断，
 > 见 R-01 条目的「建议修复 ②」，这一半仍未完成。
@@ -100,15 +103,15 @@
 - **建议修复**：区分「可重试的投递失败」与「事件本身」，给 PENDING 设置带保留期的告警/降级路径（例如写入独立的 `_critical_outbox_backlog` 集合、或允许在明确标记后腾挪并保留可重投锚点），并保证受控拒绝可自动恢复。
 - **验收标准**：模拟 `deliver` 连续失败至触顶，断言依赖恢复后角色能自动恢复提交，且不丢事件、不重复入账。
 
-### R-05 · 回执写放大与离线源角色加载 【中】
+### R-05 · 回执写放大与离线源角色加载 【中 · 已修，见 §3.0】
 
 - **现象**：`RECEIVER_MT:ack_source` 在接收方实体队列内同步 `router.reliable_send`（内部 `save` + `poke_reliable`），会尝试唤醒/加载离线源角色；重投命中 COMMITTED 的历史结果时仍再发一条 ACK。
 - **证据**：`lualib/skyext/outbox.lua:ack_source`、`lualib/skyext/entity/router.lua:reliable_send/poke_reliable`。
 - **影响**：一次跨实体事件多一次 Mongo 写 + 一次可能的实体加载（抢锁、读库）；压测时这是接收方写放大的主要来源。
-- **建议修复**：回执按 `event_id` 去重（命中 COMMITTED 历史结果时不再发），`poke_reliable` 改为可配置的延迟/批量唤醒。
+- **建议修复（已修正原判断）**：重投命中历史结果时**仍必须再发 ACK**——ACK 可能丢失，跳过会让源端事件永远停在 ENQUEUED；真正该优化的是唤醒方式：只通知已加载实体，不为一条回执加载离线源角色。
 - **验收标准**：重复投递同一事件只产生一条回执；可统计「回执数 / 事件数」并纳入压测指标。
 
-### R-06 · P2-06 启动配置自检缺失 【中】
+### R-06 · P2-06 启动配置自检缺失 【中 · 已修，见 §3.0】
 
 - **现象**：只有每个可选服务自己的 `CMD.start` 做门禁，没有统一的「哪些服务未启用、哪些依赖缺失」的启动期自检。
 - **证据**：`example/lualib/launcher.lua:launch_optional_services`、`example/etc/nodes/common.app.lua`。
@@ -199,7 +202,7 @@
 | P0-01 | 已修 + 已验证 | `CMD.start` 门禁存在；`common.app.lua` 合并默认值后 `migration={enabled=true}` 不再启动失败（F-06） |
 | P0-02 | 已修 + 已验证（代码链路） | 适配器 + 三段接管 + 真实契约测试（F-01/F-02）；真实双节点回环仍属 V-02 |
 | P0-03 | 已修 | 启动顺序 node → entities(READY) → optional → gate；非实体节点不再起实体依赖服务 |
-| P1-01 | 部分修 | DELIVERED 回写链路已通并通过契约测试（F-03），回执归属与格式校验已修（R-02）；清理闭环与 PENDING 容量兜底见 R-03/R-04 |
+| P1-01 | 部分修 | DELIVERED 回写链路已通并通过契约测试（F-03），回执归属/格式（R-02）与懒唤醒（R-05）已修；清理闭环与 PENDING 容量兜底见 R-03/R-04 |
 | P1-02 | 已修 + 已验证 | `INTERNAL_ERROR` + outbox/pay_webhook 下游（F-05） |
 | P1-03 | **部分修** | `CMD.cancel`、阶段边界检查、取消时的网关屏障兜底（kick + 拒绝后续阶段 RPC）已实现；仍缺给跨节点 RPC 加 deadline，见 R-01 ② |
 | P1-04 | 部分修 | 80% 预警、归档滞后指标已修（F-08/F-10）；压测数值见 V-06 |
@@ -215,9 +218,9 @@
 
 ## 7. 建议修复顺序
 
-1. R-01 剩余半项：给 `cluster.call` / `skynet.call` 加 deadline 与阶段租约（唯一还会导致「连接永久卡死」的路径）
+1. R-01 剩余半项：给 `cluster.call` / `skynet.call` 加 deadline 与阶段租约。**注意**：单纯超时返回会让源端 FALLBACK 而目标端仍可能完成 commit/attach，必须同时有迁移代际校验，否则是伪修复
 2. R-03 / R-04（长期运行容量：终态清理成环、PENDING 触顶可自动恢复）
-3. R-05 / R-06 / R-07 剩余项（回执去重、启动配置自检、恢复任务与 PREPARED 时长指标）
+3. R-07 剩余：PREPARED 意图持续时间
 4. R-08 ~ R-10、R-12（低风险补齐，可与 P2-01 文档对齐一起做）
 5. V-01 / V-02 / V-06 / V-07（真实环境，是「能不能上生产」的判据）
 

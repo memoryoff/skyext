@@ -61,6 +61,21 @@ t.describe("critical_reconciler 状态机", function()
         t.expect(h.finished[1].state).to.equal(S.COMPLETED_COMMITTED)
         -- 抢占后 job_version 已经 +1，终态 CAS 必须用新版本
         t.expect(h.finished[1].version).to.equal(4)
+        -- 扫描口径：本轮看到的 due 任务按状态计数，供指标暴露
+        t.expect(stats.due[S.PENDING]).to.equal(1)
+    end)
+
+    t.it("counts due jobs by state for the scan gauge", function()
+        local h = harness({
+            jobs = {
+                { rid = 1, op_id = "srv_" .. string.rep("a", 64), job_version = 1, state = S.PENDING },
+                { rid = 2, op_id = "srv_" .. string.rep("b", 64), job_version = 1, state = S.RETRY_WAIT },
+                { rid = 3, op_id = "srv_" .. string.rep("c", 64), job_version = 1, state = S.PENDING },
+            },
+        })
+        local stats = assert(run(h))
+        t.expect(stats.due[S.PENDING]).to.equal(2)
+        t.expect(stats.due[S.RETRY_WAIT]).to.equal(1)
     end)
 
     t.it("completes as NOT_COMMITTED only after a proof says so", function()

@@ -13,12 +13,61 @@ local M = {}
 -- 这些服务全都通过实体路由干活，因此**必须在 launcher_entities 之后**启动：
 -- Outbox Worker 和 Critical Maintenance 一起来就扫 Mongo，支付回调一起来就开 HTTP 端口，
 -- 实体系统还没 READY 时它们只会拿到"找不到 owner"，第一轮全部空转。
+-- required / non_empty 只用于启动自检：启用却没配关键字段，比"没启用"更难排查，
+-- 必须在节点起来的那一刻就说清楚，而不是等停服迁移或支付回调才发现。
 M.OPTIONAL_SERVICES = {
-    { config_key = "outbox_worker", service = "outbox_worker" },
-    { config_key = "critical_maintenance", service = "critical_maintenance" },
-    { config_key = "pay_callback", service = "pay_callback" },
-    { config_key = "migration", service = "migration_coordinator" },
+    { config_key = "outbox_worker", service = "outbox_worker", required = { "type_name" } },
+    { config_key = "critical_maintenance", service = "critical_maintenance", required = { "type_name" } },
+    { config_key = "pay_callback", service = "pay_callback", required = { "role_type" }, non_empty = { "providers" } },
+    {
+        config_key = "migration",
+        service = "migration_coordinator",
+        required = { "type_name", "adapter" },
+    },
 }
+
+-- 结构化启动自检：哪些开了、哪些没开、开了但缺什么。只读，不改配置。
+function M.self_check()
+    local report = { enabled = {}, disabled = {}, problems = {} }
+    for _, spec in ipairs(M.OPTIONAL_SERVICES) do
+        local conf = config.get_table(spec.config_key)
+        if type(conf) == "table" and conf.enabled == true then
+            report.enabled[#report.enabled + 1] = spec.config_key
+            for _, field in ipairs(spec.required or {}) do
+                local value = conf[field]
+                if value == nil or value == "" then
+                    report.problems[#report.problems + 1] =
+                        string.format("%s is enabled without %s", spec.config_key, field)
+                end
+            end
+            for _, field in ipairs(spec.non_empty or {}) do
+                local value = conf[field]
+                if type(value) ~= "table" or next(value) == nil then
+                    report.problems[#report.problems + 1] =
+                        string.format("%s is enabled but %s is empty", spec.config_key, field)
+                end
+            end
+        else
+            report.disabled[#report.disabled + 1] = spec.config_key
+        end
+    end
+    return report
+end
+
+local function log_self_check()
+    local report = M.self_check()
+    log.info(
+        "optional services self-check",
+        "enabled",
+        table.concat(report.enabled, ","),
+        "disabled",
+        table.concat(report.disabled, ",")
+    )
+    for _, problem in ipairs(report.problems) do
+        log.error("optional service config problem", "detail", problem)
+    end
+    return report
+end
 
 function M.launch_optional_services()
     for _, spec in ipairs(M.OPTIONAL_SERVICES) do
@@ -82,6 +131,8 @@ function M.launcher_node()
     assert(all_ok, "auto create indexes failed")
     skynet.kill(mongo_index)
     log.info("auto create indexes success")
+    -- 索引门禁之后再自检：配置问题要跟着"节点已就绪"一起出现在启动日志里
+    log_self_check()
 end
 
 -- 客户端接入：网关管连接，login 处理还没绑定的会话。

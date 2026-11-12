@@ -95,8 +95,14 @@ local function harness(overrides)
             -- 回执走可靠消息：单元测试里只记录，不碰数据库
             if name == "skyext.entity.router" then
                 return {
-                    reliable_send = function(type_name, id, cmd, args)
-                        h.acks[#h.acks + 1] = { type_name = type_name, id = id, cmd = cmd, args = args }
+                    reliable_send = function(type_name, id, cmd, args, opts)
+                        h.acks[#h.acks + 1] = {
+                            type_name = type_name,
+                            id = id,
+                            cmd = cmd,
+                            args = args,
+                            opts = opts,
+                        }
                         return "msg-ack"
                     end,
                 }
@@ -498,6 +504,8 @@ t.describe("outbox 接收方", function()
         -- 回执带上接收方坐标，源端据此校验没有错投
         t.expect(unpacked[1].receiver_type).to.equal("role")
         t.expect(unpacked[1].receiver_id).to.equal(7)
+        -- 只通知已加载的源实体，不为一条回执加载离线角色
+        t.expect(h.acks[1].opts.lazy).to.equal(true)
     end)
 
     -- 纯读预检拒绝不是持久化终态：源端资产已扣，ACK 会让事件被删且永不重投
