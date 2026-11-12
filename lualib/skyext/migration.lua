@@ -89,12 +89,23 @@ M.cancelled = cancelled
 -- deps 里的每个函数返回 true 表示这一步已确认；返回 nil, reason 表示这一步失败。
 -- 任何一步失败都按 FALLBACK 处理：**不能**宣称"无感迁移成功"再把客户端留在
 -- 一个没有下行入口的会话上。
+-- 每一轮的 barrier 必须唯一。曾经用 `"mig_" .. entity.id` 这种"每轮都一样"的
+-- 固定值：目标端的取消标记只要还在 TTL 内，就会把**下一轮**同 barrier 的 stage
+-- 直接拒掉，那个实体在目标节点上就再也迁不进来了（停服重试时正好命中）。
+-- 进程内的计数器已经足够保证唯一：取消标记本身也只存在于目标端内存里
+local g_barrier_seq = 0
+
+local function new_barrier_id(entity)
+    g_barrier_seq = g_barrier_seq + 1
+    return string.format("mig_%s_%d_%d", tostring(entity.id), clock(), g_barrier_seq)
+end
+
 function M.migrate_entity(deps, entity, opts)
     opts = opts or {}
     if type(deps) ~= "table" or type(entity) ~= "table" then
         return fail(M.STATUS.FALLBACK, "invalid arguments")
     end
-    local barrier_id = opts.barrier_id or ("mig_" .. tostring(entity.id))
+    local barrier_id = opts.barrier_id or new_barrier_id(entity)
     -- 缺依赖一律 fail-closed：把"没配 export"当成成功，会得到一个宣称迁移完成、
     -- 但快照从未送达的会话
     local function step(phase, fn)

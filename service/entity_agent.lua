@@ -712,6 +712,19 @@ local g_aborted_barriers = {}
 local STAGED_TTL = 60
 local STAGED_MAX = 64
 
+-- 测试用的时钟偏移。TTL 过期是 A-07 的核心语义（陈旧取消标记必须自己过期，
+-- 不能靠"别的实体恰好来 stage"顺带清），而 os.time() 在单测里走不动，
+-- 所以留一个显式的、只在测试里用的偏移入口
+local g_clock_skew = 0
+local function wall_now()
+    return os.time() + g_clock_skew
+end
+
+function CMD._test_advance_time(seconds)
+    g_clock_skew = g_clock_skew + (seconds or 0)
+    return wall_now()
+end
+
 local function prune_staged(now)
     local count = 0
     for id, entry in pairs(g_staged) do
@@ -733,7 +746,12 @@ function CMD.migration_stage(entity_id, payload)
     if type(payload) ~= "table" or type(payload.bytes) ~= "string" then
         return false, "snapshot is required"
     end
-    local now = os.time()
+    local now = wall_now()
+    -- 先清过期标记，再做取消判断。
+    -- 反过来的话，一个上一轮留下的取消标记会在 TTL 内把这一轮的 stage 直接拒掉，
+    -- 而这个实体在目标节点上就再也迁不进来了（停服重试时正好命中）。
+    -- prune 原本只在"别的实体也来 stage"时才被顺带触发，等于没触发
+    local count = prune_staged(now)
     -- 同一 barrier 已经被源端取消：迟到的 stage 不能重新建立暂存
     local aborted = g_aborted_barriers[entity_id]
     if aborted then
@@ -744,7 +762,7 @@ function CMD.migration_stage(entity_id, payload)
         g_aborted_barriers[entity_id] = nil
     end
     -- 没有上限的话，一次异常就能把目标节点变成快照仓库
-    if prune_staged(now) >= STAGED_MAX then
+    if count >= STAGED_MAX then
         return false, "too many staged snapshots"
     end
     g_staged[entity_id] = { payload = payload, at = now }
@@ -757,6 +775,9 @@ function CMD.migration_abort(entity_id, barrier_id)
     if type(barrier_id) ~= "string" or barrier_id == "" then
         return false, "barrier_id is required"
     end
+    -- 顺带清过期条目：取消标记只应在"目标端可能还有迟到 RPC 在路上"的窗口内存在，
+    -- 否则它会一直占着这个实体，把下一轮正常迁移挡在外面
+    prune_staged(wall_now())
     local staged = g_staged[entity_id]
     if staged and staged.payload and staged.payload.barrier_id ~= barrier_id then
         -- 旧轮次的取消请求：不能让它误伤当前这一轮
@@ -766,7 +787,7 @@ function CMD.migration_abort(entity_id, barrier_id)
     if current and current.barrier_id ~= barrier_id then
         return false, "barrier mismatch"
     end
-    g_aborted_barriers[entity_id] = { barrier_id = barrier_id, at = os.time() }
+    g_aborted_barriers[entity_id] = { barrier_id = barrier_id, at = wall_now() }
     if staged then
         g_staged[entity_id] = nil
     end
@@ -785,16 +806,35 @@ end
 
 -- OWNER_HANDOFF：认领 + 安装。with_entity 里的 ensure_loaded 就是 Fence 认领——
 -- 源端已经释放锁，这里抢到的是新租约（fence 严格前进）。抢不到说明别的节点已经接管。
-function CMD.migration_commit(entity_id)
+--
+-- `barrier_id` 可选，但生产路径必须传：目标端可能同时存在"上一轮的取消标记"
+-- 和"这一轮的暂存快照"，只有 barrier 才能说清这次 commit 属于哪一轮。
+-- 不传就退回快照自带的 barrier（兼容旧调用方）。
+function CMD.migration_commit(entity_id, barrier_id)
     if not entitymgr then
         return false, "entity manager not ready"
     end
-    -- 源端已经取消这一轮：即使 commit RPC 迟到，也不能接管。
-    -- 先看取消标记再看暂存：abort 可能已经把暂存清掉了。
-    local aborted = g_aborted_barriers[entity_id]
+    if barrier_id ~= nil and (type(barrier_id) ~= "string" or barrier_id == "") then
+        return false, "barrier_id must be a non-empty string"
+    end
+    -- 先清过期标记，避免陈旧的取消记录挡住这一轮
+    prune_staged(wall_now())
     local staged = g_staged[entity_id]
-    if aborted and (not staged or not staged.payload or aborted.barrier_id == staged.payload.barrier_id) then
-        g_staged[entity_id] = nil
+    local staged_barrier = staged and staged.payload and staged.payload.barrier_id or nil
+
+    -- 调用方声明的轮次与暂存的轮次不一致：这是上一轮的迟到 commit。
+    -- 绝不能拿新一轮的快照去安装上一轮的认领
+    if barrier_id ~= nil and staged_barrier ~= nil and staged_barrier ~= barrier_id then
+        return false, "barrier mismatch"
+    end
+
+    local round = barrier_id or staged_barrier
+    local aborted = g_aborted_barriers[entity_id]
+    if aborted and (round == nil or aborted.barrier_id == round) then
+        -- 源端已经取消这一轮：即使 commit RPC 迟到，也不能接管
+        if staged and staged_barrier == aborted.barrier_id then
+            g_staged[entity_id] = nil
+        end
         g_aborted_barriers[entity_id] = nil
         return false, "migration aborted"
     end

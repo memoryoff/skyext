@@ -72,8 +72,14 @@ M.GRANT_CLOCK_SKEW = 60
 
 -- 已投递 / 停在 ENQUEUED 的事件的保留期。到达上限时**不等**保留期：
 -- 先腾掉这些事件让新事件进来（见 evictable_outbox_events）
-M.OUTBOX_DELIVERED_RETENTION = 7 * 24 * 3600
-M.OUTBOX_ENQUEUED_RETENTION = 7 * 24 * 3600
+-- 定义在 critical_fields 里：outbox 也要用同一份数字，而两边都会被测试桩替换
+M.OUTBOX_DELIVERED_RETENTION = critical_fields.OUTBOX_DELIVERED_RETENTION
+M.OUTBOX_ENQUEUED_RETENTION = critical_fields.OUTBOX_ENQUEUED_RETENTION
+-- FAILED（投递彻底失败）的最小保留期。容量腾挪时**不能**沿用
+-- delivered_retention：那条路径把它传成 0，一条"资产已扣、可靠消息从未落库"
+-- 的事件会在下一秒被静默抹掉，连排查和补偿的依据都不剩。
+-- 1 小时足够让告警打出来、人工看到 failed_reason
+M.OUTBOX_FAILED_MIN_RETENTION = critical_fields.OUTBOX_FAILED_MIN_RETENTION
 
 -- 容量预警线：到 80% 就告警，给归档与清理留出反应时间。
 -- 触顶是受控拒绝（不是自动扩容），所以必须提前看到趋势
@@ -84,16 +90,22 @@ M.CAPACITY_WARN_RATIO = 0.8
 M.CACHEABLE = "cacheable"
 M.NO_CACHE = "no_cache"
 
-M.INTENT_FIELD = "_critical_intent_v1"
-M.OPS_FIELD = "_critical_ops_v1"
-M.OUTBOX_FIELD = "_critical_outbox_v1"
+-- 字段名只有一处定义（critical_fields.M.FIELDS 的白名单）。这里全部引用它，
+-- 不再各写一份字面量：曾经因为两边各写一个字面量，导致残留 PREPARED 的角色
+-- 文档在加载时被当成损坏数据拒绝。新增 `_critical_*` 字段时，
+-- 只要登记进 critical_fields，这里自动跟随，不会再出现"写了但加载被拒"
+M.INTENT_FIELD = critical_fields.INTENT
+M.OPS_FIELD = critical_fields.OPS
+M.OUTBOX_FIELD = critical_fields.OUTBOX
 -- 待发事件计数：既是索引字段，也是"离开 PENDING 时恰减一次"的凭据
-M.OUTBOX_PENDING_FIELD = "_critical_outbox_pending_count"
+M.OUTBOX_PENDING_FIELD = critical_fields.OUTBOX_PENDING
 -- 持久化因果序号：同一角色的事件按它排序，不依赖秒级 created_at。
 -- 与可靠消息的 msg_id 是两件事：msg_id 只保证唯一，不保证因果顺序。
-M.OUTBOX_SEQ_FIELD = "_critical_outbox_seq"
+M.OUTBOX_SEQ_FIELD = critical_fields.OUTBOX_SEQ
+-- 终态清理时刻：worker 靠它找到"回执丢了、pending_count 已归零"的角色
+M.OUTBOX_CLEANUP_FIELD = critical_fields.OUTBOX_CLEANUP
 -- 热账本最老一条操作的 `at`：归档扫描的索引字段
-M.OPS_OLDEST_FIELD = "_critical_ops_oldest_at"
+M.OPS_OLDEST_FIELD = critical_fields.OPS_OLDEST
 
 M.EVENT_PREFIX = "evt_"
 M.SERVICE_PREFIX = "srv_"
@@ -234,6 +246,9 @@ M.validate_outbox_events = validate_outbox_events
 --   DELIVERED  终态，只用于审计，随时可删
 --   ENQUEUED   超过保留期说明接收方长期没上线；可靠消息已经把消息持久化，
 --              源端副本删掉不影响业务效果（去重键由 event_id 派生）
+--   FAILED     投递彻底失败（可靠消息从未落库）。**它是这条事件唯一的记录**：
+--              源端资产已经扣了，删掉之后既不能重投也没有补偿依据。所以它比
+--              DELIVERED 多一条"最小保留期"下限，容量压力下也不能立刻删
 --   PENDING    永不腾：它还没投出去
 -- 状态字面量来自 skyext.outbox.STATUS；这里不 require outbox，避免循环依赖
 function M.evictable_outbox_events(outbox_table, now, need, opts)
@@ -246,6 +261,7 @@ function M.evictable_outbox_events(outbox_table, now, need, opts)
     -- 的审计记录立刻消失，迟到重复回执只能走 unknown event）。
     local delivered_retention = opts.delivered_retention or M.OUTBOX_DELIVERED_RETENTION
     local enqueued_retention = opts.enqueued_retention or M.OUTBOX_ENQUEUED_RETENTION
+    local failed_retention = opts.failed_retention or M.OUTBOX_FAILED_MIN_RETENTION
     local list = {}
     for event_id, event in pairs(outbox_table or {}) do
         if type(event) == "table" then
@@ -256,11 +272,12 @@ function M.evictable_outbox_events(outbox_table, now, need, opts)
             elseif event.status == "ENQUEUED" then
                 evict = age >= enqueued_retention
             elseif event.status == "FAILED" then
-                -- 已进死信：与 DELIVERED 同一保留期，避免永久占位
-                evict = age >= delivered_retention
+                -- 不能沿用 delivered_retention：容量路径把它传成 0，
+                -- 一条"资产已扣、消息从未投出"的事件会在下一秒被静默抹掉
+                evict = age >= failed_retention
             end
             if evict then
-                list[#list + 1] = { id = event_id, age = age }
+                list[#list + 1] = { id = event_id, age = age, status = event.status }
             end
         end
     end
@@ -585,13 +602,34 @@ local function commit_core(ctx, req, handlers)
             -- 不这么做的话，事件只增不减，这个角色最终会被永久拒绝
             local need = existing_events + #new_events - M.MAX_OUTBOX
             -- 触顶是有意放弃 DELIVERED 保留期：先腾终态再决定是否拒绝，
-            -- 但必须显式写出来，不能依赖"没传 opts 就当 0"的隐式行为
+            -- 但必须显式写出来，不能依赖"没传 opts 就当 0"的隐式行为。
+            -- FAILED 单独给最小保留期：它是"资产已扣、消息从未投出"的唯一记录
             evicted_events = M.evictable_outbox_events(critical[M.OUTBOX_FIELD], req.now, need, {
                 delivered_retention = 0,
+                failed_retention = M.OUTBOX_FAILED_MIN_RETENTION,
             })
             existing_events = existing_events - #evicted_events
             if #evicted_events > 0 then
                 m_outbox_evicted:inc(#evicted_events, { reason = "capacity" })
+                -- 腾掉 FAILED 是**丢证据**：必须单独打一条 error，带 event_id 与
+                -- failed_reason，否则事后既查不到是哪笔、也查不到为什么失败
+                for _, victim in ipairs(evicted_events) do
+                    if victim.status == "FAILED" then
+                        local ev = (critical[M.OUTBOX_FIELD] or {})[victim.id]
+                        m_outbox_evicted:inc(1, { reason = "failed_lost" })
+                        log.error(
+                            "evicting a FAILED outbox event at capacity; this is the last record of a deducted asset",
+                            "rid",
+                            tostring(ctx.rid),
+                            "event",
+                            tostring(victim.id),
+                            "age",
+                            tostring(victim.age),
+                            "failed_reason",
+                            tostring(ev and ev.failed_reason)
+                        )
+                    end
+                end
                 log.warn(
                     "outbox is at capacity, evicting settled events",
                     "rid",
@@ -901,7 +939,21 @@ function M.execute_client(entity, grant_fields, seq, op_type, params, handlers, 
     local now = now_of(opts)
     -- 未来签发超过允许的时钟偏差：拒绝，避免时钟偏快的签发侧让 Grant 提前生效。
     -- 窗口内的偏差放行，否则两边时钟差几秒就会误伤合法请求。
-    if math.type(grant_fields.issued_at) == "integer" and grant_fields.issued_at > now + M.GRANT_CLOCK_SKEW then
+    --
+    -- 必须用 math.tointeger 归一化后再比，不能用 math.type(...)=="integer" 当门：
+    -- 那是个 fail-open 的类型门，`issued_at = 1700000000.0`（JSON 往返或 TS Number
+    -- 序列化都可能产生整值浮点）会整条跳过检查，伪造的未来 Grant 直接放行。
+    -- 归一化失败说明字段本身不合法，按 fail-closed 拒绝
+    local issued_at = math.tointeger(grant_fields.issued_at)
+    if not issued_at then
+        return decision(
+            M.STATUS.INTERNAL_AUTH_DENIED,
+            nil,
+            M.NO_CACHE,
+            { reason = "grant issued_at is not an integer" }
+        )
+    end
+    if issued_at > now + M.GRANT_CLOCK_SKEW then
         return decision(M.STATUS.INTERNAL_AUTH_DENIED, nil, M.NO_CACHE, { reason = "grant issued in the future" })
     end
     if now >= grant_fields.expires_at then
@@ -1329,12 +1381,17 @@ function M.archive_ops(ctx_or_entity, deps, opts)
         })
         if not called then
             m_archive:inc(1, { result = "raised" })
-            return { archived = #moved, pending = #victims - #moved }, "ledger write raised: " .. tostring(state)
+            -- archived 必须报 0：这批 op 只是写进了冷账本，热账本一条都还没删。
+            -- 报 #moved 会让维护服务把"没归档"计成"已归档"，指标虚高且掩盖积压。
+            -- 冷账本写用 $setOnInsert，重试幂等，所以下一轮会重新走一遍
+            return { archived = 0, written = #moved, pending = #victims, retry = true },
+                "ledger write raised: " .. tostring(state)
         end
         if state ~= "CONFIRMED" then
             -- 冷账本没确认就绝不删热条目：宁可两边都留一份，也不能两边都没有
             m_archive:inc(1, { result = tostring(state):lower() })
-            return { archived = #moved, pending = #victims - #moved }, "ledger " .. tostring(state):lower()
+            return { archived = 0, written = #moved, pending = #victims, retry = true },
+                "ledger " .. tostring(state):lower()
         end
         moved[#moved + 1] = v.op_id
     end

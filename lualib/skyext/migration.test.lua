@@ -47,6 +47,25 @@ t.describe("migration 六阶段", function()
         t.expect(d.transferred.bytes).to.equal("SNAP")
     end)
 
+    -- 每轮的 barrier 必须不同。固定成 `mig_<id>` 的话，目标端上一轮留下的
+    -- 取消标记（TTL 60s 内）会把这一轮的 stage 直接拒掉——停服重试时第二轮
+    -- 通常几秒内就开始，那个实体在目标节点上就再也迁不进来了
+    t.it("gives every round its own barrier", function()
+        local seen = {}
+        local d = deps()
+        d.freeze = function(_, barrier_id)
+            seen[#seen + 1] = barrier_id
+            return true
+        end
+        local e = entity()
+        assert(migration.migrate_entity(d, e, {}))
+        assert(migration.migrate_entity(d, e, {}))
+        t.expect(#seen).to.equal(2)
+        t.expect(seen[1] ~= seen[2]).to.equal(true)
+        -- 也要能看出是哪个实体的第几轮，否则运维查日志只能看到一堆随机串
+        t.expect(seen[1]:find("mig_" .. tostring(e.id), 1, true)).to.equal(1)
+    end)
+
     -- 任何一步失败都不能宣称"无感迁移成功"：客户端会被留在没有下行入口的会话上
     t.it("falls back when quiescing fails", function()
         local d = deps({

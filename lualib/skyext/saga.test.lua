@@ -546,7 +546,11 @@ t.describe("saga 复杂交易", function()
         t.expect(ledger.b).to.equal(30)
     end)
 
-    t.it("compensates only once when the compensation ack is lost", function()
+    -- 补偿是**至少一次**，不是恰好一次：ACK 丢失与补偿失败在协调者看来无法区分，
+    -- 所以 handler 会被再次调用（refunds 从 1 变 2）。状态机保证的是
+    -- "只离开 COMPENSATING 一次"，因此业务补偿必须幂等。
+    -- 标题曾经写成 "compensates only once" 却断言 refunds==2，把两件事混成了一件
+    t.it("retries compensation after a lost ack and leaves COMPENSATING only once", function()
         local coll = new_trade()
         local refunds = 0
         local deps = {
@@ -573,9 +577,10 @@ t.describe("saga 复杂交易", function()
         -- 重跑同一步：补偿确认后才进入 COMPENSATED
         assert(saga.run(coll, "sag_trade", deps))
         t.expect(coll:find_one({ saga_id = "sag_trade" }).state).to.equal("COMPENSATED")
+        -- 至少一次：handler 被调了两次，所以它必须自带幂等
         t.expect(refunds).to.equal(2)
 
-        -- 终态不再重复补偿
+        -- 终态不再重复补偿：这是状态机提供的唯一保证
         assert(saga.run(coll, "sag_trade", deps))
         t.expect(refunds).to.equal(2)
     end)

@@ -75,6 +75,20 @@ local function harness(opts)
             if cmd == "freeze_owner" then
                 return h.freeze_info or { sent = 0, epoch = 2, barrier_id = "b1" }, h.freeze_err
             end
+            -- 取消兜底的两条腿要能分别注入失败：A-11 的核心是
+            -- "目标不可达时踢人仍然必须发生"
+            if cmd == "kick" then
+                if opts.kick_raises then
+                    error("gate down")
+                end
+                return opts.kick_ok ~= false, opts.kick_err
+            end
+            if cmd == "migration_abort" then
+                if opts.abort_raises then
+                    error("target unreachable")
+                end
+                return opts.abort_ok ~= false, opts.abort_err
+            end
             return true
         end,
     }
@@ -429,5 +443,70 @@ t.describe("migration_adapter 取消兜底", function()
         h.adapter.begin_round()
         local snapshot = h.adapter.export(e, "b1")
         t.expect(snapshot.bytes).to.equal("BYTES")
+    end)
+
+    -- A-11：通知目标走的是无超时的 cluster.call，而目标不可达恰恰是取消的常见原因。
+    -- 先通知再踢的话，通知一阻塞，踢人循环就永远不跑，网关 frozen_epoch 留到进程退出，
+    -- 玩家连接卡死——正好是取消兜底要避免的最坏结果
+    t.it("kicks the client before trying to notify the target", function()
+        local h = harness({ abort_raises = true })
+        local e = entity()
+        assert(h.adapter.freeze(e, "b1"))
+        assert(h.adapter.transfer(e, { bytes = "B", barrier_id = "b1" }))
+        local stats = h.adapter.abort("deadline")
+        t.expect(stats.kicked).to.equal(1)
+        t.expect(stats.notify_failed).to.equal(1)
+        -- 顺序：kick 必须先于 migration_abort
+        local kick_at, notify_at
+        for i, call in ipairs(h.calls) do
+            if call.cmd == "kick" then
+                kick_at = kick_at or i
+            elseif call.cmd == "migration_abort" then
+                notify_at = notify_at or i
+            end
+        end
+        t.expect(kick_at).to.exist()
+        t.expect(notify_at).to.exist()
+        t.expect(kick_at < notify_at).to.equal(true)
+    end)
+
+    t.it("keeps an entry whose kick failed so a later abort can retry", function()
+        local opts = { kick_raises = true }
+        local h = harness(opts)
+        local e = entity()
+        assert(h.adapter.freeze(e, "b1"))
+        local first = h.adapter.abort("deadline")
+        t.expect(first.kicked).to.equal(0)
+        t.expect(first.failed).to.equal(1)
+        -- 之前无条件清空 g_inflight，失败的连接就再也没有第二次机会
+        t.expect(first.pending).to.equal(1)
+        -- 网关恢复后，下一次取消必须补上这一脚
+        opts.kick_raises = false
+        local second = h.adapter.abort("retry")
+        t.expect(second.kicked).to.equal(1)
+        t.expect(second.pending).to.equal(0)
+    end)
+
+    t.it("does not count a rejected kick as success", function()
+        -- call_gate 返回 (nil, "invalid conn_id") 时，pcall 本身是成功的，
+        -- 旧实现只看 pcall 是否抛异常，把这种失败也计入 kicked
+        local h = harness({ kick_ok = false })
+        local e = entity()
+        assert(h.adapter.freeze(e, "b1"))
+        local stats = h.adapter.abort("deadline")
+        t.expect(stats.kicked).to.equal(0)
+        t.expect(stats.failed).to.equal(1)
+    end)
+
+    t.it("passes the round barrier when committing on the target", function()
+        local h = harness()
+        local e = entity()
+        assert(h.adapter.freeze(e, "round-42"))
+        assert(h.adapter.transfer(e, { bytes = "B", barrier_id = "round-42" }))
+        assert(h.adapter.handoff(e))
+        local call = h.last_call("migration_commit")
+        -- 不带 barrier 的话，目标端只能用暂存快照去猜轮次
+        t.expect(call.args[1]).to.equal(7)
+        t.expect(call.args[2]).to.equal("round-42")
     end)
 end)

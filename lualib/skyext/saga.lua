@@ -405,6 +405,12 @@ function M.run(coll, saga_id, deps, opts)
     end
 
     -- COMPENSATING
+    --
+    -- 补偿是**至少一次**：ACK 丢失与补偿失败在协调者看来无法区分，所以同一轮
+    -- COMPENSATING 会被反复驱动，`compensate` 可能被执行多次。
+    -- 状态机保证的是"只离开 COMPENSATING 一次"，**不是**"补偿 handler 只跑一次"。
+    -- 因此业务补偿必须幂等：用 saga_id（或 saga_id + step）做去重键，
+    -- 重复调用要返回 COMMITTED 而不是再退一次钱。
     local outcome = step_outcome(deps.compensate, doc, "compensate")
     if outcome == "COMMITTED" then
         local next_doc, terr = M.transition(coll, saga_id, state, M.STATE.COMPENSATED, nil, {

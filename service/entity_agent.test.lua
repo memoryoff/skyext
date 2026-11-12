@@ -1023,6 +1023,60 @@ t.describe("entity_agent 迁移接管", function()
         t.expect(ok).to.equal(false)
         t.expect(err).to.equal("migration aborted")
     end)
+
+    -- A-07：取消标记只应在"目标端可能还有迟到 RPC"的窗口内存在。
+    -- 之前它只在**别的实体**来 stage 时才被顺带 prune，所以一个孤立的标记会
+    -- 一直挡着这个实体：停服重试时它在目标节点上永远迁不进来
+    t.it("expires a stale abort marker on its own", function()
+        local h = harness()
+        local snapshot = exported()
+        assert(h.CMD.migration_abort(7, snapshot.barrier_id))
+        -- 窗口内仍然拒绝
+        t.expect(h.CMD.migration_stage(7, snapshot)).to.equal(false)
+        -- 过了 TTL，标记必须自己过期，不需要任何别的实体来触发 prune
+        h.CMD._test_advance_time(61)
+        t.expect(h.CMD.migration_stage(7, snapshot)).to.equal(true)
+    end)
+
+    t.it("lets the next round in once the previous abort marker expires", function()
+        local h = harness()
+        assert(h.CMD.migration_abort(7, "mig_7_round1"))
+        h.CMD._test_advance_time(61)
+        -- 新一轮的 barrier 一定不同（migration.migrate_entity 每轮生成新的）
+        t.expect(h.CMD.migration_stage(7, exported())).to.equal(true)
+        t.expect(h.CMD.migration_commit(7, "b1")).to.equal(true)
+    end)
+
+    -- 停服重试不会等 60 秒：第一轮被取消后，第二轮通常几秒内就开始。
+    -- 只有"每轮 barrier 都不同"才能让它立刻通过，而不是被 TTL 挡在外面
+    t.it("lets the next round in immediately when the barrier differs", function()
+        local h = harness()
+        assert(h.CMD.migration_abort(7, "mig_7_round1"))
+        local snapshot = exported()
+        t.expect(snapshot.barrier_id).to.equal("b1")
+        -- 不同 barrier，且**没有**推进时钟
+        t.expect(h.CMD.migration_stage(7, snapshot)).to.equal(true)
+    end)
+
+    -- A-12：目标端可能同时有"上一轮的取消标记"和"这一轮的暂存快照"，
+    -- 只有 barrier 能说清这次 commit 属于哪一轮
+    t.it("refuses a commit whose barrier does not match the staged snapshot", function()
+        local h = harness()
+        assert(h.CMD.migration_stage(7, exported()))
+        local ok, err = h.CMD.migration_commit(7, "some-other-round")
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("barrier mismatch")
+        -- 暂存必须留着：这一轮的 commit 还没到
+        t.expect(h.CMD.migration_commit(7, "b1")).to.equal(true)
+    end)
+
+    t.it("rejects a non-string barrier on commit", function()
+        local h = harness()
+        assert(h.CMD.migration_stage(7, exported()))
+        local ok, err = h.CMD.migration_commit(7, 42)
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.match("barrier_id")
+    end)
 end)
 
 -- Outbox 回执：源端把事件推进到 DELIVERED。回执晚到（事件已被清理）也算成功，

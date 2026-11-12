@@ -1318,6 +1318,57 @@ t.describe("critical 源侧 Outbox", function()
         t.expect(h.store.critical._critical_outbox_v1[event.event_id].status).to.equal("PENDING")
     end)
 
+    -- FAILED 是"资产已扣、可靠消息从未落库"的唯一记录。容量腾挪把
+    -- delivered_retention 传成 0，如果 FAILED 沿用同一个值，一条刚失败的事件
+    -- 会在下一次提交时被静默抹掉：既不能重投，也没有补偿依据
+    t.it("keeps a young FAILED event even when the outbox is at capacity", function()
+        local h = harness()
+        local existing = {}
+        for i = 1, h.critical.MAX_OUTBOX do
+            existing[string.format("evt_%064x", i)] = {
+                status = "FAILED",
+                created_at = h.now - 10,
+                updated_at = h.now - 10,
+                failed_reason = "mongo down",
+                op_type = "mail.send",
+            }
+        end
+        h.store.critical = { _critical_outbox_v1 = existing, _critical_outbox_pending_count = 0 }
+
+        -- 没有可腾的：宁可受控拒绝新事件（调用方拿到可重试错误），
+        -- 也不能把 512 条"资产已扣"的证据一起删掉
+        local result = internal(h)
+        t.expect(result.status).to.equal(h.critical.STATUS.CAPACITY_EXCEEDED)
+        local failed_left = 0
+        for _, ev in pairs(h.store.critical._critical_outbox_v1) do
+            if ev.status == "FAILED" then
+                failed_left = failed_left + 1
+            end
+        end
+        t.expect(failed_left).to.equal(h.critical.MAX_OUTBOX)
+    end)
+
+    -- 但最小保留期只是下限，不是永久占位：过了下限，容量压力下仍可腾，
+    -- 否则角色会被一批陈年 FAILED 永久锁死
+    t.it("evicts a FAILED event once it is past the minimum retention", function()
+        local h = harness()
+        local existing = {}
+        local old = h.now - h.critical.OUTBOX_FAILED_MIN_RETENTION - 1
+        for i = 1, h.critical.MAX_OUTBOX do
+            existing[string.format("evt_%064x", i)] = {
+                status = "FAILED",
+                created_at = old,
+                updated_at = old,
+                failed_reason = "mongo down",
+                op_type = "mail.send",
+            }
+        end
+        h.store.critical = { _critical_outbox_v1 = existing, _critical_outbox_pending_count = 0 }
+
+        local result = internal(h)
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+    end)
+
     -- 没投出去的事件永远不腾：删了就是业务效果永久丢失
     t.it("never evicts events that were not delivered yet", function()
         local h = harness()
@@ -1467,6 +1518,39 @@ t.describe("critical 归档", function()
         local stats, err = h.critical.archive_ops(h.entity, {}, {})
         t.expect(stats).to.be_nil()
         t.expect(err).to.match("ledger")
+    end)
+
+    -- 批处理中途失败时，前面几条只是**写进了冷账本**，热账本一条都没删。
+    -- 如果这时报 archived=#moved，维护服务会把"没归档"计成"已归档"，
+    -- 指标虚高、积压被掩盖，而热账本其实还在增长
+    t.it("reports zero archived when the batch fails midway", function()
+        local h = harness()
+        local OP_C = "srv_" .. string.rep("c", 64)
+        with_ops(h, {
+            [OP_A] = { status = "COMMITTED", op_type = "shop.buy", at = 100 },
+            [OP_B] = { status = "COMMITTED", op_type = "shop.buy", at = 200 },
+            [OP_C] = { status = "COMMITTED", op_type = "shop.buy", at = 300 },
+        }, 100)
+        local ledger = fake_ledger()
+        local n = 0
+        function ledger:critical_find_and_modify()
+            n = n + 1
+            if n == 2 then
+                error("mongo down")
+            end
+            return "CONFIRMED"
+        end
+
+        local stats, err = h.critical.archive_ops(h.entity, { ledger = ledger }, { now = 1000, retention = 500 })
+        t.expect(err).to.match("raised")
+        -- 冷账本确实写了 1 条，但热账本一条都没删，所以"已归档"必须是 0
+        t.expect(stats.archived).to.equal(0)
+        t.expect(stats.written).to.equal(1)
+        t.expect(stats.pending).to.equal(3)
+        t.expect(stats.retry).to.equal(true)
+        t.expect(h.store.critical._critical_ops_v1[OP_A]).to_not.be_nil()
+        t.expect(h.store.critical._critical_ops_v1[OP_B]).to_not.be_nil()
+        t.expect(h.store.critical._critical_ops_v1[OP_C]).to_not.be_nil()
     end)
 
     -- 热条目已归档时，查询必须回落到冷账本；否则会把"已提交"报成"没执行"
@@ -1697,6 +1781,22 @@ t.describe("critical Grant 时钟偏差", function()
         t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
         t.expect(h.applied).to.equal(1)
     end)
+
+    -- 整值浮点是"未来时间检查"的经典绕过口：JSON 往返、TS Number 序列化、
+    -- 某些 driver 的 BSON 解码都可能把 1700000000 变成 1700000000.0。
+    -- 用 math.type(...)=="integer" 当门会让这类值整条跳过检查，等于门不存在
+    t.it("rejects a future grant whose issued_at is an integer-valued float", function()
+        local h = harness()
+        local future = (h.now + h.critical.GRANT_CLOCK_SKEW + 3600) + 0.0
+        t.expect(math.type(future)).to.equal("float")
+        -- expires_at 必须晚于 issued_at，否则签名阶段就会以 "invalid expires_at" 拒绝，
+        -- 测不到未来时间检查本身
+        local result = run(h, { issued_at = future, expires_at = future + 3600 })
+        t.expect(result.status).to.equal(h.critical.STATUS.INTERNAL_AUTH_DENIED)
+        t.expect(result.reason).to.equal("grant issued in the future")
+        t.expect(h.applied).to.equal(0)
+        t.expect(#h.store.updates).to.equal(0)
+    end)
 end)
 
 -- 同一秒创建的事件只靠 created_at 排不出确定顺序；因果序号在同一次 CAS 里分配
@@ -1731,5 +1831,26 @@ t.describe("critical Outbox 因果序号", function()
         t.expect(box[e2].causal_seq).to.equal(2)
         -- 序号水位与事件同一次 CAS 落库
         t.expect(h.store.critical._critical_outbox_seq).to.equal(2)
+    end)
+
+    -- 版本冲突下最容易出的问题不是重号，而是"水位被失败的那次写推进了"：
+    -- 序号出现空洞（1,3,4），排序仍对但会让人误判丢事件。
+    -- COMMIT 的 CAS 失败会返回 UNKNOWN 交给调用方重试，这里断言那次失败
+    -- 既没有落事件，也没有推进水位
+    t.it("does not advance the sequence for a commit that never landed", function()
+        local h = harness()
+        local e1 = "evt_" .. string.rep("3", 64)
+        -- PREPARE 是第 1 次写入，COMMIT 是第 2 次：只让 COMMIT 失败一次
+        h.store.reject = true
+        h.store.reject_at = 2
+        local first = commit(h, 1, e1)
+        t.expect(first.status).to.equal(h.critical.STATUS.UNKNOWN)
+        -- 落库侧什么都没留下：水位没推进、事件没写入
+        t.expect(h.store.critical._critical_outbox_seq).to.be_nil()
+        t.expect(h.store.critical._critical_outbox_v1).to.be_nil()
+
+        -- CAS 未命中说明 apply 已经改过内存，这份内存不能再回存：必须隔离重载。
+        -- 重试由重载后的实体发起，水位从 1 重新开始，不会出现空洞
+        t.expect(h.store.state).to.equal("CRITICAL_QUARANTINED")
     end)
 end)

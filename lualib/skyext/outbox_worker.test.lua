@@ -5,6 +5,7 @@ local lfs = require "lfs"
 local source = fs.join(fs.absolute(os.getenv("SKYTEST_ROOT") or lfs.currentdir()), "lualib/skyext/outbox_worker.lua")
 
 local FIELD = "_critical_outbox_pending_count"
+local CLEANUP_FIELD = "_critical_outbox_cleanup_at"
 
 -- 假集合：记录查询条件，按注入的页返回文档
 local function fake_coll(docs, fail)
@@ -66,6 +67,10 @@ local function harness(over)
             if name == "skyext.log" then
                 return { debug = function() end, info = function() end, warn = function() end, error = function() end }
             end
+            -- default_deliver 在函数体内 require 这两个模块
+            if name == "skyext.entity.router" and over.router then
+                return over.router
+            end
             return require(name)
         end,
     }, { __index = _G })
@@ -74,18 +79,35 @@ local function harness(over)
 end
 
 t.describe("outbox_worker 扫描", function()
-    t.it("queries only roles with a positive pending count", function()
+    t.it("queries pending roles and cleanup-due roles", function()
         local h = harness()
         local coll = fake_coll({ { rid = 3, [FIELD] = 2 }, { rid = 4, [FIELD] = 1 } })
-        local list, next_skip = h.mod.scan(coll, { limit = 10 })
+        local list, next_skip = h.mod.scan(coll, { limit = 10, now = 1000 })
         t.expect(#list).to.equal(2)
         t.expect(list[1].rid).to.equal(3)
         t.expect(list[1].pending).to.equal(2)
-        -- 索引字段是查询条件：没有它就只能全表扫描
-        t.expect(coll.calls[1].query[FIELD]).to.equal({ ["$gt"] = 0 })
+        -- 两个条件取并集：只有 pending>0 的话，"回执丢了、计数归零"的角色
+        -- 永远不会被扫到，它们的终态事件只能等容量腾挪
+        local branches = coll.calls[1].query["$or"]
+        t.expect(#branches).to.equal(2)
+        t.expect(branches[1][FIELD]).to.equal({ ["$gt"] = 0 })
+        t.expect(branches[2][CLEANUP_FIELD]).to.equal({ ["$lte"] = 1000 })
         t.expect(coll.calls[1].opts.limit).to.equal(10)
         -- 这一页没满 -> 下一轮从头开始
         t.expect(next_skip).to.equal(0)
+    end)
+
+    t.it("marks a role whose cleanup time has arrived", function()
+        local h = harness()
+        local coll = fake_coll({
+            { rid = 5, [FIELD] = 0, [CLEANUP_FIELD] = 900 },
+            { rid = 6, [FIELD] = 0, [CLEANUP_FIELD] = 2000 },
+            { rid = 7, [FIELD] = 0 },
+        })
+        local list = assert(h.mod.scan(coll, { limit = 10, now = 1000 }))
+        t.expect(list[1].cleanup_due).to.equal(true)
+        t.expect(list[2].cleanup_due).to.equal(false)
+        t.expect(list[3].cleanup_due).to.equal(false)
     end)
 
     t.it("advances the cursor when a page is full", function()
@@ -129,16 +151,20 @@ t.describe("outbox_worker 索引门禁", function()
 
     t.it("accepts a confirmed index build", function()
         local h = harness()
-        local seen
+        local seen = {}
         local coll = {
             create_index = function(_, keys)
-                seen = keys
+                seen[#seen + 1] = keys
                 return true
             end,
         }
         t.expect(h.mod.ensure_indexes({ role = coll })).to.equal(true)
-        t.expect(seen.name).to.equal("critical_outbox_pending")
-        t.expect(seen.partialFilterExpression[FIELD]).to.equal({ ["$gt"] = 0 })
+        -- 两条偏索引：一条找待发角色，一条找"有终态事件待清理"的角色
+        t.expect(#seen).to.equal(2)
+        t.expect(seen[1].name).to.equal("critical_outbox_pending")
+        t.expect(seen[1].partialFilterExpression[FIELD]).to.equal({ ["$gt"] = 0 })
+        t.expect(seen[2].name).to.equal("critical_outbox_cleanup")
+        t.expect(seen[2].partialFilterExpression[CLEANUP_FIELD]).to.equal({ ["$exists"] = true })
     end)
 
     t.it("treats a raising create_index as a failed gate", function()
@@ -183,6 +209,26 @@ t.describe("outbox_worker 单轮调度", function()
         local stats = assert(h.mod.run_once(deps, {}))
         t.expect(calls).to.equal(0)
         t.expect(stats.skipped).to.equal(1)
+    end)
+
+    -- A-08 的核心：回执丢失后事件停在 ENQUEUED、pending_count 归零。
+    -- 如果只按 pending>0 判断，这些角色永远不会被 pump，终态事件只能等容量腾挪
+    t.it("pumps a role whose only work is an expired cleanup marker", function()
+        local h = harness()
+        local pumped = {}
+        local deps = {
+            role_coll = fake_coll({ { rid = 9, [FIELD] = 0, [CLEANUP_FIELD] = 500 } }),
+            pump = function(rid)
+                pumped[#pumped + 1] = rid
+                return true,
+                    { enqueued = 0, failed = 0, unknown = 0, already = 0, batches = 0, pending = 0, cleaned = 2 }
+            end,
+        }
+        local stats = assert(h.mod.run_once(deps, { now = 1000 }))
+        t.expect(#pumped).to.equal(1)
+        t.expect(pumped[1]).to.equal(9)
+        t.expect(stats.pumped).to.equal(1)
+        t.expect(stats.cleaned).to.equal(2)
     end)
 
     -- 实体不在内存时受控加载：离线角色的积压也要能排空，但不能一轮全捞起来
@@ -259,5 +305,48 @@ t.describe("outbox_worker 实体内投递", function()
         local stats, err = h.mod.pump_entity({ type_name = "role", id = 7 }, {})
         t.expect(stats).to.be_nil()
         t.expect(err).to.equal("document not loaded")
+    end)
+end)
+
+-- 投递结果必须能区分"暂时送不出去"和"永远送不出去"。可靠消息落库在 Mongo 抖动时
+-- 会抛错，如果它冒成 pcall 失败，pump 会把它算作毒事件：5 次之后一条
+-- "源端资产已扣、业务未执行"的事件就被标 FAILED，而实际只是环境抖了 25 秒
+t.describe("outbox_worker 默认投递的结果分类", function()
+    local envelope = { event_id = "evt_x", target_type = "role", target_id = 8 }
+    local delivery = require "skyext.entity.delivery"
+
+    t.it("returns true when the reliable message was accepted", function()
+        local h = harness({
+            router = {
+                reliable_send = function()
+                    return "msg-1"
+                end,
+            },
+        })
+        t.expect(h.mod.default_deliver(envelope)).to.equal(true)
+    end)
+
+    t.it("turns a raising reliable_send into a retryable environment fault", function()
+        local h = harness({
+            router = {
+                reliable_send = function()
+                    error("mongo unavailable")
+                end,
+            },
+        })
+        local result = h.mod.default_deliver(envelope)
+        t.expect(delivery.is_retryable(result)).to.equal(true)
+        t.expect(result.reason).to.match("mongo unavailable")
+    end)
+
+    t.it("treats a missing msg_id as a retryable environment fault", function()
+        local h = harness({
+            router = {
+                reliable_send = function()
+                    return nil
+                end,
+            },
+        })
+        t.expect(delivery.is_retryable(h.mod.default_deliver(envelope))).to.equal(true)
     end)
 end)

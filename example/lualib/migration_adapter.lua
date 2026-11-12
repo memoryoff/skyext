@@ -54,15 +54,19 @@ local function agent_service(entity_id)
 end
 
 -- 本节点与远端统一入口：同节点直接调，跨节点走 cluster。返回值和被调服务一致
-local function call_agent(node, entity_id, cmd, ...)
-    if g_aborted then
-        return nil, "migration aborted"
-    end
+local function call_agent_raw(node, entity_id, cmd, ...)
     local service = agent_service(entity_id)
     if node == self_node() then
         return skynet.call(service, "lua", cmd, ...)
     end
     return cluster.call(node, service, cmd, ...)
+end
+
+local function call_agent(node, entity_id, cmd, ...)
+    if g_aborted then
+        return nil, "migration aborted"
+    end
+    return call_agent_raw(node, entity_id, cmd, ...)
 end
 
 local function call_gate(conn_id, cmd, ...)
@@ -148,6 +152,7 @@ function M.freeze(entity, barrier_id)
     end
     -- 屏障已经建立：从这里到 activate 之间无论失败还是取消，都必须有人解屏障
     g_inflight[entity.id] = { id = entity.id, conn_id = entity.conn_id, barrier_id = barrier_id }
+    entity._barrier = barrier_id
     return true
 end
 
@@ -188,6 +193,9 @@ function M.transfer(entity, snapshot)
         return nil, "stage failed: " .. tostring(serr)
     end
     entity._target = target
+    -- 记下这一轮的 barrier：handoff 必须带着它去 commit，目标端才能区分
+    -- "这一轮的 commit" 和 "上一轮留下的取消标记"
+    entity._barrier = snapshot and snapshot.barrier_id or entity._barrier
     -- 记下目标：取消时要通知它拒绝同一 barrier 的迟到 commit
     local info = g_inflight[entity.id]
     if info then
@@ -200,7 +208,9 @@ function M.handoff(entity)
     if not entity._target then
         return nil, "no target was chosen"
     end
-    local ok, reason = call_agent(entity._target, entity.id, "migration_commit", entity.id)
+    -- 带上 barrier：不传的话目标端只能用暂存快照自带的那个来猜轮次，
+    -- 一旦同时存在"上一轮的取消标记"就分不清该拒还是该接
+    local ok, reason = call_agent(entity._target, entity.id, "migration_commit", entity.id, entity._barrier)
     if not ok then
         return nil, tostring(reason)
     end
@@ -263,12 +273,48 @@ end
 -- 再发 RPC（kick 除外）。这是"让失败可恢复"，不是"取消长 RPC"——后者仍需要
 -- 给跨节点调用加 deadline，见 docs/review-2026-11-12-defect-register.md R-01。
 function M.abort(reason)
-    -- 先通知目标端：同一 barrier 的 commit/attach 必须被拒绝。
-    -- 此时 g_aborted 还没置位，call_agent 仍然可用。
+    -- 顺序是硬约束：**先踢客户端，再通知目标端**。
+    --
+    -- 反过来（先通知目标）有个致命后果：通知走的是无超时的 cluster.call，
+    -- 而目标不可达恰恰是这次取消的常见原因。一旦它阻塞，后面的踢人循环
+    -- 根本不会执行，网关的 frozen_epoch 就永久留着——玩家连接卡死，
+    -- 正是"取消兜底"要避免的那个最坏结果。
+    -- 踢人只依赖网关服务，先做才能保证最坏情况下玩家至少能重连。
+    g_aborted = true
+
+    local kicked, kick_failed = 0, 0
+    for id, info in pairs(g_inflight) do
+        if info.conn_id then
+            local called, ok, err = pcall(call_gate, info.conn_id, "kick", info.conn_id)
+            if called and ok then
+                kicked = kicked + 1
+                -- 已经踢掉：不必再重试。留着 target 继续走下一步
+                info.conn_id = nil
+            else
+                kick_failed = kick_failed + 1
+                log.error(
+                    "migration abort could not kick the client",
+                    "id",
+                    tostring(id),
+                    "err",
+                    tostring(called and err or ok)
+                )
+            end
+        end
+    end
+
+    -- 再通知目标端拒绝同一 barrier 的迟到 commit/attach。
+    -- 用 raw 调用：g_aborted 已经置位，普通 call_agent 会直接拒绝，
+    -- 而这条通知恰恰必须在取消之后才发得出去
+    local notified, notify_failed = 0, 0
     for id, info in pairs(g_inflight) do
         if info.target then
-            local called, err = pcall(call_agent, info.target, id, "migration_abort", id, info.barrier_id)
-            if not called then
+            local called, ok, err = pcall(call_agent_raw, info.target, id, "migration_abort", id, info.barrier_id)
+            if called and ok then
+                notified = notified + 1
+                info.target = nil
+            else
+                notify_failed = notify_failed + 1
                 log.error(
                     "migration abort could not reach the target",
                     "id",
@@ -276,35 +322,46 @@ function M.abort(reason)
                     "target",
                     tostring(info.target),
                     "err",
-                    tostring(err)
+                    tostring(called and err or ok)
                 )
             end
         end
     end
-    g_aborted = true
-    local kicked, failed = 0, 0
+
+    -- 只清掉处理完的条目：踢失败的留着，下次 abort（或下一轮 begin_round）还能重试。
+    -- 之前无条件清掉，失败的连接就再也没有第二次机会
     for id, info in pairs(g_inflight) do
-        if info.conn_id then
-            local called, raised = pcall(call_gate, info.conn_id, "kick", info.conn_id)
-            if called then
-                kicked = kicked + 1
-            else
-                failed = failed + 1
-                log.error("migration abort could not kick the client", "id", tostring(id), "err", tostring(raised))
-            end
+        if not info.conn_id and not info.target then
+            g_inflight[id] = nil
         end
-        g_inflight[id] = nil
     end
+
     log.warn(
         "migration aborted, gateway barriers released by reconnect",
         "reason",
         tostring(reason),
         "kicked",
         kicked,
-        "failed",
-        failed
+        "kick_failed",
+        kick_failed,
+        "notified",
+        notified,
+        "notify_failed",
+        notify_failed
     )
-    return { kicked = kicked, failed = failed }
+    return {
+        kicked = kicked,
+        failed = kick_failed,
+        notified = notified,
+        notify_failed = notify_failed,
+        pending = (function()
+            local n = 0
+            for _ in pairs(g_inflight) do
+                n = n + 1
+            end
+            return n
+        end)(),
+    }
 end
 
 return M

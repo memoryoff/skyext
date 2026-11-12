@@ -17,6 +17,11 @@
 -- 与 `critical` 的分工：本模块只负责事件记录、信封、状态 CAS 与批处理调度；
 -- 资产效果永远由 `critical` 的提交内核决定。
 local critical = require "skyext.critical"
+-- 字段名从**白名单模块**取，不从 critical 取：白名单是这些名字唯一的定义处，
+-- 而 critical 会被测试桩替换。曾经因为 outbox 自己写了一份字面量、
+-- critical 也写了一份，导致新字段漏登记白名单，写过 Outbox 的角色加载即失败
+local critical_fields = require "skyext.critical_fields"
+local delivery = require "skyext.entity.delivery"
 local dbmgr = require "skyext.dbmgr"
 local log = require "skyext.log"
 local metrics = require "skyext.metrics"
@@ -30,8 +35,14 @@ M.STATUS = {
     FAILED = "FAILED",
 }
 
-M.FIELD = critical.OUTBOX_FIELD
-M.PENDING_COUNT_FIELD = "_critical_outbox_pending_count"
+M.FIELD = critical_fields.OUTBOX
+-- 与 critical 共用同一份字段名，不另写字面量：两处各写一份曾导致
+-- "写进去了但加载时被判 unknown critical field"
+M.PENDING_COUNT_FIELD = critical_fields.OUTBOX_PENDING
+-- 终态清理时刻。没有它，worker 只按 pending_count>0 扫，
+-- 回执丢失（事件停在 ENQUEUED、计数已归零）的角色永远不再被扫，
+-- 终态事件只能等容量腾挪——那正是它该解决的问题
+M.CLEANUP_FIELD = critical_fields.OUTBOX_CLEANUP
 M.ENVELOPE_VERSION = 1
 M.DEFAULT_LIMIT = 16
 -- 状态 CAS 的读后像重试次数。CAS 未命中是版本/条件冲突，不是 UNKNOWN，
@@ -39,11 +50,11 @@ M.DEFAULT_LIMIT = 16
 M.CAS_RETRY = 2
 -- 已投递事件的保留期：DELIVERED 只用于审计，过期就能删。
 -- 容量不足时不等保留期，直接腾（见 critical.commit_core）
--- 与 critical 的容量腾挪共用同一份口径：不要在这里另写一个数字
-M.DELIVERED_RETENTION = critical.OUTBOX_DELIVERED_RETENTION
+-- 与 critical 共用同一份口径（定义在 critical_fields）：不要在这里另写一个数字
+M.DELIVERED_RETENTION = critical_fields.OUTBOX_DELIVERED_RETENTION
 -- 停在 ENQUEUED 多久算"送不到了"。可靠消息已经把消息持久化，
 -- 源端副本只用于观测；接收方长期不上线时，不能让这份副本把关键字段占满
-M.ENQUEUED_RETENTION = 7 * 24 * 3600
+M.ENQUEUED_RETENTION = critical_fields.OUTBOX_ENQUEUED_RETENTION
 
 local m_enqueued =
     metrics.counter("skyext_outbox_enqueued_total", "Outbox events whose reliable message was confirmed", { "op_type" })
@@ -255,14 +266,24 @@ function M.pending_events(critical_table, limit)
     end
     table.sort(out, function(a, b)
         -- 持久化因果序号优先：同一秒创建的事件只靠 created_at 排不出确定顺序，
-        -- 而可靠消息的 msg_id 只保证唯一、不保证因果顺序
+        -- 而可靠消息的 msg_id 只保证唯一、不保证因果顺序。
+        --
+        -- 比较器必须是**全序**。曾经写成"两边都有 seq 才比 seq，否则退回
+        -- created_at"，在滚动升级期（新旧节点写的事件混在同一份 outbox 里）
+        -- 会成环：A 无 seq 比 B 早、B 的 seq 比 C 小、C 的时间又比 A 早，
+        -- table.sort 拿到非传递比较器会给出任意顺序，可能把后发生的事件先投出去。
+        -- 这里改成单一键：(是否有 seq, seq 或 created_at, event_id)。
+        -- 无 seq 的事件只可能是升级前写入的，所以排在所有有 seq 的事件之前
         local sa, sb = a.causal_seq, b.causal_seq
-        if math.type(sa) == "integer" and math.type(sb) == "integer" and sa ~= sb then
-            return sa < sb
+        local ra = math.type(sa) == "integer" and 1 or 0
+        local rb = math.type(sb) == "integer" and 1 or 0
+        if ra ~= rb then
+            return ra < rb
         end
-        local ta, tb = a.created_at or 0, b.created_at or 0
-        if ta ~= tb then
-            return ta < tb
+        local ka = ra == 1 and sa or (a.created_at or 0)
+        local kb = rb == 1 and sb or (b.created_at or 0)
+        if ka ~= kb then
+            return ka < kb
         end
         return tostring(a.event_id) < tostring(b.event_id)
     end)
@@ -301,6 +322,47 @@ function M.oldest_age(critical_table, now)
     return math.max(0, now - oldest)
 end
 
+-- 某状态的事件多久之后可以被清理
+function M.retention_for(status)
+    if status == M.STATUS.ENQUEUED then
+        return M.ENQUEUED_RETENTION
+    end
+    -- DELIVERED / FAILED 都按投递保留期
+    return M.DELIVERED_RETENTION
+end
+
+-- 下一次可以清理的时刻：所有终态事件里最早到期的那个。没有终态事件返回 nil。
+-- 清理完必须用它重算，否则标记要么永久过期（每轮空扫）要么永久缺席（不再被扫）
+function M.next_cleanup_at(outbox_table)
+    local best
+    for _, event in pairs(outbox_table or {}) do
+        if type(event) == "table" and event.status ~= M.STATUS.PENDING then
+            local base = event.updated_at or event.created_at
+            if math.type(base) == "integer" then
+                local due = base + M.retention_for(event.status)
+                if not best or due < best then
+                    best = due
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- 把清理标记推进到"不晚于 due"。取最小值：一条老事件到期了不能被一条新事件
+-- 把标记推后，否则老事件要等到新事件到期才被清
+function M.bump_cleanup_at(copy, status, now)
+    if status == M.STATUS.PENDING then
+        return copy
+    end
+    local due = now + M.retention_for(status)
+    local cur = copy[M.CLEANUP_FIELD]
+    if math.type(cur) ~= "integer" or due < cur then
+        copy[M.CLEANUP_FIELD] = due
+    end
+    return copy
+end
+
 -- 纯函数：返回把某个事件推进到新状态后的 critical 副本，以及新的 pending 计数。
 -- 不改调用方传进来的表
 function M.transition(critical_table, event_id, status, now)
@@ -337,7 +399,8 @@ function M.transition(critical_table, event_id, status, now)
     if was_pending and status ~= M.STATUS.PENDING then
         copy[M.PENDING_COUNT_FIELD] = math.max(0, (copy[M.PENDING_COUNT_FIELD] or 0) - 1)
     end
-    return copy
+    -- 离开 PENDING 就要留下清理标记，否则计数归零后这个角色再也不会被 worker 扫到
+    return M.bump_cleanup_at(copy, status, now)
 end
 
 -- 把一批 PENDING 事件推进到 ENQUEUED。
@@ -350,8 +413,18 @@ end
 --
 -- `nMatched=0` 是**版本/条件冲突**，不是"资产已执行但 ACK 丢失"：重新读当前文档后
 -- 同一条事件连续投递失败多少次后判为毒事件。
--- 不设上限的话，一条永远送不出去的事件会让该角色之后的**所有**事件都投不出去：
--- pump 遇到失败就 break 保序，队首事件永远不动，后面的事件全部饿死。
+--
+-- 这里有一个**显式的取舍**，两个阶段的行为不同，不要混为一谈：
+--
+--   1. 未到阈值：`break`。同角色事件有先后依赖，队首没投出去时后面的事件
+--      不能抢跑——宁可等，也不让接收方看到后发生的事件先到。
+--   2. 到达阈值：隔离（标 FAILED）后 `continue`。此时这条事件已经判定"短期
+--      不会成功"，继续挡着就等于让该角色**所有**后续事件永久饿死。
+--      这里**主动放弃保序**，用可用性换掉严格顺序。
+--
+-- 代价是接收方可能乱序收到同一角色的事件。所以接收侧必须：用 `service_op_id`
+-- 去重、对参数做业务自校验（不满足前置条件就拒绝而不是硬执行）。
+-- 这个取舍记录在 docs/review-2026-11-12-defect-register.md §5。
 M.MAX_DELIVER_ATTEMPTS = 5
 
 local function copy_critical(critical_table)
@@ -383,16 +456,30 @@ function M._quarantine_event(ctx, event, critical_table, now, attempts, reason, 
             -- 别的 worker 已经推进过：按当前文档继续，不再重复处理
             return next_table
         end
+        -- copy_critical 只复制一层，`ev` 仍是缓存里的同一张表。直接改它会让
+        -- CAS 被拒之后内存缓存显示 FAILED、库里仍是 PENDING，事件在内存里消失
+        -- 而 pending_count 没减，worker 就会永远空扫。所以先拷再改
+        local updated = {}
+        for k2, v2 in pairs(ev) do
+            updated[k2] = v2
+        end
+        ev = updated
+        -- 必须写回 next_table：pump 会用返回的这张表 set_critical，
+        -- 只改局部变量会让缓存与库里都停在 PENDING，而 quarantined 计数已经 +1
+        next_table[M.FIELD][event.event_id] = ev
         ev.status = M.STATUS.FAILED
         ev.updated_at = now
         ev.deliver_attempts = attempts
         ev.failed_at = now
         ev.failed_reason = tostring(reason):sub(1, 200)
         next_table[M.PENDING_COUNT_FIELD] = math.max(0, (next_table[M.PENDING_COUNT_FIELD] or 0) - 1)
+        -- FAILED 也是终态：同一次写入落下清理标记，否则计数归零后没人再扫这个角色
+        M.bump_cleanup_at(next_table, M.STATUS.FAILED, now)
         local state = dbmgr.critical_update(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, ctx.doc._version, {
             ["$set"] = {
                 [M.FIELD .. "." .. event.event_id] = ev,
                 [M.PENDING_COUNT_FIELD] = next_table[M.PENDING_COUNT_FIELD],
+                [M.CLEANUP_FIELD] = next_table[M.CLEANUP_FIELD],
             },
         }, {
             handle = ctx.handle,
@@ -461,7 +548,15 @@ function M.pump(ctx, deliver, opts)
     end
     local limit = opts.limit or M.DEFAULT_LIMIT
     local max_retry = opts.cas_retry or M.CAS_RETRY
-    local stats = { enqueued = 0, failed = 0, unknown = 0, already = 0, batches = 0, quarantined = 0 }
+    local stats = {
+        enqueued = 0,
+        failed = 0,
+        unknown = 0,
+        already = 0,
+        batches = 0,
+        quarantined = 0,
+        retryable = 0,
+    }
     local source = opts.source or {}
     local now = opts.now
 
@@ -487,6 +582,25 @@ function M.pump(ctx, deliver, opts)
             break
         else
             local ok, deliver_err = pcall(deliver, envelope)
+            -- 环境故障与毒事件必须分开：
+            --   * retryable：Mongo 抖动、连接池耗尽、写关注失败。这条事件**还没试过
+            --     真正投出去**，源端资产却已经扣了。计入毒事件阈值会在抖动 5 次
+            --     （约 25 秒）后把它标 FAILED —— 业务永不执行、资产静默丢失。
+            --     所以不计数、只停止本轮，等环境恢复
+            --   * 抛异常 / 返回 false / 返回其它：投递器明确表示这条送不出去，
+            --     或者投递器自己有 bug。计入阈值，到点隔离，避免整条队列饿死
+            if ok and delivery.is_retryable(deliver_err) then
+                stats.retryable = stats.retryable + 1
+                log.warn(
+                    "outbox delivery hit an environment fault, will retry without counting it as poison",
+                    "event",
+                    event.event_id,
+                    "err",
+                    tostring(deliver_err.reason)
+                )
+                -- 保序：环境故障时后面的事件也不能抢跑，否则接收方会先看到后发生的事件
+                break
+            end
             if not ok or deliver_err ~= true then
                 stats.failed = stats.failed + 1
                 local attempts = (event.deliver_attempts or 0) + 1
@@ -494,8 +608,9 @@ function M.pump(ctx, deliver, opts)
                     log.warn("outbox deliver raised", "event", event.event_id, "err", deliver_err)
                 end
                 if attempts >= (opts.max_deliver_attempts or M.MAX_DELIVER_ATTEMPTS) then
-                    -- 毒事件：标 FAILED 后继续。不隔离的话，队首一条永远送不出去的事件
-                    -- 会让该角色之后的所有事件都饿死（pump 失败即 break 保序）
+                    -- 毒事件：标 FAILED 后**继续**投后面的事件。
+                    -- 这与阈值内的 `break` 是两个阶段的不同取舍，见 M.MAX_DELIVER_ATTEMPTS 的注释：
+                    -- 阈值内保序，达到阈值后用可用性换掉严格顺序
                     local quarantined =
                         M._quarantine_event(ctx, event, critical_table, now, attempts, deliver_err, max_retry)
                     if not quarantined then
@@ -547,30 +662,19 @@ function M.pump(ctx, deliver, opts)
     return M._finish_pump(ctx, now, stats)
 end
 
--- 定期清理的节流窗口（秒）。活跃角色每轮都清一次会把 Mongo 打得很碎，
--- 但只在 pending == 0 时清又会让"一直有积压"的角色永远攒着终态记录。
-M.CLEANUP_INTERVAL = 60
-local g_last_cleanup_at = 0
-
--- 仅供测试：清掉进程内的清理节流
-function M._reset_cleanup()
-    g_last_cleanup_at = 0
-end
-
--- 一轮收尾：没有待发事件时立即清；仍有积压时按 CLEANUP_INTERVAL 定期清。
--- 静默角色没有 pump，仍靠容量腾挪兜底。
--- 清理失败不影响本轮投递结果，下一轮再试
+-- 一轮收尾：清掉到期终态事件。
+--
+-- 这里**不再做进程级节流**。原先用 `g_last_cleanup_at` 每 60 秒只允许一次清理，
+-- 但它对"回执丢失"的角色永远不可达：那些角色的 pending_count 已经归零，
+-- worker 根本不会扫到它们；就算扫到，一个进程级的窗口也会让第二个角色被跳过。
+-- 真正的节流由数据本身承担：`cleanup` 只删已过保留期的事件，没过期时
+-- 只是一次内存遍历，不做任何 Mongo 写入。
 function M._finish_pump(ctx, now, stats)
-    local clock = now or os.time()
-    local due = stats.pending == 0 or (clock - g_last_cleanup_at >= M.CLEANUP_INTERVAL)
-    if due then
-        local cleaned, cerr = M.cleanup(ctx, { now = now })
-        if cleaned then
-            stats.cleaned = cleaned
-            g_last_cleanup_at = clock
-        elseif cerr then
-            log.warn("outbox cleanup skipped", "err", tostring(cerr))
-        end
+    local cleaned, cerr = M.cleanup(ctx, { now = now })
+    if cleaned then
+        stats.cleaned = cleaned
+    elseif cerr then
+        log.warn("outbox cleanup skipped", "err", tostring(cerr))
     end
     return stats
 end
@@ -599,6 +703,9 @@ function M._advance(ctx, event, critical_table, now, max_retry, stats)
             ["$set"] = {
                 [M.FIELD .. "." .. event.event_id] = next_table[M.FIELD][event.event_id],
                 [M.PENDING_COUNT_FIELD] = next_table[M.PENDING_COUNT_FIELD],
+                -- 清理标记必须与状态同一次写入：分开写会出现"状态已终态但没人清"
+                -- 或者"标记已设但状态还没终态"两种半完成状态
+                [M.CLEANUP_FIELD] = next_table[M.CLEANUP_FIELD],
             },
         }, {
             handle = ctx.handle,
@@ -683,8 +790,9 @@ function M.evictable(critical_table, now, opts)
             elseif event.status == M.STATUS.ENQUEUED then
                 evict = age >= enqueued_retention
             elseif event.status == M.STATUS.FAILED then
-                -- 已进死信的事件：源端副本只用于审计。不腾会被 512 上限永久占位，
-                -- 把真正待发的事件挤掉（当前没有写入点，属于防御）
+                -- 投递彻底失败：可靠消息从未落库，这条记录是"资产已扣但业务未生效"
+                -- 的唯一证据。定期清理仍按正常保留期删（留够排查窗口），
+                -- 容量压力下的删除下限由 critical.OUTBOX_FAILED_MIN_RETENTION 管
                 evict = age >= delivered_retention
             end
             if evict then
@@ -759,6 +867,9 @@ function M.mark_delivered(ctx, event_id, opts)
             ["$set"] = {
                 [M.FIELD .. "." .. event_id] = next_table[M.FIELD][event_id],
                 [M.PENDING_COUNT_FIELD] = next_table[M.PENDING_COUNT_FIELD],
+                -- 与状态同一次写入：回执到达是这个角色最后一次被写，
+                -- 漏掉标记的话它的终态事件就再也没人清了
+                [M.CLEANUP_FIELD] = next_table[M.CLEANUP_FIELD],
             },
         }, {
             handle = ctx.handle,
@@ -814,12 +925,24 @@ function M.cleanup(ctx, opts)
         unset[M.FIELD .. "." .. victim.event_id] = true
         next_field[victim.event_id] = nil
     end
-    local state, detail = dbmgr.critical_update(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, ctx.doc._version, {
-        ["$unset"] = unset,
-    }, {
-        handle = ctx.handle,
-        metadata_only = true,
-    })
+    -- 清理完必须重算标记：还有终态事件就指向下一批到期时刻，
+    -- 一条不剩就删掉标记（否则这个角色会被 worker 每轮空扫）
+    local update = { ["$unset"] = unset }
+    local next_due = M.next_cleanup_at(next_field)
+    if next_due then
+        update["$set"] = { [M.CLEANUP_FIELD] = next_due }
+    else
+        unset[M.CLEANUP_FIELD] = true
+    end
+    local state, detail = dbmgr.critical_update(
+        ctx.dbname,
+        ctx.dbcoll,
+        ctx.key,
+        ctx.unique_id,
+        ctx.doc._version,
+        update,
+        { handle = ctx.handle, metadata_only = true }
+    )
     if state ~= "CONFIRMED" then
         if state == "UNKNOWN" then
             dbmgr.refresh_critical(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, { handle = ctx.handle })
@@ -832,6 +955,7 @@ function M.cleanup(ctx, opts)
         next_table[k] = v
     end
     next_table[M.FIELD] = next_field
+    next_table[M.CLEANUP_FIELD] = next_due
     dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, next_table, ctx.handle)
     for _, victim in ipairs(victims) do
         m_evicted:inc(1, { reason = victim.status == M.STATUS.DELIVERED and "delivered" or "enqueued_expired" })

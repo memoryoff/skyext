@@ -12,14 +12,21 @@
 -- 扫描依据是索引字段 `_critical_outbox_pending_count`。没有这个索引，扫描退化成
 -- 全表扫描，几千个角色就能把 Mongo 打满——所以 `ensure_indexes` 是启用门禁。
 local critical = require "skyext.critical"
+local critical_fields = require "skyext.critical_fields"
 local log = require "skyext.log"
 local metrics = require "skyext.metrics"
 local outbox = require "skyext.outbox"
 
 local M = {}
 
-M.FIELD = outbox.PENDING_COUNT_FIELD
+-- 字段名从契约模块取，不从 outbox / critical 取：这两个都会被测试桩替换，
+-- 取到 nil 会在构造查询时炸成 "table index is nil"，而不是给出可读的错误
+M.FIELD = critical_fields.OUTBOX_PENDING
+-- 终态清理标记。只按 pending>0 扫的话，"回执丢了、计数归零"的角色永远不再被扫，
+-- 它们的终态事件只能等容量腾挪——而那正是要避免的路径
+M.CLEANUP_FIELD = critical_fields.OUTBOX_CLEANUP
 M.INDEX_NAME = "critical_outbox_pending"
+M.CLEANUP_INDEX_NAME = "critical_outbox_cleanup"
 M.DEFAULT_SCAN = 64
 M.DEFAULT_BATCH = 16
 M.DEFAULT_INTERVAL = 5
@@ -36,7 +43,8 @@ local m_age = metrics.histogram(
 )
 local m_scan_size = metrics.gauge("skyext_outbox_scan_candidates", "Roles found by the last scan round", { "type" })
 
--- 索引门禁：`_critical_outbox_pending_count > 0` 是偏索引，只为待发角色建条目
+-- 索引门禁：`_critical_outbox_pending_count > 0` 是偏索引，只为待发角色建条目。
+-- 清理标记单独一条偏索引：它只在"有终态事件待清理"时存在，条目数远小于角色总数
 function M.index_specs(colls)
     return {
         {
@@ -45,6 +53,14 @@ function M.index_specs(colls)
                 { [M.FIELD] = 1 },
                 name = M.INDEX_NAME,
                 partialFilterExpression = { [M.FIELD] = { ["$gt"] = 0 } },
+            },
+        },
+        {
+            colls.role,
+            {
+                { [M.CLEANUP_FIELD] = 1 },
+                name = M.CLEANUP_INDEX_NAME,
+                partialFilterExpression = { [M.CLEANUP_FIELD] = { ["$exists"] = true } },
             },
         },
     }
@@ -73,9 +89,13 @@ function M.ensure_indexes(colls)
     return true
 end
 
--- 扫描待投递角色。skip 用于轮转，避免"永远只处理最前面那一批"：
+-- 扫描待处理角色。skip 用于轮转，避免"永远只处理最前面那一批"：
 -- 前面的角色一直投不出去时，后面的角色会饿死
--- 返回 [{ rid, pending }], next_skip 或 nil, err
+-- 返回 [{ rid, pending, cleanup_due }], next_skip 或 nil, err
+--
+-- 两个条件取并集：
+--   * pending > 0        还有待发事件
+--   * cleanup_at <= now  有到期的终态事件（回执丢失后计数已归零的角色靠这条才被扫到）
 function M.scan(role_coll, opts)
     opts = opts or {}
     if type(role_coll) ~= "table" then
@@ -84,8 +104,14 @@ function M.scan(role_coll, opts)
     local key = opts.key or "rid"
     local limit = opts.limit or M.DEFAULT_SCAN
     local skip = opts.skip or 0
-    local called, docs, err = pcall(role_coll.find_many, role_coll, { [M.FIELD] = { ["$gt"] = 0 } }, {
-        projection = { [key] = 1, [M.FIELD] = 1, _id = 0 },
+    local now = opts.now or os.time()
+    local called, docs, err = pcall(role_coll.find_many, role_coll, {
+        ["$or"] = {
+            { [M.FIELD] = { ["$gt"] = 0 } },
+            { [M.CLEANUP_FIELD] = { ["$lte"] = now } },
+        },
+    }, {
+        projection = { [key] = 1, [M.FIELD] = 1, [M.CLEANUP_FIELD] = 1, _id = 0 },
         -- 按主键排序保证轮转分页稳定；不排序时 Mongo 的返回顺序在数据变动后会漂移
         sort = { { [key] = 1 } },
         skip = skip,
@@ -100,7 +126,12 @@ function M.scan(role_coll, opts)
     local list = {}
     for _, doc in ipairs(docs) do
         if type(doc) == "table" and doc[key] ~= nil then
-            list[#list + 1] = { rid = doc[key], pending = doc[M.FIELD] or 0 }
+            local due = doc[M.CLEANUP_FIELD]
+            list[#list + 1] = {
+                rid = doc[key],
+                pending = doc[M.FIELD] or 0,
+                cleanup_due = math.type(due) == "integer" and due <= now,
+            }
         end
     end
     -- 这一页没满说明已经到末尾，下一轮从头开始
@@ -111,13 +142,28 @@ function M.scan(role_coll, opts)
     return list, next_skip
 end
 
--- 默认投递：走现有可靠消息接口。msg_id 由可靠消息模块分配，event_id 才是业务去重键
+-- 默认投递：走现有可靠消息接口。msg_id 由可靠消息模块分配，event_id 才是业务去重键。
+--
+-- 返回值语义（pump 依赖它区分"暂时送不出去"和"永远送不出去"）：
+--   true                   已确认入队
+--   delivery.retryable(...) 环境故障（Mongo 抖动、连接池耗尽、写关注失败）
+--   其它                    永久失败，计入毒事件阈值
+--
+-- 这里必须把落库异常翻成 retryable：`reliable_msg.save` 在 Mongo 抖动时抛错，
+-- 如果让它冒成 pcall 失败，pump 会把"环境抖动 5 次（约 25 秒）"当成毒事件，
+-- 把一条**源端资产已经扣掉**的事件标成 FAILED，而业务从未执行。
 function M.default_deliver(envelope)
     local router = require "skyext.entity.router"
-    local msg_id = router.reliable_send(envelope.target_type, envelope.target_id, "__apply_outbox_event", {
-        envelope,
-    })
-    return msg_id ~= nil
+    local delivery = require "skyext.entity.delivery"
+    local called, msg_id =
+        pcall(router.reliable_send, envelope.target_type, envelope.target_id, "__apply_outbox_event", { envelope })
+    if not called then
+        return delivery.retryable("reliable_send raised: " .. tostring(msg_id))
+    end
+    if msg_id == nil then
+        return delivery.retryable("reliable_send returned no msg_id")
+    end
+    return true
 end
 
 -- 在实体队列内执行：由 entity_agent 的 `outbox_pump` 命令调用。
@@ -144,8 +190,8 @@ function M.pump_entity(entity, opts)
 end
 
 local function merge_stats(total, stats)
-    for _, field in ipairs({ "enqueued", "failed", "unknown", "already", "batches" }) do
-        total[field] = total[field] + (stats[field] or 0)
+    for _, field in ipairs({ "enqueued", "failed", "unknown", "already", "batches", "cleaned", "retryable" }) do
+        total[field] = (total[field] or 0) + (stats[field] or 0)
     end
     total.pending = (total.pending or 0) + (stats.pending or 0)
 end
@@ -169,6 +215,7 @@ function M.run_once(deps, opts)
         key = opts.key or deps.key,
         limit = opts.scan_limit or M.DEFAULT_SCAN,
         skip = deps.cursor or 0,
+        now = opts.now or os.time(),
     })
     if not list then
         m_scan:inc(1, { result = "error" })
@@ -189,9 +236,11 @@ function M.run_once(deps, opts)
         pending = 0,
         skipped = 0,
         loads = 0,
+        cleaned = 0,
+        retryable = 0,
     }
     for _, entry in ipairs(list) do
-        if (entry.pending or 0) <= 0 then
+        if (entry.pending or 0) <= 0 and not entry.cleanup_due then
             -- 索引字段是陈旧的（事件已被消费但计数没来得及更新）：不加载、不投递
             stats.skipped = stats.skipped + 1
         else

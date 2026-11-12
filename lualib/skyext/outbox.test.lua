@@ -56,7 +56,7 @@ local function fake_dbmgr(store)
             return "UNKNOWN", store.unknown
         end
         if store.reject then
-            return "REJECTED", "cas mismatch"
+            return "REJECTED", store.reject_detail or "cas mismatch"
         end
         if store.doc._version ~= expected then
             return "REJECTED", "version mismatch"
@@ -779,6 +779,70 @@ t.describe("outbox 投递闭环", function()
         t.expect(h.store.critical._critical_outbox_v1[EVENT].status).to.equal("DELIVERED")
     end)
 
+    -- 回执写入的三个失败分支以前都没有断言。它们决定可靠消息"重投还是放弃"，
+    -- 分错了会变成"永远不 ACK"或者"静默丢回执"
+    t.it("returns UNKNOWN and refreshes when the ack write is undecided", function()
+        local h = harness()
+        h.seed({ { event_id = EVENT, status = "ENQUEUED", created_at = h.now - 10, op_type = "mail.send" } }, 0)
+        h.store.unknown = "mongo down"
+        local ok, err = h.outbox.mark_delivered(h.ctx, EVENT, { now = h.now })
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.equal("UNKNOWN")
+        -- 写入可能已经生效：必须对齐内存版本，否则下一轮 CAS 永远打不中
+        t.expect(h.store.refreshed).to.equal(1)
+    end)
+
+    t.it("returns BLOCKED without retrying for a non-version rejection", function()
+        local h = harness()
+        h.seed({ { event_id = EVENT, status = "ENQUEUED", created_at = h.now - 10, op_type = "mail.send" } }, 0)
+        h.store.reject = true
+        h.store.reject_detail = "lease expired"
+        local before = #(h.store.cas or {})
+        local ok, err = h.outbox.mark_delivered(h.ctx, EVENT, { now = h.now })
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.equal("BLOCKED")
+        -- 环境/归属类拒绝重试只会重复写，必须一次就放弃
+        t.expect(#(h.store.cas or {}) - before).to.equal(1)
+    end)
+
+    t.it("gives up after exhausting the version-conflict retries", function()
+        local h = harness()
+        h.seed({ { event_id = EVENT, status = "ENQUEUED", created_at = h.now - 10, op_type = "mail.send" } }, 0)
+        h.store.reject = true
+        h.store.reject_detail = "cas mismatch"
+        local ok, err = h.outbox.mark_delivered(h.ctx, EVENT, { now = h.now })
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.equal("CAS retries exhausted")
+        -- 版本冲突是有界重试，不能无限转
+        t.expect(#(h.store.cas or {})).to.equal(h.outbox.CAS_RETRY + 1)
+    end)
+
+    -- 回执到达是这个角色最后一次被写：清理标记必须与状态同一次落库，
+    -- 否则它的终态事件再也没人清（worker 只扫 pending>0 或 cleanup_at<=now）
+    t.it("persists the cleanup marker together with the delivered status", function()
+        local h = harness()
+        h.seed({ { event_id = EVENT, status = "ENQUEUED", created_at = h.now - 10, op_type = "mail.send" } }, 0)
+        assert(h.outbox.mark_delivered(h.ctx, EVENT, { now = h.now }))
+        local update = h.store.cas[#h.store.cas].update
+        local expected = h.now + h.outbox.DELIVERED_RETENTION
+        t.expect(update["$set"][h.outbox.CLEANUP_FIELD]).to.equal(expected)
+        t.expect(h.store.critical[h.outbox.CLEANUP_FIELD]).to.equal(expected)
+    end)
+
+    -- 投递成功（PENDING -> ENQUEUED）也要落标记：这条路径之后这个角色可能
+    -- 再也不被写，回执丢了就停在 ENQUEUED，标记是它唯一的"该清理了"信号
+    t.it("stamps the cleanup marker when an event becomes ENQUEUED", function()
+        local h = harness()
+        h.seed({ { event_id = EVENT, status = "PENDING", created_at = h.now - 5, op_type = "mail.send" } }, 1)
+        assert(h.outbox.pump(h.ctx, function()
+            return true
+        end, { now = h.now }))
+        local update = h.store.cas[#h.store.cas].update
+        local expected = h.now + h.outbox.ENQUEUED_RETENTION
+        t.expect(update["$set"][h.outbox.CLEANUP_FIELD]).to.equal(expected)
+        t.expect(h.store.critical[h.outbox.CLEANUP_FIELD]).to.equal(expected)
+    end)
+
     t.it("cleans up delivered and expired events but never pending ones", function()
         local week = 8 * 24 * 3600
         local h = harness()
@@ -862,6 +926,77 @@ t.describe("outbox 毒事件隔离", function()
         t.expect(h.store.critical._critical_outbox_pending_count).to.equal(0)
     end)
 
+    -- A-10：两个阶段的行为不同，这是**主动的取舍**，不是矛盾。
+    -- 阈值内保序（break），达到阈值后用可用性换掉严格顺序（隔离 + continue）。
+    -- 这条用例把两段行为放在一起断言，避免以后有人只看到一半就"修正"成另一半
+    t.it("preserves order before the poison threshold and abandons it after", function()
+        local h = harness()
+        seed_two(h)
+        local limit = h.outbox.MAX_DELIVER_ATTEMPTS
+
+        -- 阶段一：阈值内只记尝试次数，第二条绝不抢跑
+        for i = 1, limit - 1 do
+            local stats = assert(h.outbox.pump(h.ctx, function()
+                return false
+            end, { now = h.now + i }))
+            t.expect(stats.quarantined).to.equal(0)
+            local box = h.store.critical._critical_outbox_v1
+            t.expect(box[eid("a")].status).to.equal("PENDING")
+            t.expect(box[eid("a")].deliver_attempts).to.equal(i)
+            -- 保序：第一条没投出去，第二条不能被尝试
+            t.expect(box[eid("b")].deliver_attempts).to.be_nil()
+            t.expect(box[eid("b")].status).to.equal("PENDING")
+        end
+
+        -- 阶段二：达到阈值后隔离第一条，并继续投第二条
+        local last = assert(h.outbox.pump(h.ctx, function()
+            return false
+        end, { now = h.now + limit }))
+        t.expect(last.quarantined).to.equal(1)
+        local box = h.store.critical._critical_outbox_v1
+        t.expect(box[eid("a")].status).to.equal("FAILED")
+        -- 这里就是"主动放弃保序"：第二条在第一条失败之后仍被尝试
+        t.expect(box[eid("b")].deliver_attempts).to.equal(1)
+    end)
+
+    -- 环境故障与毒事件必须分开。Mongo 抖动 5 次（默认 5s 间隔约 25 秒）如果被
+    -- 当成毒事件，一条"源端资产已经扣掉"的事件会被标 FAILED，而业务从未执行：
+    -- 这就是静默资产丢失
+    t.it("does not quarantine an event whose delivery hit an environment fault", function()
+        local h = harness()
+        seed_two(h)
+        local delivery = require "skyext.entity.delivery"
+        local stats
+        for _ = 1, h.outbox.MAX_DELIVER_ATTEMPTS + 2 do
+            stats = assert(h.outbox.pump(h.ctx, function()
+                return delivery.retryable("mongo unavailable")
+            end, { now = h.now }))
+        end
+        t.expect(stats.quarantined).to.equal(0)
+        t.expect(stats.retryable).to.equal(1)
+        t.expect(stats.failed).to.equal(0)
+        local box = h.store.critical._critical_outbox_v1
+        -- 仍然是 PENDING，且没有留下"已尝试 N 次"的痕迹（那些会推向隔离）
+        t.expect(box[eid("a")].status).to.equal("PENDING")
+        t.expect(box[eid("a")].deliver_attempts).to.be_nil()
+        t.expect(h.store.critical._critical_outbox_pending_count).to.equal(2)
+    end)
+
+    -- 但投递器明确说"送不出去"（返回 false）或自己抛异常，仍要走隔离，
+    -- 否则一条永远送不出去的事件会让整个角色的队列饿死
+    t.it("still quarantines an event when the deliverer explicitly fails", function()
+        local h = harness()
+        seed_two(h)
+        local last
+        for _ = 1, h.outbox.MAX_DELIVER_ATTEMPTS do
+            last = assert(h.outbox.pump(h.ctx, function()
+                return false
+            end, { now = h.now }))
+        end
+        t.expect(last.quarantined).to.equal(1)
+        t.expect(h.store.critical._critical_outbox_v1[eid("a")].status).to.equal("FAILED")
+    end)
+
     t.it("stays pending when the attempt counter cannot be persisted", function()
         local h = harness()
         seed_two(h)
@@ -869,6 +1004,22 @@ t.describe("outbox 毒事件隔离", function()
         local stats = assert(h.outbox.pump(h.ctx, deliver, { now = h.now }))
         t.expect(stats.quarantined).to.equal(0)
         t.expect(h.store.critical._critical_outbox_v1[eid("a")].status).to.equal("PENDING")
+    end)
+
+    -- copy_critical 只复制一层，事件记录仍是缓存里的同一张表。若在 CAS 之前直接
+    -- 改它，CAS 被拒之后内存缓存显示 FAILED、库里仍是 PENDING：事件在内存里消失，
+    -- pending_count 却没减，worker 会对着一个"看起来没有待发事件"的角色永远空扫
+    t.it("does not corrupt the cached event when the quarantine CAS is rejected", function()
+        local h = harness()
+        seed_two(h)
+        h.store.reject = true
+        local event = h.store.critical._critical_outbox_v1[eid("a")]
+        local returned = h.outbox._quarantine_event(h.ctx, event, h.store.critical, h.now, 5, "boom", 2)
+        t.expect(returned).to.be_nil()
+        -- 缓存必须原样保留 PENDING，不能因为一次失败的 CAS 被就地改成 FAILED
+        t.expect(h.store.critical._critical_outbox_v1[eid("a")].status).to.equal("PENDING")
+        t.expect(h.store.critical._critical_outbox_v1[eid("a")].failed_reason).to.be_nil()
+        t.expect(h.store.critical._critical_outbox_pending_count).to.equal(2)
     end)
 end)
 
@@ -878,9 +1029,11 @@ t.describe("outbox 定期清理", function()
         return "evt_" .. string.rep(ch, 64)
     end
 
-    t.it("cleans periodically even while events are still pending", function()
+    -- 清理不再有进程级节流窗口：节流对"回执丢失"的角色永远不可达（它们计数已归零，
+    -- worker 根本扫不到），而且一个进程级窗口会让第二个角色被跳过。
+    -- 真正的节流由保留期承担：没过期时只是一次内存遍历，不产生 Mongo 写入
+    t.it("cleans expired terminal events on every round while pending events remain", function()
         local h = harness()
-        h.outbox._reset_cleanup()
         local week = 8 * 24 * 3600
         h.seed({
             { event_id = eid("a"), status = "PENDING", created_at = h.now - 20, op_type = "mail.send" },
@@ -893,17 +1046,43 @@ t.describe("outbox 定期清理", function()
         t.expect(first.pending).to.equal(1)
         t.expect(first.cleaned).to.equal(1)
 
-        -- 节流窗口内不重复清理
-        local second = assert(h.outbox.pump(h.ctx, function()
-            return false
-        end, { now = h.now + 10 }))
-        t.expect(second.cleaned).to.be_nil()
+        -- 同一个进程里第二个角色也必须能清：节流窗口不存在了
+        local other = harness()
+        other.seed({
+            { event_id = eid("c"), status = "DELIVERED", updated_at = other.now - week, op_type = "mail.send" },
+        }, 0)
+        local second = assert(other.outbox.pump(other.ctx, function()
+            return true
+        end, { now = other.now }))
+        t.expect(second.cleaned).to.equal(1)
 
-        -- 超过窗口后再次清理（此时已没有可清的事件）
+        -- 没有到期事件时不写库，也不报错
         local third = assert(h.outbox.pump(h.ctx, function()
             return false
         end, { now = h.now + 70 }))
         t.expect(third.cleaned).to.equal(0)
+    end)
+
+    -- 回执丢失后事件停在 ENQUEUED、pending_count 归零。清理完必须重算标记：
+    -- 还有终态事件就指向下一批到期时刻，一条不剩就删掉，否则角色会被每轮空扫
+    t.it("recomputes or clears the cleanup marker after a cleanup", function()
+        local h = harness()
+        local week = 8 * 24 * 3600
+        h.seed({
+            { event_id = eid("a"), status = "DELIVERED", updated_at = h.now - week, op_type = "mail.send" },
+            { event_id = eid("b"), status = "ENQUEUED", updated_at = h.now - 10, op_type = "mail.send" },
+        }, 0)
+        t.expect(h.store.critical[h.outbox.CLEANUP_FIELD]).to.be_nil()
+
+        local cleaned = h.outbox.cleanup(h.ctx, { now = h.now })
+        t.expect(cleaned).to.equal(1)
+        -- 还剩一条 ENQUEUED 没到期：标记必须指向它的到期时刻，而不是留在过去
+        local expected = (h.now - 10) + h.outbox.ENQUEUED_RETENTION
+        t.expect(h.store.critical[h.outbox.CLEANUP_FIELD]).to.equal(expected)
+
+        -- 全部清完后标记必须消失
+        t.expect(h.outbox.cleanup(h.ctx, { now = expected + 1 })).to.equal(1)
+        t.expect(h.store.critical[h.outbox.CLEANUP_FIELD]).to.be_nil()
     end)
 end)
 
@@ -932,5 +1111,26 @@ t.describe("outbox 因果排序", function()
         local list = h.outbox.pending_events(h.store.critical, 10)
         t.expect(list[1].event_id).to.equal(eid("a"))
         t.expect(list[2].event_id).to.equal(eid("b"))
+    end)
+
+    -- 滚动升级期新旧节点写的事件会混在同一份 outbox 里：一部分有 causal_seq，
+    -- 一部分只有 created_at。比较器如果写成"两边都有 seq 才比 seq，否则退回时间"，
+    -- 就**不是全序**（A 无 seq 比 B 早、B 的 seq 比 C 小、C 的时间又比 A 早），
+    -- table.sort 拿到非传递比较器会给出任意顺序，可能把后发生的事件先投出去。
+    -- 无 seq 的事件只可能来自升级前，必须整体排在所有有 seq 的事件之前
+    t.it("keeps a total order when sequenced and legacy events are mixed", function()
+        local h = harness()
+        h.seed({
+            -- 有 seq：seq=1 但时间最晚，seq=2 但时间最早
+            { event_id = eid("b"), status = "PENDING", created_at = 200, causal_seq = 1, op_type = "mail.send" },
+            { event_id = eid("c"), status = "PENDING", created_at = 50, causal_seq = 2, op_type = "mail.send" },
+            -- 无 seq（升级前写入）：时间居中
+            { event_id = eid("a"), status = "PENDING", created_at = 100, op_type = "mail.send" },
+        }, 3)
+        local list = h.outbox.pending_events(h.store.critical, 10)
+        -- 先 legacy（按时间），再按 seq 升序
+        t.expect(list[1].event_id).to.equal(eid("a"))
+        t.expect(list[2].event_id).to.equal(eid("b"))
+        t.expect(list[3].event_id).to.equal(eid("c"))
     end)
 end)

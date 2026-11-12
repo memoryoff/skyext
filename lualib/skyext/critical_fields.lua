@@ -22,8 +22,34 @@ M.OUTBOX_PENDING = "_critical_outbox_pending_count"
 -- 热账本里最老一条操作的 `at`：归档扫描的索引字段。
 -- 没有它，归档只能全表扫描，或者根本不扫
 M.OPS_OLDEST = "_critical_ops_oldest_at"
+-- 因果序号水位：与事件同一次 CAS 分配，保证同秒事件能排出确定顺序。
+-- 和 OUTBOX_PENDING 同理，漏进白名单就是"写过 Outbox 的角色加载失败"，
+-- 所以任何新增的 `_critical_*` 写入点都必须同步登记到这里
+M.OUTBOX_SEQ = "_critical_outbox_seq"
+-- 终态清理时刻：有终态事件、且到了可以删的时间点。worker 靠它找到
+-- "回执丢了、pending_count 已归零"的角色——只按 pending>0 扫的话，
+-- 这些角色的终态事件永远没人清，只能等容量腾挪
+M.OUTBOX_CLEANUP = "_critical_outbox_cleanup_at"
 
-M.FIELDS = { M.INTENT, M.OPS, M.OUTBOX, M.OUTBOX_PENDING, M.OPS_OLDEST }
+M.FIELDS = {
+    M.INTENT,
+    M.OPS,
+    M.OUTBOX,
+    M.OUTBOX_PENDING,
+    M.OPS_OLDEST,
+    M.OUTBOX_SEQ,
+    M.OUTBOX_CLEANUP,
+}
+
+-- Outbox 的保留期口径也放在这里：`critical` 与 `outbox` 必须用同一个数字，
+-- 而且两边都会被测试桩替换，只有这个模块是"永远真实"的契约来源。
+-- 曾经 outbox 自己写一份字面量、critical 写另一份，容量腾挪路径就悄悄把
+-- DELIVERED 变成了 0 秒即删。
+M.OUTBOX_DELIVERED_RETENTION = 7 * 24 * 3600
+M.OUTBOX_ENQUEUED_RETENTION = 7 * 24 * 3600
+-- FAILED（投递彻底失败）的最小保留期：容量腾挪时不能沿用 delivered 口径，
+-- 否则"资产已扣、可靠消息从未落库"的唯一记录会被静默抹掉
+M.OUTBOX_FAILED_MIN_RETENTION = 3600
 
 local WHITELIST = {}
 for _, name in ipairs(M.FIELDS) do
@@ -242,6 +268,22 @@ function M.extract(raw)
         -- 只接受非负整数：写成浮点或字符串会让索引查询与计数减法都失真
         if math.type(pending) ~= "integer" or pending < 0 then
             return nil, M.OUTBOX_PENDING .. " must be a non-negative integer"
+        end
+    end
+    if critical[M.OUTBOX_SEQ] ~= nil then
+        local seq = critical[M.OUTBOX_SEQ]
+        -- 序号水位必须是单调递增的整数：浮点会让 `seq_base + 1` 产生小数，
+        -- 而后续事件排序会因此失去全序
+        if math.type(seq) ~= "integer" or seq < 0 then
+            return nil, M.OUTBOX_SEQ .. " must be a non-negative integer"
+        end
+    end
+    if critical[M.OUTBOX_CLEANUP] ~= nil then
+        local due = critical[M.OUTBOX_CLEANUP]
+        -- 必须是非负整数：它直接进 Mongo 的 `$lte` 查询，浮点或字符串会让
+        -- 索引匹配不到，清理又退回"永远没人扫"
+        if math.type(due) ~= "integer" or due < 0 then
+            return nil, M.OUTBOX_CLEANUP .. " must be a non-negative integer"
         end
     end
 

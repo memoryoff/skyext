@@ -246,6 +246,11 @@ t.describe("node_shutdown 迁移截止", function()
         h.CMD.shutdown(2)
         t.expect(h.sent).to.equal({ { ":migration", "cancel", "shutdown deadline" } })
         t.expect(#h.logs > 0).to.equal(true)
+        -- cancel 是单向消息，发出去不等于被处理。必须给协调器一小段宽限，
+        -- 让它把"踢掉屏障期客户端"的兜底清理跑完；否则进程紧接着 abort，
+        -- cancel 可能压根没被读到，网关屏障就永久留着
+        -- 2 秒总预算里迁移只分到一半（1 秒 = 100 tick），再加 10 tick 宽限
+        t.expect(h.slept).to.equal(110)
     end)
 
     t.it("does not send a cancel when the hook finishes in time", function()
@@ -254,5 +259,7 @@ t.describe("node_shutdown 迁移截止", function()
 
         h.CMD.shutdown(2)
         t.expect(h.sent).to.be_nil()
+        -- 钩子按时返回就不该有宽限等待
+        t.expect(h.slept).to.be_nil()
     end)
 end)

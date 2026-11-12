@@ -117,18 +117,35 @@ mongo_config = {
 -- 节点配置只在 include 之前写**要覆盖的字段**，这里逐字段合并默认值。
 -- 用 `x = x or {...}` 是整表替换：运维最自然的一句 `migration = { enabled = true }`
 -- 会把 adapter / type_name / concurrency 全丢掉，CMD.start 直接拒绝、节点起不来。
-local function with_defaults(custom, defaults)
-    if type(custom) ~= "table" then
-        return defaults
-    end
+--
+-- 嵌套表也要合并，不能整表替换：`pay_callback = { enabled = true, orders = { db = "role2" } }`
+-- 若整表替换 orders，coll 就没了，pay_callback 会静默回退到默认集合名，
+-- 把订单写进另一个库/集合——这类错配在支付链路上很难事后发现。
+-- 数组（如白名单）仍然整表替换：合并数组会得到既不是默认值也不是用户意图的结果
+local function is_array(t)
+    return t[1] ~= nil
+end
+
+local function merge_table(custom, defaults)
     local out = {}
     for k, v in pairs(defaults) do
         out[k] = v
     end
     for k, v in pairs(custom) do
-        out[k] = v
+        if type(v) == "table" and type(out[k]) == "table" and not is_array(v) and not is_array(out[k]) then
+            out[k] = merge_table(v, out[k])
+        else
+            out[k] = v
+        end
     end
     return out
+end
+
+local function with_defaults(custom, defaults)
+    if type(custom) ~= "table" then
+        return defaults
+    end
+    return merge_table(custom, defaults)
 end
 
 outbox_worker = with_defaults(outbox_worker, {

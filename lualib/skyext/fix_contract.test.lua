@@ -318,3 +318,94 @@ t.describe("Outbox 回执链路契约", function()
         t.expect(store.critical._critical_outbox_v1[EVENT].status).to.equal("DELIVERED")
     end)
 end)
+
+--------------------------------------------------------------------------------
+-- 关键字段白名单契约
+--
+-- 这一组守的是一个"上线即炸"的失败模式：critical 往文档里写了某个
+-- `_critical_*` 字段，但 critical_fields 的白名单没登记它。extract 看到未知的
+-- `_critical_*` 会直接拒绝整个文档（这是对的，旧代码没资格删新字段），
+-- 结果是**写过 Outbox 的角色下次加载就永久登不上**。
+--
+-- 124 个单测全绿也发现不了，因为没有一个用例把"提交后的文档"再喂回 extract。
+-- 所以这里既断言当前字段齐全，也断言"critical 导出的每个 *_FIELD 都在白名单里"
+-- 这条结构性不变式，以后新增字段漏登记会立刻变红。
+--------------------------------------------------------------------------------
+t.describe("关键字段白名单契约", function()
+    t.it("exposes the outbox seq field in the whitelist", function()
+        local cf = require "skyext.critical_fields"
+        local allowed = {}
+        for _, name in ipairs(cf.FIELDS) do
+            allowed[name] = true
+        end
+        t.expect(allowed["_critical_outbox_seq"]).to.equal(true)
+    end)
+
+    t.it("keeps every critical *_FIELD constant inside the whitelist", function()
+        local cf = require "skyext.critical_fields"
+        local crit = require "skyext.critical"
+        local allowed = {}
+        for _, name in ipairs(cf.FIELDS) do
+            allowed[name] = true
+        end
+        local missing = {}
+        for key, value in pairs(crit) do
+            if type(key) == "string" and key:match("_FIELD$") and type(value) == "string" then
+                if not allowed[value] then
+                    missing[#missing + 1] = key .. "=" .. value
+                end
+            end
+        end
+        table.sort(missing)
+        -- 失败信息要直接指出是哪个常量漏登记，而不是只说"断言失败"
+        t.expect(table.concat(missing, ", ")).to.equal("")
+    end)
+
+    t.it("accepts a document written by a full commit round trip", function()
+        local cf = require "skyext.critical_fields"
+        local crit = require "skyext.critical"
+        -- 按 critical 自己的字段常量拼一份"刚提交完"的文档后像
+        local doc = {
+            rid = 7,
+            gold = 100,
+            [crit.OUTBOX_FIELD] = {
+                evt_abc = {
+                    event_id = "evt_abc",
+                    status = "PENDING",
+                    causal_seq = 1,
+                    target_type = "role",
+                    target_id = 8,
+                    op_type = "mail.send",
+                    param_hash = string.rep("a", 64),
+                    created_at = 1000,
+                },
+            },
+            [crit.OUTBOX_PENDING_FIELD] = 1,
+            [crit.OUTBOX_SEQ_FIELD] = 1,
+            -- 终态清理标记也必须在白名单里，否则 worker 写完之后角色就加载不了
+            [crit.OUTBOX_CLEANUP_FIELD] = 2000,
+            [crit.OPS_FIELD] = {
+                srv_abc = { status = "COMMITTED", op_type = "mail.send", at = 1000 },
+            },
+            [crit.OPS_OLDEST_FIELD] = 1000,
+        }
+        local clean, critical, reject = cf.extract(doc)
+        t.expect(reject).to.be_nil()
+        t.expect(clean).to.exist()
+        t.expect(critical).to.exist()
+        t.expect(critical[crit.OUTBOX_SEQ_FIELD]).to.equal(1)
+        t.expect(critical[crit.OUTBOX_PENDING_FIELD]).to.equal(1)
+        t.expect(critical[crit.OUTBOX_CLEANUP_FIELD]).to.equal(2000)
+    end)
+
+    t.it("rejects a seq that is not a non-negative integer", function()
+        local cf = require "skyext.critical_fields"
+        local crit = require "skyext.critical"
+        local ok, err = cf.extract({
+            rid = 7,
+            [crit.OUTBOX_SEQ_FIELD] = 1.5,
+        })
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.match("_critical_outbox_seq")
+    end)
+end)

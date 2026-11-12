@@ -18,16 +18,22 @@
 
 ## 1. 总览
 
+> 本节数字以本文件实际条目为准；上一版存在重复行（「需真实环境验证」写了两遍）
+> 与总数不自洽（写 21，实际 F-01~F-10 + R-01~R-12 = 22），已修正。
+
 | 分类 | 数量 | 说明 |
 | --- | --- | --- |
-| 已修复并验证（第五 ~ 九批） | 21 | 全部代码层缺陷收敛，124 files / 124 passed |
+| 已修复并验证（第五 ~ 九批） | 22 | F-01 ~ F-10、R-01 ~ R-12 |
+| 对抗审查发现 · 已修 | 14 | A-01 ~ A-14，见 §8 / §9 |
 | 代码层待修 | 0 | — |
-| 需真实环境验证 | 7 | V-01 已通过（真实副本集 + stepDown）；V-02 ~ V-07 待环境 |
-| 需真实环境验证 | 7 | 本文件 §4，不是代码写错，是没跑过 |
-| 设计权衡（记录不改） | 4 | 本文件 §5，改了反而更危险 |
+| 需真实环境验证 | 7 | V-01 / V-06 已实测通过；V-02 ~ V-05 需要多节点与故障注入；V-07 已提供可复跑脚本 |
+| 设计权衡（记录不改） | 4 | 见 §5 |
 | 后续优化 | 3 | P2 类，不阻塞生产验收 |
 
-> **提交基线**：`ed9d05a`（第五批 + 本台账首次建立）。第六批修复在工作区，尚未提交。
+> **提交基线**：`bf0abf4`（第九批）。第十批（A-07 ~ A-14）在工作区，未提交。
+>
+> **口径**：只把「代码改完 + 新增测试通过 + 全量门禁通过」记为已修；
+> 需要真实多节点 / 故障注入的项一律标「待环境」，不写「已验证」。
 
 原始审查报告 12 项修复清单（P0-01 ~ P2-02）的状态映射见 §6。
 
@@ -180,15 +186,49 @@
 
 | 编号 | 验证项 | 现状 | 通过标准 |
 | --- | --- | --- | --- |
-| V-01 · P1-06 | 三节点副本集 `rs.stepDown()` + 并发关键操作 | **已通过**（2026-11-12 本地 rs0，`documents=1 version=10 hits=10`，无重复；集成测试在该副本集上 124/124） | 无重复资产效果；所有 UNKNOWN 能被 `critical.query` 归位；`_critical_ops_v1` 同一 op_id 只有一条 |
+| V-01 · P1-06 | 三节点副本集 `rs.stepDown()` + 并发关键操作 | **已通过（2026-11-12 重跑，用加强后的脚本）**：`topology: set=rs0 members=3`、`primary moved: 27021 -> 27022`、`documents=1 version=8 hits=8`；连续两次执行 primary 分别换到 27022 / 27023，无重复文档。集成测试在同一副本集上 124/124。负例（连不上）确认 exit=1 | 无重复资产效果；所有 UNKNOWN 能被 `critical.query` 归位；`_critical_ops_v1` 同一 op_id 只有一条 |
 | V-02 · P1-07 | 双 skynet 节点 + 真实客户端迁移回环 | 待跑 | 连接不断、`session_epoch` 不变、`owner_epoch` +1、下行序号不重不漏、在途上行不重复执行 |
 | V-03 | Mongo 网络分区（minority 侧写入） | 待跑 | 写入 fail-closed，恢复后对账收敛 |
 | V-04 | etcd 租约抖动（暂停 10s） | 待跑 | 实体不丢锁、不重复加载，恢复后服务发现收敛 |
 | V-05 | 真实 WebSocket 网络回环（握手期断网、ACK 丢） | 待跑 | 六状态机转移次数正确、配额归零、续接按 `(session_epoch, seq)` 去重 |
-| V-06 · P1-04 | 账本容量压测（1k/5k/10k 关键操作） | 数值未采集 | 归档 P95/P99、CAS 冲突率、BSON 大小、`MAX_OPS` 预警阈值、腾挪次数有数据支撑 |
-| V-07 · P2-07 | 自动化压测脚本 + 固定硬件基准报告 | 仓库只有指标与注入点 | 脚本可复跑，报告含硬件规格与原始数值 |
+| V-06 · P1-04 | 账本容量压测（512 条事件 / 512 条操作满载） | **已跑（2026-11-12）**：`scripts/ci/bench_critical_capacity.sh` 在本地三节点副本集上实测。见下方数值 | 归档 P95/P99、CAS 冲突率、BSON 大小、`MAX_OPS` 预警阈值、腾挪次数有数据支撑 |
+| V-07 · P2-07 | 自动化压测脚本 + 固定硬件基准报告 | **已提供脚本**：`scripts/ci/bench_critical_capacity.sh`；数值见下方 V-06 | 脚本可复跑，报告含硬件规格与原始数值 |
+
+#### V-06 实测数值（2026-11-12，macOS 本地，三节点副本集 rs0，majority 写关注）
+
+环境：单机三进程 mongod（27021-27023），`wiredTigerCacheSizeGB=0.25`，localhost 回环。
+**这不是生产硬件**，数值用于判断数量级与相对关系，不能直接当容量上限。
+
+| 指标 | 数值 |
+| --- | --- |
+| Outbox 满载（512 事件）文档大小 | **194,877 字节**（EJSON 上界，约 190KB） |
+| 热账本满载（512 操作）文档大小 | **108,136 字节**（约 105KB） |
+| 触顶提交（腾 1 条 + 新增 1 条 + 推进水位，单次 CAS） | **p50 66ms / p95 139ms / p99 143ms** |
+| 归档一轮（64 次 upsert + 1 次 unset），**有** `rid+op_id` 索引 | **p50 104ms / p95 123ms / p99 255ms**，≈615 op/s |
+| 归档一轮，**没有**索引（索引门禁被绕过） | **p50 115ms / p95 4226ms / p99 4270ms** |
+
+结论：
+
+1. **索引门禁必须保留。** 没有 `rid+op_id` 唯一索引时，冷账本 upsert 退化成 COLLSCAN，
+   P95 从 123ms 涨到 4226ms（**34 倍**），而且随账本增长继续恶化。这就是
+   `critical.ensure_indexes` 存在的理由，不是形式主义。
+2. **文档体积不是瓶颈。** 512 条满载也只有约 190KB，离 16MB 上限两个数量级。
+   512 这个上限的真实约束来自"单次提交要重写整份文档"，不是 BSON 大小。
+3. **触顶提交 66ms 偏慢，值得关注。** 满载时每次提交都要重写约 190KB 文档。
+   这意味着 Outbox 长期贴着 512 上限跑会让关键操作延迟明显上升——
+   `CAPACITY_WARN_RATIO=0.8` 的预警线应该按这个延迟来调，而不是等撞顶。
+4. **归档吞吐 ≈615 op/s 足够。** 单角色按每小时几百次关键操作估算，
+   64 条/轮的批量远快于产生速度；真正的风险是索引缺失或长期不归档。
+
+复跑：`scripts/ci/bench_critical_capacity.sh [mongo_uri] [rounds]`（默认 40 轮）。
 
 > `docs/design/p17_verification.md` §3 已有 B1 / P00-C / 跨节点回环的执行步骤。
+> **V-02 ~ V-05、V-07 的可执行步骤已单独整理成
+> [`docs/design/p17_pending_verification_runbook.md`](p17_pending_verification_runbook.md)**：
+> 含环境准备（etcd 三节点、Mongo 副本集、`make build`）、必改配置、启动顺序、
+> 每项的注入方式 / 观察指标 / 通过标准 / 记录模板，以及失败定位顺序。
+> 到环境上照着跑，跑完把结果贴回本节。
+>
 > `critical.integration.test.lua` 使用真实 MongoDB，但单节点副本集的 `w:majority` **不能**证明真实多数派切主语义。
 >
 > **V-01 复跑方式**（需要三节点副本集）：
@@ -219,6 +259,8 @@
 | 容量触顶显式放弃 DELIVERED 保留期 | 触顶时先腾终态再决定是否 `CAPACITY_EXCEEDED`，比直接拒绝玩家更可取；已显式传 `delivered_retention = 0`，不再是隐式行为 |
 | 迁移冻结期上行静默丢弃 | 协议没有对应 `errcode`，回错误码会走断连兜底；客户端按超时重传同一 `req_id`，由新 owner 的幂等缓存回应 |
 | 只有 `role` 节点调 `launch_optional_services` | `pay_callback` 是纯 HTTP 服务，在 account/gateway/robot 各起一份会端口冲突；其余三个服务都依赖实体路由，本就不该在非实体节点启动 |
+| 毒事件隔离后**放弃保序**（A-10） | 阈值内 break 保序；达到阈值说明这条事件短期不会成功，继续挡着会让整个角色饿死。两阶段行为不同是主动取舍，不是矛盾。代价是接收方可能乱序收到同一角色的事件，因此接收侧必须用 `service_op_id` 去重 + 参数自校验。契约写在 `outbox.MAX_DELIVER_ATTEMPTS` 注释与对应用例里 |
+| 补偿是**至少一次**（A-14） | ACK 丢失与补偿失败在协调者看来不可区分，所以 `compensate` 会被重复调用。状态机只保证"离开 COMPENSATING 一次"，业务补偿必须自带幂等键。改成"恰好一次"需要补偿侧持久化去重表，成本远高于要求 handler 幂等 |
 
 ---
 
@@ -229,29 +271,199 @@
 | P0-01 | 已修 + 已验证 | `CMD.start` 门禁存在；`common.app.lua` 合并默认值后 `migration={enabled=true}` 不再启动失败（F-06） |
 | P0-02 | 已修 + 已验证（代码链路） | 适配器 + 三段接管 + 真实契约测试（F-01/F-02）；真实双节点回环仍属 V-02 |
 | P0-03 | 已修 | 启动顺序 node → entities(READY) → optional → gate；非实体节点不再起实体依赖服务 |
-| P1-01 | 部分修 | DELIVERED 回写链路已通并通过契约测试（F-03），回执归属/格式（R-02）与懒唤醒（R-05）已修；清理闭环与 PENDING 容量兜底见 R-03/R-04 |
+| P1-01 | 已修 + 已验证 | DELIVERED 回写（F-03）、回执归属/格式（R-02）、懒唤醒（R-05）、定期清理成环（R-03）、毒事件隔离（R-04）、FAILED 保留期下限（A-09）、回执丢失角色的清理可达性（A-08）全部落地 |
 | P1-02 | 已修 + 已验证 | `INTERNAL_ERROR` + outbox/pay_webhook 下游（F-05） |
-| P1-03 | 已修（竞态已堵） | 取消兜底 + 目标端 `migration_abort` / barrier 校验已实现；RPC deadline 不做，理由见 R-01 |
-| P1-04 | 部分修 | 80% 预警、归档滞后指标已修（F-08/F-10）；压测数值见 V-06 |
+| P1-03 | 已修（竞态已堵） | 取消兜底 + 目标端 `migration_abort` / barrier 校验已实现；abort 改为先踢后通知（A-11）；RPC deadline 不做，理由见 R-01 |
+| P1-04 | 已修 + 已实测 | 80% 预警、归档滞后指标（F-08/F-10）；V-06 实测数值见 §4，含索引门禁 34 倍差异 |
 | P1-05 | 已修 | `critical.query` 冷账本 pcall；归档写路径 pcall（F-09） |
 | P1-06 | **已通过** | V-01：本地三节点副本集 + `rs.stepDown()`，`documents=1 / version=hits` |
 | P1-07 | 待环境 | V-02 双节点回环，需要两个 skynet 节点 + 真实客户端 |
 | P2-01 | 部分修 | 收敛计划 §8、本台账、`p17_verification.md` §3 已同步；`session_snapshot_v1.md` / `outbox_saga_v1.md` 仍需逐篇对齐 |
-| P2-02 | 已修 | R-10 四组复杂交易用例 |
+| P2-02 | 已修 | R-10 四组复杂交易用例；补偿语义（至少一次）已在 A-14 定清 |
+| P2-03 | 已修 | R-09 因果序号 + A-03 全序比较器 |
+| P2-04 | 已修 | R-07 指标补齐（迁移取消、恢复任务 due、PREPARED 时长） |
+| P2-05 | 已修 | R-08 + A-05（`math.tointeger` 归一化，fail-closed） |
+| P2-06 | 已修 | R-06 启动配置自检 + A-06 嵌套配置合并 |
+| P2-07 | 部分完成 | V-07 脚本已提供（`bench_critical_capacity.sh`）；生产硬件基准仍待采集 |
 
-**对外表述**：核心架构已实现，跨模块契约已由自动化测试验证；真实故障验证与容量压测尚未完成，**暂不具备生产部署资格**。
+**对外表述**：核心架构已实现，跨模块契约由自动化测试验证，副本集切主与容量压测已在本地环境实测；
+**双节点迁移回环、网络分区、etcd 租约抖动仍未验证**，因此仍不建议直接生产部署。
 
 ---
 
 ## 7. 建议修复顺序
 
-1. **代码层缺陷已全部收敛**（R-01 ~ R-12），`./bin/skyext test` 124 files / 124 passed。
-2. **剩余只有真实环境验证**，不是代码缺陷，不能由单测替代：
+1. **代码层已无待修项**：R-01 ~ R-12、A-01 ~ A-14 全部收敛，
+   `./bin/skyext test` 124 files / 124 passed。
+2. **真实环境验证**（不是代码缺陷，不能由单测替代）：
+   - V-01 副本集 stepDown —— 已用加强后的脚本重跑通过（见 §4）
+   - V-06 容量压测 —— 已实测，数值见 §4（含索引门禁的 34 倍差异）
    - V-02 双节点迁移回环（需要两个 skynet 节点 + 真实客户端）
    - V-03 Mongo 网络分区、V-04 etcd 租约抖动、V-05 真实 WebSocket 回环
-   - V-06 账本容量压测数值、V-07 自动化压测脚本与硬件基准
-3. V-01（副本集 stepDown）已于 2026-11-12 在本地三节点副本集通过，复跑方式见 §4。
-4. R-01 的 RPC deadline 不再作为缺陷项：当前「源端放弃、目标端接管」的竞态已由目标端
+   - V-07 压测脚本已提供（`scripts/ci/bench_critical_capacity.sh`），生产硬件基准仍待采集
+3. R-01 的 RPC deadline 不再作为缺陷项：当前「源端放弃、目标端接管」的竞态已由目标端
    `migration_abort` + barrier 校验堵住；若将来要做 deadline，必须与迁移代际校验一起设计。
+4. 剩下 4 项设计权衡见 §5：改动收益低于风险，需要产品级决策，不作为缺陷。
 
 **每完成一项**：在本文档把状态改成「已修」并注明验证用例与门禁结果，再进入下一项。
+
+---
+
+## 8. 对抗审查发现（2026-11-12，第二批）
+
+> 方法：5 个子代理按域并行审查 `9c34398..HEAD` 的未 push 代码，要求"能跑就跑、去证伪"。
+> 关键结论由主代理用 `./bin/lua` 加载真实模块复跑确认；已修项用**变异测试**验证
+> 新用例真的会变红（改坏实现 → 测试必须失败），不是又一层假绿。
+
+### 8.1 本轮已修（A-01 ~ A-06）
+
+#### A-01 · `_critical_outbox_seq` 写入 Mongo 但不在关键字段白名单 【致命 · 已修】
+
+- **现象**：`critical.lua:commit_core` 把 `_critical_outbox_seq` 写进角色文档，
+  但 `critical_fields.FIELDS` 没登记它。`extract` 对未知 `_critical_*` 一律拒绝
+  （这是对的，旧代码没资格删新字段），于是 `dbmgr.load` 返回
+  `"critical metadata rejected"`。
+- **后果**：**任何提交过一次 Outbox 的角色，下次加载就永久登不上**。重启、迁移、
+  卸载重载都会触发；`refresh_critical` 同样失败，pump 卡死。
+- **为什么 124 个测试全绿**：没有任何用例把"提交后的文档"再喂回 `extract`。
+- **修复**：
+  - `critical_fields` 新增 `M.OUTBOX_SEQ` 并登记进 `FIELDS`，补非负整数校验；
+  - `critical.lua` 的 6 个 `*_FIELD` 常量改为**引用** `critical_fields`，不再各写一份字面量；
+  - `outbox.lua` 的 `FIELD` / `PENDING_COUNT_FIELD` 同样改为引用白名单模块
+    （不从 `critical` 取——`critical` 会被测试桩替换，取到 nil）。
+- **验证**：`fix_contract.test.lua` 新增 4 例，其中一条是**结构性不变式**：
+  「`critical` 导出的每个 `*_FIELD` 常量都必须在白名单里」——以后新增字段漏登记会立刻变红。
+  变异测试：把字段从 `FIELDS` 移除 → 3 个用例变红。
+
+#### A-02 · `_quarantine_event` 先污染共享缓存再 CAS 【高 · 已修】
+
+- **现象**：`copy_critical` 只复制一层，事件记录仍是缓存里的同一张表；
+  `ev.status = FAILED` 在 `critical_update` 之前就地执行。
+- **后果**：CAS 被拒后内存缓存显示 FAILED、库里仍是 PENDING，`pending_count` 没减。
+  pump 把事件当成已隔离并继续投后续事件，而事件在内存里消失，worker 对着
+  `pending_count>0` 的角色永远空扫。
+- **修复**：先深拷贝事件再改，并写回 `next_table`（pump 会用返回的表 `set_critical`）。
+- **验证**：`outbox.test.lua`「does not corrupt the cached event when the quarantine CAS is rejected」；
+  变异回浅拷贝 → 该用例变红。
+
+#### A-03 · `pending_events` 比较器非传递，升级期会乱序 【高 · 已修】
+
+- **现象**：`两边都有 seq 才比 seq，否则退回 created_at`。混合数据下成环：
+  A(无 seq, t=10) < B(seq=1, t=20)、B < C(seq=2, t=5)、C < A。
+- **后果**：`table.sort` 拿到非传递比较器时行为未定义，可能把后发生的事件先投出去；
+  依赖前序的业务会 `PRECHECK_REJECTED` → 进死信，而源端资产已扣。
+  滚动升级期每个有历史事件的角色都会命中。
+- **修复**：改成单一全序键 `(是否有 seq, seq 或 created_at, event_id)`；
+  无 seq 只可能来自升级前，整体排在所有有 seq 的事件之前。
+- **验证**：`outbox.test.lua`「keeps a total order when sequenced and legacy events are mixed」；
+  变异回旧比较器 → 该用例变红。
+
+#### A-04 · `archive_ops` 批处理中途失败时报 `archived=#moved` 【中 · 已修】
+
+- **现象**：循环里遇到驱动抛错或冷账本未确认就 `return { archived = #moved, ... }`，
+  但热账本的 `$unset` 在循环之后才执行。
+- **后果**：`service/critical_maintenance` 把这批算成"已归档"，指标虚高、积压被掩盖，
+  而热账本其实一条都没删。另外 `call_owner` 只回传两个值，错误串被丢掉。
+- **修复**：中途失败返回 `archived = 0, written = #moved, pending = #victims, retry = true`。
+  冷账本写是 `$setOnInsert`，重试幂等。
+- **验证**：`critical.test.lua`「reports zero archived when the batch fails midway」（3 条 op，
+  第 2 条抛错）；变异回 `archived=#moved` → 该用例变红。
+
+#### A-05 · Grant 未来时间检查是 fail-open 的类型门 【中 · 已修】
+
+- **现象**：`math.type(grant_fields.issued_at) == "integer"` 当门。整值浮点
+  （JSON 往返、TS Number、某些 BSON 解码都可能产生）会**整条跳过**未来时间检查。
+- **修复**：改为 `math.tointeger` 归一化后再比，归一化失败按 fail-closed 拒绝。
+- **验证**：`critical.test.lua`「rejects a future grant whose issued_at is an integer-valued float」；
+  变异回 `math.type` 门 → 该用例变红。
+
+#### A-06 · `common.app.lua` 只合并顶层，嵌套表被整表替换 【中 · 已修】
+
+- **现象**：注释写"逐字段合并"，实际 `for k,v in pairs(custom) do out[k]=v end` 只合一层。
+  运维写 `pay_callback = { orders = { db = "role2" } }` → `orders.coll` 丢失。
+- **后果**：`pay_callback` 静默回退默认集合名，订单写进另一个集合——支付链路上很难事后发现。
+- **修复**：递归合并；数组仍整表替换（合并数组会得到既不是默认也不是用户意图的结果）。
+- **验证**：`common.app.test.lua` 新增 2 例（嵌套合并、默认表不被跨次加载共享）；
+  变异回只合顶层 → 变红。
+
+### 8.2 本轮已修（A-07 ~ A-14，第十批）
+
+| 编号 | 问题 | 修复 |
+| --- | --- | --- |
+| A-07 | 迁移 abort 标记的 TTL 只在**别的实体 stage** 时被 prune；同 barrier 的迟到 stage 在 prune 之前就早退。默认 barrier 是 `mig_<id>`（每轮相同）→ 停服重试时该实体在目标节点上永久迁不进来 | `migration.migrate_entity` 每轮生成唯一 barrier（`mig_<id>_<time>_<seq>`）；`migration_stage` / `migration_abort` / `migration_commit` 都**先 prune 再判取消**；新增 `CMD._test_advance_time` 让 TTL 可测 |
+| A-08 | Outbox 定期清理对"回执丢失"角色不可达：worker 只扫 `pending_count>0`，计数归零后不再被扫 | 新增 `_critical_outbox_cleanup_at`（登记白名单 + 校验）；`transition` / `_quarantine_event` / `mark_delivered` 与状态同一次 CAS 落标记；`cleanup` 清理后重算或删除标记；worker 用 `$or(pending>0, cleanup_at<=now)` 扫描并新增偏索引 |
+| A-09 | 投递失败计数不区分环境故障（Mongo 抖动 5 次≈25s 就把"资产已扣"的事件标 FAILED）；FAILED 无重放入口，容量腾挪 `delivered_retention=0` 立即删除 | `default_deliver` 把落库异常/空 msg_id 翻成 `delivery.retryable`；`pump` 对 retryable **不计数只停轮**；FAILED 改用独立下限 `OUTBOX_FAILED_MIN_RETENTION=1h`，容量腾挪时单独传参并 `log.error` 记录 event_id + failed_reason |
+| A-10 | 注释写"失败即 break 保序"，隔离后却 `continue`，自相矛盾 | 把两阶段取舍写成显式契约（阈值内 break 保序；达阈值后主动放弃保序换可用性），并新增一条用例把两段行为放在一起断言 |
+| A-11 | `abort` 先通知目标（无超时 cluster.call）再踢客户端：目标不可达时踢人不执行，网关屏障永久冻结；`g_inflight` 无条件清；kick 返回 `nil` 也算成功 | 顺序改为**先踢后通知**；通知走 `call_agent_raw` 绕过 `g_aborted` 守卫；踢/通知分别计数，失败条目保留以便重试；返回值新增 `notified / notify_failed / pending` |
+| A-12 | `CMD.migration_commit(entity_id)` 无 barrier 参数，无法区分轮次 | 新增可选 `barrier_id` 参数并校验与暂存快照一致（不一致返回 `barrier mismatch`）；适配器 `handoff` 带上本轮 barrier |
+| A-13 | 两个 CI 门禁假绿 | 见 §8.3（上一轮已修）；V-01 已重跑 |
+| A-14 | `saga.test.lua` 标题「compensates only once」却断言 `refunds==2` | 明确契约：补偿是**至少一次**，状态机只保证"离开 COMPENSATING 一次"；`saga.lua` 加注释，用例改名并断言两次调用 |
+
+### 8.3 上一轮已修的门禁（A-13）
+
+- `scripts/ci/verify_replica_stepdown.sh`：新增三条硬门禁——必须是 ≥3 节点副本集、
+  必须真的换 primary（不吞 stepDown 结果）、`hits >= 1`（排除"全程没写成功"的空跑）。
+  之前 `0 == 0` 也会打印 passed。
+- `scripts/ci/check_metrics_labels.lua`：先做遮罩（注释与字符串内容抹成空格、长度不变）
+  再匹配，消除注释误红与 help 文本含括号导致的漏检；补 `metrics:counter(` 方法形式；
+  扫到 0 个文件时直接失败，不再"没扫到" = "全合规"。
+
+### 8.4 确认没问题的部分
+
+对抗审查同时确认了以下修复是真实有效的（实跑验证，非读码推断）：
+
+- `CMD.session_export` 契约闭合：真实适配器调用真实 CMD，参数个数 `n=3` 与签名一致；
+- owner_epoch 严格前进：`restore` 停在源端代际 → `attach(target)` → 推进一代 →
+  `resume_owner` 带新代际、网关 `frozen_epoch` 解除、`session.replay` 执行；
+  重复 attach 被 "owner epoch must advance" 拒绝；
+- `launcher_entities` 的 `pcall` 解包正确，异常与 `false` 两种形态都能带类型名报错；
+- `INTERNAL_ERROR` 在 outbox / pay_webhook / charge_order / saga 下游均未被当成成功；
+- `critical.query` 冷账本读取已 pcall；`causal_seq` 在同一 CAS 内分配不会重号。
+
+### 8.5 测试有效性说明（重要）
+
+本轮新增/修改的 6 项修复，全部用**变异测试**确认过新用例会变红：
+
+| 变异 | 变红的用例数 |
+| --- | --- |
+| 白名单移除 `_critical_outbox_seq` | 3 |
+| 排序器改回非传递比较 | 1 |
+| 隔离时不再拷贝事件 | 1（另连带 1） |
+| 配置只合顶层 | 1 |
+| Grant 改回 `math.type` 门 | 多条 |
+| 归档中途失败报 `#moved` | 1 |
+
+未覆盖的路径（仍无测试，读码判断）：`mark_delivered` 的 UNKNOWN/BLOCKED 分支、
+`causal_seq` 并发 CAS 重试、`node_shutdown` 的 `skynet.sleep` 宽限、
+`migration_adapter` 的 abort 失败路径。
+
+**第十批已把这四条全部补上**：
+
+| 路径 | 新增用例 |
+| --- | --- |
+| `mark_delivered` UNKNOWN / BLOCKED / 重试耗尽 | `outbox.test.lua` 3 例（含 refresh 调用次数、重试次数上限） |
+| `mark_delivered` 落清理标记 | `outbox.test.lua` 1 例（断言 `$set` 里带 `_critical_outbox_cleanup_at`） |
+| `causal_seq` 版本冲突 | `critical.test.lua`「does not advance the sequence for a commit that never landed」 |
+| `node_shutdown` 宽限 | `node_shutdown.test.lua` 断言 `slept == 110`（1s 预算 100 tick + 10 tick 宽限） |
+| `migration_adapter.abort` 失败路径 | `migration_adapter.test.lua` 4 例（先踢后通知、kick 失败可重试、拒绝不计成功、handoff 带 barrier） |
+
+补测试过程中还发现并修掉一个真实缺陷：`mark_delivered` 的 `$set` **漏写清理标记**——
+`transition` 在内存副本里设了 `cleanup_at`，但没写进 CAS，于是"回执到达"这条路径
+产出的角色文档没有标记，终态事件又回到"没人清"的状态（A-08 只修了一半）。
+现已与状态同一次写入，并有专门用例守着。
+
+**第十批变异测试**（每条都确认「改坏实现 → 对应用例变红」）：
+
+| 变异 | 变红的用例 |
+| --- | --- |
+| `_advance` 的 `$set` 漏写 `cleanup_at` | `stamps the cleanup marker when an event becomes ENQUEUED` |
+| `mark_delivered` 的 `$set` 漏写 `cleanup_at` | `persists the cleanup marker together with the delivered status` |
+| worker 忽略 `cleanup_due` | `pumps a role whose only work is an expired cleanup marker` |
+| FAILED 沿用 `delivered_retention` | `keeps a young FAILED event even when the outbox is at capacity` |
+| `pump` 把 retryable 当毒事件 | `does not quarantine an event whose delivery hit an environment fault` |
+| barrier 退回固定 `mig_<id>` | `gives every round its own barrier` |
+| abort 里 kick 只看 pcall 是否抛异常 | `does not count a rejected kick as success` |
+| `cleanup` 后不重算标记 | `recomputes or clears the cleanup marker after a cleanup` |
+
+这一步不是形式主义：第一版变异里 `_advance` 那条**没有**变红，才发现
+"ENQUEUED 路径的标记写入"完全没有断言，补了用例才把它守住。
