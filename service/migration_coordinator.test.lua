@@ -52,6 +52,11 @@ local function harness(opts)
                 h.errors[#h.errors + 1] = table.pack(...)
             end,
         },
+        ["skyext.metrics"] = {
+            counter = function()
+                return { inc = noop }
+            end,
+        },
         ["skyext.migration"] = {
             run = function(deps, run_opts)
                 h.run_calls[#h.run_calls + 1] = { deps = deps, opts = run_opts }
@@ -258,5 +263,36 @@ t.describe("migration_coordinator 取消", function()
         assert(h.CMD.run({}))
         t.expect(h.run_calls[2].opts.is_cancelled()).to.equal(false)
         t.expect(h.CMD.stats().cancelled).to.equal(false)
+    end)
+
+    -- 只置标志救不了卡在长 RPC 里的实体：取消时必须让适配器解掉网关屏障
+    t.it("runs the adapter abort cleanup and exposes it in stats", function()
+        local adapter = stage_adapter()
+        local aborts, rounds = {}, 0
+        adapter.abort = function(reason)
+            aborts[#aborts + 1] = reason
+            return { kicked = 2, failed = 0 }
+        end
+        adapter.begin_round = function()
+            rounds = rounds + 1
+        end
+        local h = harness({ modules = { ["game.migration_adapter"] = adapter } })
+        assert(h.CMD.start(enabled_conf({ adapter = "game.migration_adapter" })))
+        assert(h.CMD.run({}))
+        t.expect(rounds).to.equal(1)
+        assert(h.CMD.cancel("shutdown deadline"))
+        t.expect(#aborts).to.equal(1)
+        t.expect(h.CMD.stats().abort.kicked).to.equal(2)
+        -- 重复 cancel 幂等，不能踢两遍
+        assert(h.CMD.cancel("shutdown deadline"))
+        t.expect(#aborts).to.equal(1)
+    end)
+
+    t.it("keeps running when the adapter has no abort hook", function()
+        local h = harness({ modules = { ["game.migration_adapter"] = stage_adapter() } })
+        assert(h.CMD.start(enabled_conf({ adapter = "game.migration_adapter" })))
+        assert(h.CMD.cancel("shutdown deadline"))
+        t.expect(h.CMD.stats().cancelled).to.equal(true)
+        t.expect(h.CMD.stats().abort).to.be_nil()
     end)
 end)

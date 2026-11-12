@@ -68,6 +68,9 @@ local function run_hooks_with_deadline(phase, timeout_sec)
                 log.warn("shutdown hook cancel failed", "phase", phase, "addr", hook.addr, "err", cerr)
             end
         end
+        -- cancel 是单向消息。给协调器一小段宽限，让它把「踢掉屏障期客户端」
+        -- 的兜底清理跑完；否则进程紧接着 abort，cancel 可能根本没被处理。
+        pcall(skynet.sleep, 10)
     end
 end
 

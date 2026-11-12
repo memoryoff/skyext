@@ -20,11 +20,14 @@
 
 | 分类 | 数量 | 说明 |
 | --- | --- | --- |
-| 已修复并验证（第五批） | 10 | 跨模块契约断链与语义缺陷，124 files / 124 passed |
-| 代码层待修 | 12 | 本文件 §3，均有明确的测试验收标准 |
+| 已修复并验证（第五批 + 第六批） | 13 | 跨模块契约断链、语义缺陷、取消兜底、回执归属，124 files / 124 passed |
+| 代码层待修 | 9 | 本文件 §3，均有明确的测试验收标准 |
+| 部分完成 | 1 | R-07 指标：迁移取消/兜底已埋点，恢复任务与 PREPARED 时长仍缺 |
 | 需真实环境验证 | 7 | 本文件 §4，不是代码写错，是没跑过 |
 | 设计权衡（记录不改） | 4 | 本文件 §5，改了反而更危险 |
 | 后续优化 | 3 | P2 类，不阻塞生产验收 |
+
+> **提交基线**：`ed9d05a`（第五批 + 本台账首次建立）。第六批修复在工作区，尚未提交。
 
 原始审查报告 12 项修复清单（P0-01 ~ P2-02）的状态映射见 §6。
 
@@ -54,7 +57,18 @@
 
 ## 3. 代码层待修（可在本地闭环，按优先级）
 
-### R-01 · P1-03 取消令牌打不断阶段内 RPC，超时后网关屏障残留 【高】
+### 3.0 第六批已修（本轮，工作区未提交）
+
+| 编号 | 修复 | 验证 |
+| --- | --- | --- |
+| R-01（部分） | 适配器新增 `begin_round` / `abort`：登记「已冻结但未 activate」的实体，`CMD.cancel` 时主动 `kick` 让网关会话连同 `frozen_epoch` 一起销毁；`call_agent` / `call_gate` 在取消后拒绝新的阶段 RPC（kick 除外）；`node_shutdown` 超时发 cancel 后加 10 tick 宽限。协调器 `CMD.run` 复位适配器状态，`CMD.stats().abort` 可观测，新增 `skyext_migration_cancelled_total` / `skyext_migration_abort_clients_total` | `migration_adapter.test.lua` 5 例、`migration_coordinator.test.lua` 2 例；124 files / 124 passed |
+| R-02 | `outbox.is_valid_event_id` 在边界拒绝畸形 ID（含可靠消息追加的数字 `msg_id`），`FRAMEWORK.outbox_ack` 对畸形/错投回执抛错进 DLQ；回执携带 `receiver_type/receiver_id`，`mark_delivered` 用 `expect_target` 校验事件归属；`ack_source` 带接收方坐标 | `outbox.test.lua` 3 例、`entity_agent.test.lua` 3 例；124 files / 124 passed |
+| R-11 | `launcher_entities` 用 `pcall(skynet.call, ...)` 统一「抛异常 / 返回 false」两种失败形态，错误信息带实体类型名与原因，删掉死分支 | `launcher.test.lua` 2 例；124 files / 124 passed |
+
+> R-01 只做到**兜底清理**，没有给跨节点 RPC 加 deadline；卡在 `cluster.call` 里的协程仍无法中断，
+> 见 R-01 条目的「建议修复 ②」，这一半仍未完成。
+
+### R-01 · P1-03 取消令牌打不断阶段内 RPC，超时后网关屏障残留 【高 · 兜底已修，RPC deadline 待修】
 
 - **现象**：`node_shutdown.run_hooks_with_deadline` 超时只 `skynet.send(..., "cancel")` 且**不等待**协程结束，随即 `unload_entities` → `skynet.abort()`。`migration_coordinator.CMD.cancel` 仅置 `g_cancelled`；`migration.migrate_entity` 只在阶段边界检查 `is_cancelled`。
 - **证据**：`service/node_shutdown.lua:run_hooks_with_deadline`、`service/migration_coordinator.lua:CMD.cancel`、`lualib/skyext/migration.lua:cancelled`、`example/lualib/migration_adapter.lua:call_agent/call_gate`（`cluster.call` / `skynet.call` 无超时）。
@@ -62,7 +76,7 @@
 - **建议修复**：① 给协调器增加 `abort` 兜底：cancel 时遍历「已冻结但未 activate」的实体，调网关 `resume_owner` 解屏障并 `kick` 让客户端重登；② 给阶段 RPC 加 deadline（或至少在阶段边界再校验一次代际租约），并把已开始的实体标记为 `FALLBACK/ABORTED`。
 - **验收标准**：注入「`migration_commit` 永不返回」+ 停服超时，断言 `resume_owner`/`kick` 被调用、`g_inflight` 清空、`stats.cancelled` 与实体数一致；且重复 cancel 幂等。
 
-### R-02 · Outbox 回执缺归属与格式校验 【高】
+### R-02 · Outbox 回执缺归属与格式校验 【高 · 已修，见 §3.0】
 
 - **现象**：`FRAMEWORK.outbox_ack` 直接取 `args.event_id`（或 `args` 本身），不校验格式、前缀、来源；`outbox.mark_delivered` 允许 `PENDING → DELIVERED`。
 - **证据**：`service/entity_agent.lua:FRAMEWORK.outbox_ack`、`lualib/skyext/outbox.lua:mark_delivered`。
@@ -102,7 +116,7 @@
 - **建议修复**：在 `launcher_node` 输出一份结构化自检摘要（已启用 / 未启用 / 依赖缺失），对「启用但关键依赖为空」显式告警或拒绝启动。
 - **验收标准**：配置矩阵用例覆盖「缺 providers」「非实体节点启用实体依赖服务」「全部关闭」三种情况，断言摘要与启动行为。
 
-### R-07 · P2-04 指标覆盖不完整 【中】
+### R-07 · P2-04 指标覆盖不完整 【中 · 部分完成，见 §3.0】
 
 - **缺口**：`skyext_critical_reconcile_jobs{state}`（恢复任务扫描口径，目前只有任务表可查）、
   `PREPARED 持续时间`、`迁移取消次数`（现在只有 `log.warn`）、`reconcile 队列年龄`。
@@ -134,7 +148,7 @@
 - **证据**：`lualib/skyext/saga.test.lua` 现有以单实体状态机为主。
 - **验收标准**：四组用例全部通过，且断言「同一业务操作最多一次经济效果」。
 
-### R-11 · `launcher_entities` 的错误分支是死代码 【低】
+### R-11 · `launcher_entities` 的错误分支是死代码 【低 · 已修，见 §3.0】
 
 - **现象**：`if not ok then error("entity system ... failed to start")` 永远不会触发，因为 `entity_agentmgr.start` 失败走 `error(err, 0)`，`skynet.call` 直接抛异常。
 - **证据**：`example/lualib/launcher.lua:launcher_entities`、`service/entity_agentmgr.lua:CMD.start`。
@@ -185,9 +199,9 @@
 | P0-01 | 已修 + 已验证 | `CMD.start` 门禁存在；`common.app.lua` 合并默认值后 `migration={enabled=true}` 不再启动失败（F-06） |
 | P0-02 | 已修 + 已验证（代码链路） | 适配器 + 三段接管 + 真实契约测试（F-01/F-02）；真实双节点回环仍属 V-02 |
 | P0-03 | 已修 | 启动顺序 node → entities(READY) → optional → gate；非实体节点不再起实体依赖服务 |
-| P1-01 | 部分修 | DELIVERED 回写链路已通并通过契约测试（F-03）；清理闭环、回执归属、PENDING 容量兜底见 R-02/R-03/R-04 |
+| P1-01 | 部分修 | DELIVERED 回写链路已通并通过契约测试（F-03），回执归属与格式校验已修（R-02）；清理闭环与 PENDING 容量兜底见 R-03/R-04 |
 | P1-02 | 已修 + 已验证 | `INTERNAL_ERROR` + outbox/pay_webhook 下游（F-05） |
-| P1-03 | **部分修** | `CMD.cancel` 与阶段边界检查已实现；阶段内 RPC 穿透与网关屏障兜底见 R-01 |
+| P1-03 | **部分修** | `CMD.cancel`、阶段边界检查、取消时的网关屏障兜底（kick + 拒绝后续阶段 RPC）已实现；仍缺给跨节点 RPC 加 deadline，见 R-01 ② |
 | P1-04 | 部分修 | 80% 预警、归档滞后指标已修（F-08/F-10）；压测数值见 V-06 |
 | P1-05 | 已修 | `critical.query` 冷账本 pcall；归档写路径 pcall（F-09） |
 | P1-06 | 待环境 | V-01 |
@@ -201,9 +215,10 @@
 
 ## 7. 建议修复顺序
 
-1. R-01（最坏后果是连接永久卡死）→ R-02（资产面）→ R-03 / R-04（长期运行容量）
-2. R-05 / R-06 / R-07（可观测性与运维）
-3. R-08 ~ R-12（低风险补齐，可与 P2-01 文档对齐一起做）
-4. V-01 / V-02 / V-06 / V-07（真实环境，是「能不能上生产」的判据）
+1. R-01 剩余半项：给 `cluster.call` / `skynet.call` 加 deadline 与阶段租约（唯一还会导致「连接永久卡死」的路径）
+2. R-03 / R-04（长期运行容量：终态清理成环、PENDING 触顶可自动恢复）
+3. R-05 / R-06 / R-07 剩余项（回执去重、启动配置自检、恢复任务与 PREPARED 时长指标）
+4. R-08 ~ R-10、R-12（低风险补齐，可与 P2-01 文档对齐一起做）
+5. V-01 / V-02 / V-06 / V-07（真实环境，是「能不能上生产」的判据）
 
 **每完成一项**：在本文档把状态改成「已修」并注明验证用例与门禁结果，再进入下一项。

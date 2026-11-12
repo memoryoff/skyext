@@ -26,6 +26,9 @@ local function harness(opts)
                     return opts.index_ok ~= false
                 end
                 if cmd == "start" then
+                    if opts.start_raises then
+                        error(opts.start_raises, 0)
+                    end
                     return opts.start_ok ~= false, opts.start_err
                 end
                 if cmd == "is_ready" then
@@ -139,6 +142,23 @@ t.describe("launcher 可选服务接线", function()
             cmds[#cmds + 1] = call.cmd
         end
         t.expect(cmds).to.equal({ "start", "is_ready", "start", "is_ready" })
+    end)
+
+    -- agentmgr 的 start 失败是抛异常，旧的 `if not ok` 分支永远走不到
+    t.it("wraps an agentmgr start exception with the entity type", function()
+        local h = harness({ start_raises = "agentmgr boom" })
+        t.expect(function()
+            h.launcher.launcher_entities({ "role" })
+        end).to
+            .throw("entity system role failed to start: agentmgr boom")
+    end)
+
+    t.it("reports a start that returns false with its reason", function()
+        local h = harness({ start_ok = false, start_err = "not started" })
+        t.expect(function()
+            h.launcher.launcher_entities({ "rank" })
+        end).to
+            .throw("entity system rank failed to start: not started")
     end)
 
     t.it("refuses to report an entity system that is not ready", function()

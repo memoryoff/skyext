@@ -45,9 +45,13 @@ function M.launcher_entities(type_names)
     local started = {}
     for _, type_name in ipairs(type_names or {}) do
         local mgr = skynet.newservice("entity_agentmgr", type_name)
-        local ok, err = skynet.call(mgr, "lua", "start")
-        if not ok then
-            error("entity system " .. tostring(type_name) .. " failed to start: " .. tostring(err))
+        -- agentmgr 的 start 失败是抛异常（skynet.call 直接上抛），不是返回 false。
+        -- 用 pcall 统一两种形态，否则 "failed to start" 分支是永远走不到的死代码，
+        -- 异常会以没有实体类型名的原始错误冒出来。
+        local called, result, reason = pcall(skynet.call, mgr, "lua", "start")
+        if not called or result ~= true then
+            local detail = not called and tostring(result) or tostring(reason or result)
+            error("entity system " .. tostring(type_name) .. " failed to start: " .. detail, 0)
         end
         local ready = skynet.call(mgr, "lua", "is_ready")
         if ready ~= true then

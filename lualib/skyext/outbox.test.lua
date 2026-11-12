@@ -495,6 +495,9 @@ t.describe("outbox 接收方", function()
         t.expect(unpacked.n).to.equal(1)
         t.expect(type(unpacked[1])).to.equal("table")
         t.expect(unpacked[1].event_id).to.equal(EVENT)
+        -- 回执带上接收方坐标，源端据此校验没有错投
+        t.expect(unpacked[1].receiver_type).to.equal("role")
+        t.expect(unpacked[1].receiver_id).to.equal(7)
     end)
 
     -- 纯读预检拒绝不是持久化终态：源端资产已扣，ACK 会让事件被删且永不重投
@@ -727,6 +730,43 @@ t.describe("outbox 投递闭环", function()
         t.expect(ok).to.equal(false)
         t.expect(err).to.equal("unknown event")
         t.expect(#(h.store.cas or {})).to.equal(0)
+    end)
+
+    t.it("rejects malformed event ids at the boundary", function()
+        local h = harness()
+        t.expect(h.outbox.is_valid_event_id(EVENT)).to.equal(true)
+        t.expect(h.outbox.is_valid_event_id("evt_short")).to.equal(false)
+        t.expect(h.outbox.is_valid_event_id(987654321)).to.equal(false)
+        local ok, err = h.outbox.mark_delivered(h.ctx, "evt_short", { now = h.now })
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.equal("invalid event_id")
+    end)
+
+    t.it("only accepts an ack from the event's declared receiver", function()
+        local h = harness()
+        h.seed({
+            {
+                event_id = EVENT,
+                status = "ENQUEUED",
+                created_at = h.now - 10,
+                op_type = "mail.send",
+                target_type = "role",
+                target_id = 9,
+            },
+        }, 0)
+        local ok, err = h.outbox.mark_delivered(h.ctx, EVENT, {
+            now = h.now,
+            expect_target = { target_type = "role", target_id = 8 },
+        })
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.equal("ack receiver mismatch")
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].status).to.equal("ENQUEUED")
+
+        assert(h.outbox.mark_delivered(h.ctx, EVENT, {
+            now = h.now,
+            expect_target = { target_type = "role", target_id = "9" },
+        }))
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].status).to.equal("DELIVERED")
     end)
 
     t.it("cleans up delivered and expired events but never pending ones", function()

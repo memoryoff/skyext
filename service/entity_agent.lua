@@ -289,12 +289,24 @@ FRAMEWORK.outbox_ack = function(entity, args)
         return nil, cerr
     end
     local event_id = type(args) == "table" and args.event_id or args
-    local ok, err = outbox.mark_delivered(ctx, event_id, { now = os.time() })
+    -- 畸形 event_id（含可靠消息末尾追加的数字 msg_id）不是环境故障：
+    -- 计 attempts 进死信人工可见，不能当 retryable 无限重投
+    if type(outbox.is_valid_event_id) == "function" and not outbox.is_valid_event_id(event_id) then
+        error("outbox ack rejected: invalid event_id", 0)
+    end
+    local expect_target
+    if type(args) == "table" and args.receiver_type ~= nil then
+        expect_target = { target_type = args.receiver_type, target_id = args.receiver_id }
+    end
+    local ok, err = outbox.mark_delivered(ctx, event_id, { now = os.time(), expect_target = expect_target })
     if ok then
         return true
     end
     if err == "unknown event" then
         return true
+    end
+    if err == "ack receiver mismatch" then
+        error("outbox ack rejected: " .. tostring(err), 0)
     end
     -- 未决/环境问题：保留 pending 等重投，不能悄悄丢掉回执
     return require("skyext.entity.delivery").retryable(err)

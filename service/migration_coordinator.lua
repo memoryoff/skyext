@@ -15,11 +15,21 @@
 --   probe(entity) -> bool     可选，BUSY 实体的限时等待
 --   fallback(entity, reason)  可选，降级通知（提示续接或重登）
 --   init(conf)                可选，拿到本服务的配置表
+--   begin_round()             可选，新一轮开始时清掉上一次取消的状态
+--   abort(reason)             可选，取消时清理还在屏障期的客户端（R-01 兜底）
 local skynet = require "skynet"
 local cmd_api = require "skyext.cmd_api"
 local log = require "skyext.log"
+local metrics = require "skyext.metrics"
 local migration = require "skyext.migration"
 local node_shutdown_api = require "skyext.node_shutdown_api"
+
+local m_cancel = metrics.counter("skyext_migration_cancelled_total", "Migration rounds cancelled at shutdown", {
+    "reason",
+})
+local m_abort = metrics.counter("skyext_migration_abort_clients_total", "Clients released by a migration abort", {
+    "result",
+})
 
 local CMD = {}
 
@@ -28,6 +38,8 @@ local g_conf
 local g_started = false
 -- 停服截止时间到达后由 node_shutdown 置位：迁移在每个阶段边界检查它
 local g_cancelled = false
+-- 最后一次取消的兜底清理结果，供 CMD.stats 观测
+local g_abort_stats
 
 -- 六个阶段一个都不能少：缺哪一步都会得到一个"宣称迁移成功、会话没送到"的假象
 local REQUIRED_DEPS = {
@@ -132,6 +144,15 @@ function CMD.run(opts)
         return false, "migration coordinator is not started"
     end
     g_cancelled = false
+    g_abort_stats = nil
+    -- 上一轮可能被取消过：适配器内部的 inflight/aborted 状态必须在这里复位，
+    -- 否则新一轮的所有阶段 RPC 都会被当成"已取消"直接拒绝
+    if type(g_adapter.begin_round) == "function" then
+        local ok, err = pcall(g_adapter.begin_round)
+        if not ok then
+            return false, "migration adapter begin_round failed: " .. tostring(err)
+        end
+    end
     local deps = {}
     for _, name in ipairs(REQUIRED_DEPS) do
         deps[name] = g_adapter[name]
@@ -188,12 +209,26 @@ function CMD.run(opts)
     return true, stats
 end
 
--- 停服截止时间到达：让正在跑的迁移在阶段边界停下
+-- 停服截止时间到达：让正在跑的迁移在阶段边界停下，并做网关屏障兜底。
+-- 只置标志是不够的：卡在无超时 cluster.call 里的阶段协程收不到它，进程 abort
+-- 之后网关的 frozen_epoch 永远没人清，客户端上下行会被一直丢弃。
 function CMD.cancel(reason)
     if g_cancelled then
         return true
     end
     g_cancelled = true
+    m_cancel:inc(1, { reason = "shutdown_deadline" })
+    if g_adapter and type(g_adapter.abort) == "function" then
+        local called, stats = pcall(g_adapter.abort, reason)
+        if not called then
+            log.error("migration abort failed", "err", tostring(stats))
+            m_abort:inc(1, { result = "raised" })
+        else
+            g_abort_stats = stats
+            m_abort:inc(stats.kicked or 0, { result = "kicked" })
+            m_abort:inc(stats.failed or 0, { result = "failed" })
+        end
+    end
     log.warn("migration cancelled", "reason", tostring(reason))
     return true
 end
@@ -205,6 +240,7 @@ function CMD.stats()
         type_name = g_conf and g_conf.type_name or nil,
         adapter = g_conf and g_conf.adapter or nil,
         cancelled = g_cancelled,
+        abort = g_abort_stats,
     }
 end
 

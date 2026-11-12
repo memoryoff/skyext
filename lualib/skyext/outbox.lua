@@ -541,6 +541,17 @@ function M.evictable(critical_table, now, opts)
     return list
 end
 
+-- event_id 必须是规范形式（evt_ + 64 位小写 hex）。可靠消息投递时会在参数末尾
+-- 追加一个数字 msg_id，旧实现把畸形值直接交给 mark_delivered，只会得到
+-- "event_id is required" 并转成无限重投；现在在边界就明确拒绝。
+function M.is_valid_event_id(event_id)
+    if type(event_id) ~= "string" then
+        return false
+    end
+    local _, verr = critical.service_op_id_from_event(event_id)
+    return verr == nil
+end
+
 -- 接收方回执：把事件推进到 DELIVERED（终态），可重复调用。
 --
 -- 允许 PENDING -> DELIVERED：可靠消息先落库、投递可能比本端的状态 CAS 还快，
@@ -549,6 +560,9 @@ function M.mark_delivered(ctx, event_id, opts)
     opts = opts or {}
     if type(event_id) ~= "string" then
         return nil, "event_id is required"
+    end
+    if not M.is_valid_event_id(event_id) then
+        return nil, "invalid event_id"
     end
     local now = opts.now or os.time()
     for _ = 1, M.CAS_RETRY + 1 do
@@ -561,6 +575,17 @@ function M.mark_delivered(ctx, event_id, opts)
             -- 回执晚到：事件已经被清理。终态早已确定，没有副作用
             m_acked:inc(1, { result = "gone" })
             return false, "unknown event"
+        end
+        -- 回执必须来自事件声明的接收方。错投到别的实体的回执不能把别人的
+        -- 未投出事件直接标成 DELIVERED（源端资产已在同一次 CAS 扣除）。
+        local expect = opts.expect_target
+        if type(expect) == "table" and expect.target_type ~= nil then
+            if
+                M.id_key(event.target_type) ~= M.id_key(expect.target_type)
+                or M.id_key(event.target_id) ~= M.id_key(expect.target_id)
+            then
+                return nil, "ack receiver mismatch"
+            end
         end
         if event.status == M.STATUS.DELIVERED then
             m_acked:inc(1, { result = "already" })
@@ -769,7 +794,7 @@ function RECEIVER_MT:handle(entity, envelope, handlers, opts)
         -- 重放同一个 service_op_id 会拿到相同结论。没有回执时源角色的
         -- `_critical_outbox_v1` 只增不减，最终会撞上容量上限。
         -- PRECHECK_REJECTED 不在此列：它是 PREPARE 之前的纯读拒绝，什么都没写。
-        self:ack_source(envelope)
+        self:ack_source(envelope, entity)
         return result
     end
     if
@@ -805,7 +830,7 @@ end
 --
 -- 回执失败只记日志：业务终态已经落库，源端事件会停在 ENQUEUED，
 -- 由容量腾挪与保留期清理兜底，不影响这次业务结果。
-function RECEIVER_MT:ack_source(envelope)
+function RECEIVER_MT:ack_source(envelope, entity)
     local source_type = envelope.source_type
     local source_id = envelope.source_id
     if type(source_type) ~= "string" or source_type == "" or source_id == nil then
@@ -819,7 +844,12 @@ function RECEIVER_MT:ack_source(envelope)
         -- 只拿到一个 snowflake 数字，mark_delivered 必然拒绝，回执永远到不了
         -- DELIVERED（对照 outbox_worker.default_deliver 的 { envelope } 写法）。
         return router.reliable_send(source_type, source_id, "outbox_ack", {
-            { event_id = envelope.event_id },
+            {
+                event_id = envelope.event_id,
+                -- 带上接收方坐标：源端据此校验回执没有错投到别的事件上
+                receiver_type = entity and entity.type_name or nil,
+                receiver_id = entity and entity.id or nil,
+            },
         })
     end)
     if not called or not ok then

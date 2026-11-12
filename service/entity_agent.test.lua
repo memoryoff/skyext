@@ -994,9 +994,15 @@ end)
 -- Outbox 回执：源端把事件推进到 DELIVERED。回执晚到（事件已被清理）也算成功，
 -- 未决结果必须转 retryable，否则可靠消息会 ACK 掉一条没生效的回执
 t.describe("entity_agent Outbox 回执", function()
+    local ACK_EVENT = "evt_" .. string.rep("d", 64)
+    local ACK_GONE = "evt_" .. string.rep("e", 64)
+
     local function with_outbox(reply)
         local calls = {}
         local outbox = {
+            is_valid_event_id = function(id)
+                return type(id) == "string" and #id == 68 and id:sub(1, 4) == "evt_"
+            end,
             mark_delivered = function(ctx, event_id, opts)
                 calls[#calls + 1] = { ctx = ctx, event_id = event_id, opts = opts }
                 return reply[1], reply[2]
@@ -1010,24 +1016,48 @@ t.describe("entity_agent Outbox 回执", function()
 
     t.it("marks the event delivered through the framework command", function()
         local h = with_outbox({ true })
-        local ok, value = h.CMD.entity_call(7, "outbox_ack", { event_id = "evt_x" })
+        local ok, value = h.CMD.entity_call(7, "outbox_ack", { event_id = ACK_EVENT })
         t.expect(ok).to.equal(true)
         t.expect(value).to.equal(true)
-        t.expect(h.ack_calls[1].event_id).to.equal("evt_x")
+        t.expect(h.ack_calls[1].event_id).to.equal(ACK_EVENT)
         t.expect(h.ack_calls[1].ctx.unique_id).to.equal(7)
     end)
 
     t.it("treats an ack for a cleaned-up event as success", function()
         local h = with_outbox({ false, "unknown event" })
-        local ok, value = h.CMD.entity_call(7, "outbox_ack", { event_id = "evt_gone" })
+        local ok, value = h.CMD.entity_call(7, "outbox_ack", { event_id = ACK_GONE })
         t.expect(ok).to.equal(true)
         t.expect(value).to.equal(true)
     end)
 
     t.it("turns an undecided result into a retryable delivery fault", function()
         local h = with_outbox({ nil, "UNKNOWN" })
-        local ok, value = h.CMD.entity_call(7, "outbox_ack", { event_id = "evt_x" })
+        local ok, value = h.CMD.entity_call(7, "outbox_ack", { event_id = ACK_EVENT })
         t.expect(ok).to.equal(true)
         t.expect(require("skyext.entity.delivery").is_retryable(value)).to.equal(true)
+    end)
+
+    -- 畸形 event_id（含可靠消息追加的数字 msg_id）是毒消息，不是环境故障
+    t.it("rejects a malformed event_id instead of retrying forever", function()
+        local h = with_outbox({ true })
+        local ok, err = pcall(h.CMD.entity_call, 7, "outbox_ack", { event_id = "evt_short" }, 987654321)
+        t.expect(ok).to.equal(false)
+        t.expect(tostring(err)).to.match("invalid event_id")
+        t.expect(#h.ack_calls).to.equal(0)
+    end)
+
+    t.it("passes the declared receiver down for target validation", function()
+        local h = with_outbox({ true })
+        local ok = h.CMD.entity_call(7, "outbox_ack", { event_id = ACK_EVENT, receiver_type = "role", receiver_id = 9 })
+        t.expect(ok).to.equal(true)
+        t.expect(h.ack_calls[1].opts.expect_target.target_id).to.equal(9)
+    end)
+
+    t.it("rejects an ack whose receiver does not match the event", function()
+        local h = with_outbox({ nil, "ack receiver mismatch" })
+        local ok, err =
+            pcall(h.CMD.entity_call, 7, "outbox_ack", { event_id = ACK_EVENT, receiver_type = "role", receiver_id = 8 })
+        t.expect(ok).to.equal(false)
+        t.expect(tostring(err)).to.match("ack receiver mismatch")
     end)
 end)

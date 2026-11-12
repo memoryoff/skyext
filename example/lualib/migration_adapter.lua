@@ -29,6 +29,19 @@ local M = {}
 local g_type
 local g_self_node
 
+-- 取消兜底（P1-03）：停服超时后协调器只置一个 is_cancelled 标志，卡在跨节点
+-- cluster.call 里的阶段协程收不到它，进程 abort 后也没人给网关解屏障。
+-- 这里登记"已冻结但还没 activate"的实体，cancel 时主动踢掉客户端重连，
+-- 让网关会话连同 frozen_epoch 一起销毁；并阻止取消后继续发新的阶段 RPC。
+local g_inflight = {}
+local g_aborted = false
+
+-- 新一轮开始时由协调器调用，清掉上一轮取消留下的状态
+function M.begin_round()
+    g_inflight = {}
+    g_aborted = false
+end
+
 local function self_node()
     if not g_self_node then
         g_self_node = assert(config.get("cluster_node_name"), "cluster_node_name is not configured")
@@ -42,6 +55,9 @@ end
 
 -- 本节点与远端统一入口：同节点直接调，跨节点走 cluster。返回值和被调服务一致
 local function call_agent(node, entity_id, cmd, ...)
+    if g_aborted then
+        return nil, "migration aborted"
+    end
     local service = agent_service(entity_id)
     if node == self_node() then
         return skynet.call(service, "lua", cmd, ...)
@@ -50,6 +66,10 @@ local function call_agent(node, entity_id, cmd, ...)
 end
 
 local function call_gate(conn_id, cmd, ...)
+    -- kick 是取消兜底本身用的，必须放行；其余阶段命令在取消后一律不再发出
+    if g_aborted and cmd ~= "kick" then
+        return nil, "migration aborted"
+    end
     local parsed, err = connection_id.parse(conn_id)
     if not parsed then
         return nil, "invalid conn_id: " .. tostring(err)
@@ -65,6 +85,7 @@ function M.init(conf)
     conf = conf or {}
     g_type = assert(conf.type_name, "migration.type_name is required")
     g_self_node = nil
+    M.begin_round()
     log.info("migration adapter ready", "type", g_type, "node", self_node())
 end
 
@@ -125,6 +146,8 @@ function M.freeze(entity, barrier_id)
     if not info then
         return nil, tostring(err)
     end
+    -- 屏障已经建立：从这里到 activate 之间无论失败还是取消，都必须有人解屏障
+    g_inflight[entity.id] = { id = entity.id, conn_id = entity.conn_id }
     return true
 end
 
@@ -187,6 +210,8 @@ function M.activate(entity)
     if not ok then
         return nil, tostring(reason)
     end
+    -- 新 owner 已经让网关 resume_owner，屏障自然解除，取消时不需要再踢这个客户端
+    g_inflight[entity.id] = nil
     return true
 end
 
@@ -194,6 +219,8 @@ end
 -- 已经释放的实体只能让客户端重登——而且要**主动踢**。源端已经没有 owner 了，
 -- 网关还会把上行转给一个不存在的服务；不踢的话客户端会对着空气重试到空闲超时。
 function M.fallback(entity, reason)
+    -- 降级路径自己负责解冻/踢人，不再留给取消兜底重复处理
+    g_inflight[entity.id] = nil
     if entity._quiesced and not entity._released then
         local ok, revoked, err = pcall(call_agent, self_node(), entity.id, "migration_unquiesce", entity.id, reason)
         if not ok then
@@ -223,6 +250,38 @@ function M.fallback(entity, reason)
         "released",
         entity._released == true
     )
+end
+
+-- 停服截止：协调器的 cancel 只置标志，卡在无超时 cluster.call 里的协程不会返回，
+-- 进程随后 abort，网关的 frozen_epoch 可能永远没人清。这里做**兜底**：
+-- 把仍处在屏障期的客户端踢下线，网关会话销毁即等于解屏障；并禁止后续阶段
+-- 再发 RPC（kick 除外）。这是"让失败可恢复"，不是"取消长 RPC"——后者仍需要
+-- 给跨节点调用加 deadline，见 docs/review-2026-11-12-defect-register.md R-01。
+function M.abort(reason)
+    g_aborted = true
+    local kicked, failed = 0, 0
+    for id, info in pairs(g_inflight) do
+        if info.conn_id then
+            local called, raised = pcall(call_gate, info.conn_id, "kick", info.conn_id)
+            if called then
+                kicked = kicked + 1
+            else
+                failed = failed + 1
+                log.error("migration abort could not kick the client", "id", tostring(id), "err", tostring(raised))
+            end
+        end
+        g_inflight[id] = nil
+    end
+    log.warn(
+        "migration aborted, gateway barriers released by reconnect",
+        "reason",
+        tostring(reason),
+        "kicked",
+        kicked,
+        "failed",
+        failed
+    )
+    return { kicked = kicked, failed = failed }
 end
 
 return M
