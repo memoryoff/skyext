@@ -785,16 +785,21 @@ t.describe("outbox 投递闭环", function()
             { event_id = eid("b"), status = "DELIVERED", updated_at = h.now - 60, op_type = "mail.send" },
             { event_id = eid("c"), status = "ENQUEUED", updated_at = h.now - week, op_type = "mail.send" },
             { event_id = eid("d"), status = "PENDING", created_at = h.now - week, op_type = "mail.send" },
+            { event_id = eid("e"), status = "FAILED", updated_at = h.now - week, op_type = "mail.send" },
+            { event_id = eid("f"), status = "FAILED", updated_at = h.now - 60, op_type = "mail.send" },
         }, 1)
 
         local removed = h.outbox.cleanup(h.ctx, { now = h.now })
-        t.expect(removed).to.equal(2)
+        t.expect(removed).to.equal(3)
         local box = h.store.critical._critical_outbox_v1
         t.expect(box[eid("a")]).to.be_nil()
         t.expect(box[eid("c")]).to.be_nil()
-        -- 刚投递的留着审计，没投出去的永远不删
+        -- FAILED 已进死信：超期后可以腾，否则会被上限永久占位
+        t.expect(box[eid("e")]).to.be_nil()
+        -- 刚投递/刚失败的留着审计，没投出去的永远不删
         t.expect(box[eid("b")]).to.exist()
         t.expect(box[eid("d")]).to.exist()
+        t.expect(box[eid("f")]).to.exist()
         -- 一批删除只推进一次 _version
         t.expect(#h.store.cas).to.equal(1)
     end)

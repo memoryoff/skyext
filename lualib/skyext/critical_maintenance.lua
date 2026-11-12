@@ -32,6 +32,13 @@ local m_archive_lag = metrics.gauge(
     "Extra delay past the retention window for the oldest op waiting to be archived",
     { "task" }
 )
+-- PREPARED 意图挂了多久：这是恢复任务队列年龄的直接观测值。
+-- 只靠任务表逐条查看不到趋势，堆积只能靠日志猜。
+local m_prepared_age = metrics.histogram(
+    "skyext_critical_prepared_seconds",
+    "Age of a PREPARED intent observed by maintenance",
+    { "task" }
+)
 
 -- 归档滞后 = 超过保留期之后又等了多久。候选必然已经超期，所以不能直接用
 -- now - oldest（那会恒 >= retention，指标在 0 与 7 天之间跳变）。
@@ -160,7 +167,11 @@ function M.run_once(deps, opts)
         return nil, ierr
     end
     m_candidates:set(#intents, { task = "intent" })
+    local intent_now = opts.now or os.time()
     for _, entry in ipairs(intents) do
+        if math.type(entry.prepared_at) == "integer" then
+            m_prepared_age:observe(math.max(0, intent_now - entry.prepared_at), { task = "intent" })
+        end
         if type(deps.ensure_job) ~= "function" then
             stats.skipped = stats.skipped + 1
         else

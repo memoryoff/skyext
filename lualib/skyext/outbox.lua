@@ -526,6 +526,10 @@ function M.evictable(critical_table, now, opts)
                 evict = age >= delivered_retention
             elseif event.status == M.STATUS.ENQUEUED then
                 evict = age >= enqueued_retention
+            elseif event.status == M.STATUS.FAILED then
+                -- 已进死信的事件：源端副本只用于审计。不腾会被 512 上限永久占位，
+                -- 把真正待发的事件挤掉（当前没有写入点，属于防御）
+                evict = age >= delivered_retention
             end
             if evict then
                 list[#list + 1] = { event_id = event_id, status = event.status, age = age }

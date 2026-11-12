@@ -65,6 +65,10 @@ M.ARCHIVE_SETTLED = {
 -- 和 `_critical_ops_v1` 共享 512 KiB 的关键字段预算，无上限增长会让角色
 -- 在下次加载时直接 fail-closed
 M.MAX_OUTBOX = 512
+-- 允许签发侧与验证侧的时钟偏差（秒）。超过这个窗口的"未来签发"直接拒绝：
+-- 否则一个时钟偏快的签发节点可以让 Grant 提前生效，而时钟偏慢的验证节点
+-- 会把合法 Grant 误判成过期。两个方向共用同一个窗口。
+M.GRANT_CLOCK_SKEW = 60
 
 -- 已投递 / 停在 ENQUEUED 的事件的保留期。到达上限时**不等**保留期：
 -- 先腾掉这些事件让新事件进来（见 evictable_outbox_events）
@@ -248,6 +252,9 @@ function M.evictable_outbox_events(outbox_table, now, need, opts)
                 evict = age >= delivered_retention
             elseif event.status == "ENQUEUED" then
                 evict = age >= enqueued_retention
+            elseif event.status == "FAILED" then
+                -- 已进死信：与 DELIVERED 同一保留期，避免永久占位
+                evict = age >= delivered_retention
             end
             if evict then
                 list[#list + 1] = { id = event_id, age = age }
@@ -877,6 +884,11 @@ function M.execute_client(entity, grant_fields, seq, op_type, params, handlers, 
     end
 
     local now = now_of(opts)
+    -- 未来签发超过允许的时钟偏差：拒绝，避免时钟偏快的签发侧让 Grant 提前生效。
+    -- 窗口内的偏差放行，否则两边时钟差几秒就会误伤合法请求。
+    if math.type(grant_fields.issued_at) == "integer" and grant_fields.issued_at > now + M.GRANT_CLOCK_SKEW then
+        return decision(M.STATUS.INTERNAL_AUTH_DENIED, nil, M.NO_CACHE, { reason = "grant issued in the future" })
+    end
     if now >= grant_fields.expires_at then
         -- 过期授权绝不执行业务；只允许查询
         return decision(M.STATUS.EXPIRED, nil, M.NO_CACHE, { reason = "grant expired" })

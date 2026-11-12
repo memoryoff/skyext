@@ -20,9 +20,9 @@
 
 | 分类 | 数量 | 说明 |
 | --- | --- | --- |
-| 已修复并验证（第五 ~ 七批） | 15 | 契约断链、取消兜底、回执归属、启动自检、回执唤醒，124 files / 124 passed |
-| 代码层待修 | 7 | 本文件 §3，均有明确的测试验收标准 |
-| 部分完成 | 1 | R-07 指标：迁移取消/兜底、恢复任务 due 已埋点，PREPARED 时长仍缺 |
+| 已修复并验证（第五 ~ 八批） | 17 | 契约断链、取消兜底、回执归属/唤醒、启动自检、指标、Grant 时钟偏差，124 files / 124 passed |
+| 代码层待修 | 6 | R-01 剩余、R-03、R-04 剩余、R-09、R-10、R-12，见 §3 |
+| 部分完成 | 1 | R-04：FAILED 事件已可腾，PENDING 触顶自动恢复仍待设计 |
 | 需真实环境验证 | 7 | 本文件 §4，不是代码写错，是没跑过 |
 | 设计权衡（记录不改） | 4 | 本文件 §5，改了反而更危险 |
 | 后续优化 | 3 | P2 类，不阻塞生产验收 |
@@ -57,7 +57,7 @@
 
 ## 3. 代码层待修（可在本地闭环，按优先级）
 
-### 3.0 第六 / 七批已修（第七批在工作区，未提交）
+### 3.0 第六 ~ 八批已修（第八批在工作区，未提交）
 
 | 编号 | 修复 | 验证 |
 | --- | --- | --- |
@@ -67,11 +67,14 @@
 | R-05 | `router.reliable_send` 新增 `opts.lazy`：回执仍持久化、重投仍再发（ACK 可能丢），但只通知**已加载**的源实体，不为一条回执加载离线角色；新增 `notify_reliable_loaded` 走 `deliver_reliable_loaded` | `router.test.lua` 2 例、`outbox.test.lua` 1 例断言 lazy；124 files / 124 passed |
 | R-06 | `launcher.self_check()` 输出 enabled/disabled/problems 结构化摘要，`launcher_node` 在索引门禁后打印；启用但缺 `type_name`/`adapter`/`providers` 会 `log.error` | `launcher.test.lua` 4 例；124 files / 124 passed |
 | R-07（部分） | `critical_reconciler` 每轮按状态统计 due 任务并 `set` 到 `skyext_critical_reconcile_due_jobs{state}`，`stats.due` 可断言；PREPARED 时长仍未埋点 | `critical_reconciler.test.lua` 2 例；124 files / 124 passed |
+| R-07（完成） | `critical_maintenance` 对每个 PREPARED 意图 `observe(skyext_critical_prepared_seconds)`，恢复任务队列年龄可看趋势 | `critical_maintenance.test.lua` 走真实 metrics，无断言值；口径由 `scan_intents` 的 `prepared_at` 保证 |
+| R-08 | `critical.GRANT_CLOCK_SKEW = 60`，`execute_client` 对「未来签发超过窗口」返回 `INTERNAL_AUTH_DENIED`，窗口内放行 | `critical.test.lua` 2 例（超出拒绝 / 窗口内提交） |
+| R-04（部分） | `outbox.evictable` 与 `critical.evictable_outbox_events` 把 `FAILED` 纳入可腾范围（与 DELIVERED 同保留期），避免死信事件被 512 上限永久占位 | `outbox.test.lua` 清理用例、`critical.test.lua` 默认保留期用例 |
 
 > R-01 只做到**兜底清理**，没有给跨节点 RPC 加 deadline；卡在 `cluster.call` 里的协程仍无法中断，
 > 见 R-01 条目的「建议修复 ②」，这一半仍未完成。
 
-### R-01 · P1-03 取消令牌打不断阶段内 RPC，超时后网关屏障残留 【高 · 兜底已修，RPC deadline 待修】
+### R-01 · P1-03 取消令牌打不断阶段内 RPC，超时后网关屏障残留 【高 · 兜底已修；deadline 暂缓】
 
 - **现象**：`node_shutdown.run_hooks_with_deadline` 超时只 `skynet.send(..., "cancel")` 且**不等待**协程结束，随即 `unload_entities` → `skynet.abort()`。`migration_coordinator.CMD.cancel` 仅置 `g_cancelled`；`migration.migrate_entity` 只在阶段边界检查 `is_cancelled`。
 - **证据**：`service/node_shutdown.lua:run_hooks_with_deadline`、`service/migration_coordinator.lua:CMD.cancel`、`lualib/skyext/migration.lua:cancelled`、`example/lualib/migration_adapter.lua:call_agent/call_gate`（`cluster.call` / `skynet.call` 无超时）。
@@ -87,7 +90,7 @@
 - **建议修复**：校验 `event_id` 为 `EVENT_PREFIX` 开头的定长字符串；回执只接受来自该事件 `target_type/target_id` 的消息（或由 capability/HMAC 绑定）；`PENDING → DELIVERED` 必须限定为「可靠消息已入队」的证据，否则拒绝。
 - **验收标准**：伪造/畸形 `event_id` 被拒且事件状态不变；对 PENDING 事件的回执不推进；合法回执仍幂等推进到 DELIVERED。
 
-### R-03 · Outbox 终态清理不成环 【中】
+### R-03 · Outbox 终态清理不成环 【中 · 降级：容量腾挪已覆盖大部分场景】
 
 - **现象**：`outbox._finish_pump` 只在 `stats.pending == 0` 时调 `cleanup`；`outbox_worker.scan` 只查 `_critical_outbox_pending_count > 0` 的角色。
 - **证据**：`lualib/skyext/outbox.lua:_finish_pump` / `M.cleanup`、`lualib/skyext/outbox_worker.lua:scan`。
@@ -95,7 +98,7 @@
 - **建议修复**：为终态事件增加独立的扫描入口（按 `updated_at` 的 TTL 索引或轻量扫描），或在 worker 每轮固定抽样清理；清理失败只记日志不影响投递。
 - **验收标准**：构造「只有 ENQUEUED/DELIVERED、pending_count=0」的角色，跑一轮 worker 后终态记录被清；PENDING 永不被清。
 
-### R-04 · PENDING 永不腾 + 512 上限导致永久拒绝 【中】
+### R-04 · PENDING 永不腾 + 512 上限导致永久拒绝 【中 · 部分完成，见 §3.0】
 
 - **现象**：`critical.evictable_outbox_events` 明确「PENDING 永不腾」，超过 `MAX_OUTBOX = 512` 返回 `CAPACITY_EXCEEDED`。
 - **证据**：`lualib/skyext/critical.lua:commit_core` / `evictable_outbox_events`、`lualib/skyext/outbox.lua:pump`（`deliver` 失败保持 PENDING）。
@@ -119,7 +122,7 @@
 - **建议修复**：在 `launcher_node` 输出一份结构化自检摘要（已启用 / 未启用 / 依赖缺失），对「启用但关键依赖为空」显式告警或拒绝启动。
 - **验收标准**：配置矩阵用例覆盖「缺 providers」「非实体节点启用实体依赖服务」「全部关闭」三种情况，断言摘要与启动行为。
 
-### R-07 · P2-04 指标覆盖不完整 【中 · 部分完成，见 §3.0】
+### R-07 · P2-04 指标覆盖不完整 【中 · 已修，见 §3.0】
 
 - **缺口**：`skyext_critical_reconcile_jobs{state}`（恢复任务扫描口径，目前只有任务表可查）、
   `PREPARED 持续时间`、`迁移取消次数`（现在只有 `log.warn`）、`reconcile 队列年龄`。
@@ -129,7 +132,7 @@
   `service/migration_coordinator.lua:CMD.cancel`。
 - **验收标准**：每项指标有对应单测断言其在状态迁移时 `inc/set`，且不会把 `conn_id` 之类的高基数值当标签。
 
-### R-08 · P2-05 Grant 未来 `issued_at` 无时钟偏差窗口 【低】
+### R-08 · P2-05 Grant 未来 `issued_at` 无时钟偏差窗口 【低 · 已修，见 §3.0】
 
 - **现象**：`grant.lua` 只校验 `issued_at >= 0` 与 `expires_at > issued_at`，没有对「未来时间」设置允许的时钟偏差。
 - **证据**：`lualib/skyext/grant.lua:issue`（`issued_at` / `expires_at` 校验）。
@@ -218,10 +221,9 @@
 
 ## 7. 建议修复顺序
 
-1. R-01 剩余半项：给 `cluster.call` / `skynet.call` 加 deadline 与阶段租约。**注意**：单纯超时返回会让源端 FALLBACK 而目标端仍可能完成 commit/attach，必须同时有迁移代际校验，否则是伪修复
-2. R-03 / R-04（长期运行容量：终态清理成环、PENDING 触顶可自动恢复）
-3. R-07 剩余：PREPARED 意图持续时间
-4. R-08 ~ R-10、R-12（低风险补齐，可与 P2-01 文档对齐一起做）
-5. V-01 / V-02 / V-06 / V-07（真实环境，是「能不能上生产」的判据）
+1. R-01 剩余：给 `cluster.call` / `skynet.call` 加 deadline 与阶段租约。**暂缓**——单纯超时返回会让源端 FALLBACK 而目标端仍可能完成 commit/attach，必须同时做迁移代际校验；这是独立设计项，不能塞进缺陷修复
+2. R-03 / R-04 剩余：终态清理成环、PENDING 触顶自动恢复。**已降级**——容量腾挪与 FAILED 可腾已覆盖大部分场景，剩余收益低于改造成本，等压测数据（V-06）出来再定
+3. R-09 / R-10 / R-12：因果序号、Saga 复杂交易用例、`conn_id` 指标标签（低风险，可与 P2-01 文档对齐一起做）
+4. V-01 / V-02 / V-06 / V-07（真实环境，是「能不能上生产」的判据）
 
 **每完成一项**：在本文档把状态改成「已修」并注明验证用例与门禁结果，再进入下一项。

@@ -1341,9 +1341,12 @@ t.describe("critical 源侧 Outbox", function()
         local ids = h.critical.evictable_outbox_events({
             fresh = { status = "DELIVERED", updated_at = now - 1 },
             old = { status = "DELIVERED", updated_at = now - 8 * 24 * 3600 },
+            failed_old = { status = "FAILED", updated_at = now - 8 * 24 * 3600 },
+            failed_fresh = { status = "FAILED", updated_at = now - 1 },
         }, now, 10)
-        t.expect(#ids).to.equal(1)
-        t.expect(ids[1]).to.equal("old")
+        t.expect(#ids).to.equal(2)
+        t.expect(ids[1]).to.equal("failed_old")
+        t.expect(ids[2]).to.equal("old")
         t.expect(h.critical.OUTBOX_DELIVERED_RETENTION).to.equal(7 * 24 * 3600)
     end)
 end)
@@ -1665,5 +1668,33 @@ t.describe("critical 容量预警", function()
         })
         t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
         t.expect(h.entity.capacity_warned_outbox).to.equal(true)
+    end)
+end)
+
+-- 签发侧与验证侧时钟不同步：偏差窗口内的未来签发放行，超出窗口拒绝
+t.describe("critical Grant 时钟偏差", function()
+    local function run(h, over)
+        return h.critical.execute_client(h.entity, h.new_grant(over), 1, "shop.buy", { amount = 1 }, h.handlers(), {
+            hmac_fn = HASH,
+            hash_fn = HASH,
+            equal_fn = EQ,
+            now = h.now,
+        })
+    end
+
+    t.it("rejects a grant issued beyond the allowed skew", function()
+        local h = harness()
+        local result = run(h, { issued_at = h.now + h.critical.GRANT_CLOCK_SKEW + 1 })
+        t.expect(result.status).to.equal(h.critical.STATUS.INTERNAL_AUTH_DENIED)
+        t.expect(result.reason).to.equal("grant issued in the future")
+        t.expect(h.applied).to.equal(0)
+        t.expect(#h.store.updates).to.equal(0)
+    end)
+
+    t.it("accepts a grant issued within the allowed skew", function()
+        local h = harness()
+        local result = run(h, { issued_at = h.now + h.critical.GRANT_CLOCK_SKEW })
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+        t.expect(h.applied).to.equal(1)
     end)
 end)
