@@ -73,6 +73,7 @@ local function harness(opts)
             else
                 fn()
             end
+            return {}
         end
         fake_skynet.timeout = function(_, cb)
             if h.hang then
@@ -81,6 +82,9 @@ local function harness(opts)
         end
         fake_skynet.wait = function() end
         fake_skynet.wakeup = function() end
+        fake_skynet.killthread = function()
+            h.killed = (h.killed or 0) + 1
+        end
     end
 
     local fake_cluster = {
@@ -726,6 +730,8 @@ t.describe("migration_adapter 有界 RPC 与轮次隔离", function()
         local ok, err = h.adapter.freeze(e, "b1")
         t.expect(ok).to.be_nil()
         t.expect(tostring(err)).to.match("deadline")
+        -- 超时必须回收卡在 RPC 里的本地协程，不能把孤儿留在会话表里
+        t.expect(h.killed).to.equal(1)
         -- 回包没来不等于屏障没建立：登记必须保留，abort 仍要踢这条连接
         h.hang = false
         local stats = h.adapter.abort("shutdown deadline")
@@ -744,6 +750,28 @@ t.describe("migration_adapter 有界 RPC 与轮次隔离", function()
         local stats = h.adapter.abort("deadline")
         t.expect(stats.kicked).to.equal(1)
         t.expect(stats.pending).to.equal(0)
+    end)
+
+    -- 上一轮踢人成功但 migration_abort 没送达：target 会留在登记里。
+    -- begin_round 必须补发通知，而不是只重试 kick 后就把条目算作"待清理"搁着
+    t.it("retries a failed target abort notification on the next round", function()
+        local opts = { abort_ok = false }
+        local h = harness(opts)
+        local e = entity()
+        assert(h.adapter.freeze(e, "b1"))
+        assert(h.adapter.transfer(e, { bytes = "B", barrier_id = "b1" }))
+        local first = h.adapter.abort("deadline")
+        t.expect(first.kicked).to.equal(1)
+        t.expect(first.notified).to.equal(0)
+        t.expect(first.pending).to.equal(1)
+        t.expect(count_calls(h, "migration_abort")).to.equal(1)
+
+        opts.abort_ok = true
+        t.expect(h.adapter.begin_round()).to.equal(0)
+        t.expect(count_calls(h, "migration_abort")).to.equal(2)
+        local second = h.adapter.abort("deadline")
+        t.expect(second.notified).to.equal(0)
+        t.expect(second.pending).to.equal(0)
     end)
 
     -- 新轮次被网关明确拒绝时，只能撤销新轮次那一条登记，不能误删上一轮的

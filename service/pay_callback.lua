@@ -17,12 +17,14 @@ local charge_order = require "skyext.charge_order"
 local charge_reconcile = require "skyext.charge_reconcile"
 local cmd_api = require "skyext.cmd_api"
 local config = require "skyext.config"
+local gm_api = require "skyext.gm_api"
 local http_server = require "skyext.http_server"
 local log = require "skyext.log"
 local mongo_conn = require "skyext.mongo_conn"
 local router = require "skyext.entity.router"
 
 local CMD = {}
+local GM_CMD = {}
 
 local g_conf
 local g_orders
@@ -206,6 +208,89 @@ function CMD.reconcile_once()
     }, {})
 end
 
+-- 人工阻断是终态：对账扫描显式排除、webhook 只 ACK。核对/补偿完成后必须有
+-- 一个运行中的入口把订单放回自动对账，否则只能 debug inject 或直连库改文档。
+GM_CMD.pay_unblock = {
+    desc = "解除订单的人工阻断，重新纳入自动对账（需先完成人工核对/补偿）",
+    params = {
+        provider = "渠道名（必填）",
+        order_id = "渠道订单号（必填）",
+    },
+    handler = function(params)
+        if not g_orders then
+            return false, "pay callback is not started"
+        end
+        if type(params) ~= "table" then
+            return false, "params must be a table"
+        end
+        local provider, order_id = params.provider, params.order_id
+        if type(provider) ~= "string" or provider == "" or type(order_id) ~= "string" or order_id == "" then
+            return false, "provider and order_id are required"
+        end
+        -- 多数派读：主节点上看得见的阻断单不一定可靠，解封必须基于已确认的状态
+        local order, ferr = g_orders:critical_find({ provider = provider, order_id = order_id })
+        if type(order) ~= "table" then
+            return false,
+                "blocked order not found or not majority-visible: " .. tostring(ferr or provider .. "/" .. order_id)
+        end
+        if not order.reconcile_blocked_at then
+            return false, "order is not blocked"
+        end
+        local unblocked, uerr = charge_order.unblock_reconcile(g_orders, order, os.time())
+        if type(unblocked) ~= "table" then
+            return false, tostring(uerr)
+        end
+        log.warn(
+            "charge order manually unblocked",
+            "provider",
+            provider,
+            "order_id",
+            order_id,
+            "status",
+            tostring(order.status)
+        )
+        return true, { provider = provider, order_id = order_id, status = order.status }
+    end,
+}
+
+GM_CMD.pay_blocked = {
+    desc = "列出处于人工阻断的订单（按 updated_at 复合 Keyset 翻页）",
+    params = {
+        limit = "返回条数，默认 50，最大 200",
+        cursor_updated_at = "上一页最后一条的 updated_at（可选）",
+        cursor_provider = "上一页最后一条的 provider（可选）",
+        cursor_order_id = "上一页最后一条的 order_id（可选）",
+    },
+    handler = function(params)
+        if not g_orders then
+            return false, "pay callback is not started"
+        end
+        params = type(params) == "table" and params or {}
+        local opts = { limit = params.limit }
+        if params.cursor_updated_at ~= nil then
+            local updated_at = tonumber(params.cursor_updated_at)
+            if not updated_at or updated_at ~= math.floor(updated_at) then
+                return false, "cursor_updated_at must be an integer"
+            end
+            opts.cursor = {
+                updated_at = math.tointeger(updated_at),
+                provider = params.cursor_provider,
+                order_id = params.cursor_order_id,
+            }
+        end
+        local list, next_cursor, lerr = charge_order.list_blocked(g_orders, opts)
+        if type(list) ~= "table" then
+            return false, tostring(lerr)
+        end
+        return true, { orders = list, next_cursor = next_cursor }
+    end,
+}
+
 skynet.start(function()
     cmd_api.dispatch(CMD)
+    -- 注册失败不该拖垮服务：没有 GM 只是少了运维入口，回调与对账照常跑
+    local ok, err = pcall(gm_api.register, GM_CMD)
+    if not ok then
+        log.warn("pay callback GM registration failed", "err", tostring(err))
+    end
 end)

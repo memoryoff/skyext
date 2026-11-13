@@ -1,9 +1,7 @@
 # skyext 评审修复 · 交接文档（2026-11-13）
 
-> **用途**：把"外部实施审查（memoryoff/skyext，2026-11-12）所点 7 个问题"的整改进度与剩余工作，整理成可交接给另一个 Agent 的规格。
-> 主代理已逐条回源码核实并开工，本会话已落地大部分；因积分耗尽暂停。**接手者：已做的别重做，剩下的照 §5~§7 的规格做。**
->
-> **基准**：`main` 分支，HEAD = `ea59e5c`。所有"已完成"批次已在工作区落盘（未提交），测试全绿、stylua 全清。
+> **文档性质**：本文件从“外部实施审查（memoryoff/skyext，2026-11-12）所点 7 个问题”的交接规格演化而来。§1~§9 保留历史规格与当时的执行状态；**当前状态、第二轮落地与对抗审查修复以 §10 为准**。
+> **基准**：原稿 HEAD = `ea59e5c`；当前 HEAD = `7f9d007`，其上还有 §10.2 记录的本轮改动（未提交）。
 
 ---
 
@@ -30,7 +28,7 @@
 | 迁移 Gateway 屏障 | 属实 | barrier token + 目标端校验**已落地**（R-01），仅 fallback 解屏障缺失 | D-12 | **已修** |
 | Critical Maintenance 配置 | 风险真 | "两边用不同集合"是误读——两处读同一键 `entity_types.<type>.critical_ledger/jobs`；真问题是缺配置时行为不对称 | D-16 + 静默回退 | **已修** |
 | Outbox 三点 | 都成立 | A：3600s 是容量腾挪下限，非超时即删；B：DLQ 已存在（reliable_msg status=2），缺的是把"永久无效"送进去 | D-23 + A-09 | **已修** |
-| 支付状态机三点 | 都成立 | 3 处误读：action 已在 `service_op_id` 编码；scan 注释被读反；`transition`/`mark_reconciled` 已查 CAS | D-19 / D-20 / D-10 | **待修** |
+| 支付状态机三点 | 都成立 | 3 处误读：action 已在 `service_op_id` 编码；scan 注释被读反；`transition`/`mark_reconciled` 已查 CAS | D-19 / D-20 / D-10 | **已修（c00bb4a / c782924 / 3e075bc）** |
 | 生产验收缺口 | 判断对 | 完全是已登记门禁（V-02~V-05 等），非新发现 | V-02~V-05 | 文档化（见 §7 门禁） |
 
 > 注：评审还点了"停服 RPC 无 deadline"——那是 `R-01` 已记录的**设计取舍**（deadline 必须与迁移代际校验一起设计）。**本轮已按这个前提把两者一并落地**：`bounded_call` 给每个阶段 RPC 加了 deadline，登记改为 `(entity_id, barrier_id)` 键控并带轮次，`abort` 有界并发。详见 §8，不再按"未做"处理。
@@ -43,7 +41,7 @@
 | --- | --- | --- | --- | --- |
 | 1 | P0 配置执行环境 + `config.init()` 集成测试 | `lualib/skyext/config.lua`, `config.test.lua` | **已完成** | 36 passing |
 | 2 | 迁移 fallback 网关屏障（D-12） | `example/lualib/migration_adapter.lua`, `.test.lua` | **已完成** | 34 passing |
-| 3 | 支付状态机（D-19/D-20/D-10）+ D-11 | `charge_order.lua`, `charge_reconcile.lua`, `pay_webhook.lua` + 测试 | **待修**（未触碰） | — |
+| 3 | 支付状态机（D-19/D-20/D-10）+ D-11 | `charge_order.lua`, `charge_reconcile.lua`, `pay_webhook.lua` + 测试 | **已完成（c00bb4a / c782924 / 3e075bc）** | 支付三组测试全绿；§5 保留为历史规格 |
 | 4 | Critical Maintenance 配置闭合（D-16 + 去静默回退） | `service/critical_maintenance.lua`, `example/lualib/launcher.lua`, `launcher.test.lua` | **已完成** | 18 passing |
 | 5 | 普通回存 UNKNOWN 读后对齐 | `lualib/skyext/dbmgr.lua`, `dbmgr.test.lua` | **已完成** | 82 passing |
 | 6 | Outbox 失败证据保留 + 永久无效进死信（D-23/A-09） | `lualib/skyext/outbox.lua`, `critical_fields.lua`, `critical.lua`, `example/lualib/entity_handler/role.lua` + 测试 | **已完成** | 68 passing（跨 3 文件） |
@@ -86,9 +84,9 @@
 
 ---
 
-## 5. 待办 1 · 支付状态机（D-19 / D-20 / D-10）+ D-11 —— 主要剩余代码
+## 5. 历史规格 · 支付状态机（D-19 / D-20 / D-10）+ D-11（已落地，勿按本节重新实现）
 
-> 这三个文件本会话**完全未触碰**（git 状态确认）。接手者从零实现，规格如下。行号基于 HEAD `ea59e5c`，实现前请 re-grep 确认无漂移。
+> 这三个文件已在后续提交 `c00bb4a` / `c782924` / `3e075bc` 落地；本节保留为历史规格，行号基于 `ea59e5c`，只用于追溯，不代表当前实现。
 
 ### D-20 · 重复回调冲突校验漏 `action`
 - **文件**：`lualib/skyext/charge_order.lua`
@@ -139,7 +137,7 @@
 
 ---
 
-## 7. 待办 3 · 全量门禁（收口）
+## 7. 全量门禁（收口命令，当前结果见 §10.4）
 
 接手者在完成 §5 代码 + §6 台账更新后，跑以下命令，必须全绿：
 
@@ -153,7 +151,7 @@ make -C example lint                   # 示例 lint
 # sdk/ts: npx tsc --noEmit            # 仅当改了 TS SDK 才需要
 ```
 
-当前（本会话结束前）已确认绿：上述涉及文件 `stylua --check` 全清；`migration_adapter`(34) / `launcher`(18) / `dbmgr`(82) / `outbox+critical+role`(68) / `config+common.app`(36) 全部 passing。剩余需接手者补的是支付相关测试与全量门禁。
+当前（§10.4 已实测）：`./bin/skyext test` 129 files 全过；`luacheck .` 0 warnings；`stylua --check .` 通过；`git diff --check` 干净。
 
 ---
 
@@ -167,7 +165,7 @@ make -C example lint                   # 示例 lint
 
 ---
 
-## 9. 当前工作区改动文件清单（未提交）
+## 9. 上一轮工作区改动清单（历史，已提交，勿按此核对现状）
 
 ```
 M docs/design/outbox_saga_v1.md
@@ -189,31 +187,51 @@ M service/critical_maintenance.lua
 ```
 （共 16 文件，+682 / -80；均通过 stylua 与对应测试。）
 
-## 8. 追加落地：2026-11-13 晚（P1-01 ~ P2-04）
+## 10. 第二轮落地与对抗审查修复（2026-11-13 晚）
 
-外部审查第二轮（2026-11-13）提出 4 个 P1 + 4 个 P2。逐条回源码核实后，**全部属实**（其中 P1-02 的前提"必须与代际校验一起设计"已满足，因此实施），本轮已修：
+> 说明：原稿有两个 §8，本节把追加记录改为 §10；§8 保留为“给接手 Agent 的提醒”。
+> 独立对抗审查报告与证据链见 `docs/review-2026-11-13-adversarial.md`，本节只记录修复与复验结果。
+
+### 10.1 第二轮外部评审 P1/P2 落地（提交 `7f9d007`）
 
 | 项 | 结论 | 落点 |
 | --- | --- | --- |
 | P1-01 重复订单普通读 | 属实。E11000 与其它 REJECTED 混在一起，且回读走 `find_one`（主节点可见≠多数派确认） | `charge_order.record` 只对真正 E11000 走回读，回读改 `critical_find`；读不到/读失败/无通道一律 `UNKNOWN`；`check_write_channel` 同时要求多数派写与多数派读通道 |
-| P1-02 迁移 RPC 无 deadline | 属实 | `migration_adapter.bounded_call`：fork + timeout，超时返回 `TIMEOUT`（按"结果未知"处理）；全部阶段调用改用 |
-| P1-03 begin_round 丢待清理 | 属实 | `begin_round` 先重试踢人，清不掉的保留登记并返回 pending，绝不 `g_inflight = {}` |
+| P1-02 迁移 RPC 无 deadline | 属实 | `migration_adapter.bounded_call`：fork + timeout，超时返回 `TIMEOUT`（按“结果未知”处理）；阶段调用与 abort 两腿均改用 |
+| P1-03 begin_round 丢待清理 | 属实 | `begin_round` 先重试清理，清不掉的保留登记并返回 pending，绝不 `g_inflight = {}` |
 | P1-04 迟到回包越代际 | 属实 | 登记键改 `(entity_id, barrier_id)` + `round`；回包比对轮次，旧轮次只允许清自己那条 |
-| P2-01 类型缓存串味 | 属实 | `config` 拆分 `bool_conf` / `number_conf`，双向交叉测试 |
+| P2-01 类型缓存串味 | 属实 | `config` 拆分 `raw/bool/number/table` 四张缓存，双向交叉测试 |
 | P2-02 启动门禁只是接口检查 | 属实 | `pay_callback.start` 调 `critical_probe()`，探针未确认/抛错直接拒绝启动 |
 | P2-03 人工阻断可被回调绕过 | 属实 | `pay_webhook` 对 `reconcile_blocked_at` 订单只 ACK、不回发奖；grant/webhook 均不再自动清阻断 |
-| P2-04 索引执行计划 | 已用真实 explain 核验 | 见下 |
+| P2-04 索引执行计划 | 已用真实 explain 核验 | 见 10.3 |
 
-### P2-04 实测（临时单机 mongod，10 万级数据，非生产库）
+### 10.2 对抗审查发现的问题与修复（本轮改动，未提交）
+
+审查结论是 `changes_required`：P0 = 0，但存在 1 条本轮引入的 P1 行为回归，以及 4 条 P2。
+
+| 项 | 问题 | 修复 |
+| --- | --- | --- |
+| P1（回归） | `mongo_conn.classify_write` 对非 CONFIRMED 只透传 `first.errmsg`（字符串），而 `is_duplicate_key` 首行要求 `detail` 是表，E11000 分支在生产不可达；重复回调全部 500，幂等被打回原形 | `is_duplicate_key` 只按字符串判定 `E11000`；测试桩全部改成生产真实形状（`"REJECTED", "E11000 duplicate key ..."`）；补“多数派读返回 nil, err”和“读抛错”两个 `UNKNOWN` 用例 |
+| P2-1 | 阻断单无生产解封入口，也无清单端点；阻断后永久停在 GRANTING | `charge_order.list_blocked`（复合 Keyset，limit 默认 50/上限 200，含 blocked/last_error 投影）；`charge_reconcile` 增偏索引 `reconcile_blocked`；`pay_callback` 增 `pay_unblock`（先 `critical_find` 多数派读，再 `unblock_reconcile`）与 `pay_blocked` 两个 GM 命令；`mark_reconciled` 去掉自动 `$unset reconcile_blocked_at`（原被状态门挡住，属 latent 的静默绕过入口） |
+| P2-2 | Critical Reconciler 的“无阻塞排序”只是带 `limit=64` 时优化器选了 `rid_op_id`；去掉 limit 会切成 `SORT→FETCH→IXSCAN(state_lease)` | 不加索引（生产查询恒带 limit，加 `{state:1,rid:1,op_id:1}` 会给每次任务写多维护一条索引）；改为在 10.3 如实记录条件与退化路径，未来若改无 limit 查询，先补该索引（临时 mongod 实测可消除 SORT） |
+| P2-3 | 超时后 fork 子协程仍卡在 `yield_call`，静默黑洞目标下逐轮累积孤儿 | 超时分支用 `skynet.killthread` 回收本地协程与 session 映射；远端 RPC 没有取消语义仍是残留，但结果已不会被采用。测试断言超时会调用回收 |
+| P2-4 | `begin_round` 只重试 kick，不重试陈旧 target 的 `migration_abort` | `begin_round` 分两批补发：先 kick 后 abort 通知，各自受 `g_abort_budget` 约束；两批后仍清不掉的保留登记。新增“上一轮 target 通知失败、下一轮补发成功”用例 |
+| P2-5 | 交接文档 §8 两处推断不成立；章节编号重复；§3/§5/§9 过期 | 本节即修订：排序复杂度改为 O(n log n)；补 100 MiB 阻塞排序硬上限与“超限直接报错”；去掉缺前提的“5 ms 可接受”；合并重复编号并标注历史章节 |
+
+### 10.3 扫描器执行计划（临时单机 mongod v7.0.35，10 万级数据，非生产库）
 
 | 扫描器 | 计划 | keys/docs/returned | 阻塞排序 | 耗时 |
 | --- | --- | --- | --- | --- |
-| Critical Reconciler（jobs 100k，1k 到期） | `SORT_MERGE(FETCH(IXSCAN))` | 64 / 64 / 64 | 否 | 3ms |
-| Charge Reconciler（orders 100k，500 GRANTING） | `SORT_MERGE(FETCH(IXSCAN))` | 65 / 64 / 64 | 否 | 15ms |
-| Outbox Worker（roles 100k，1k 待发 + 300 到期清理） | `SORT(FETCH(OR(IXSCAN)))` | 1300 / 1300 / 64 | **是** | 5ms |
+| Critical Reconciler（jobs 100k，1k 到期，`limit=64`） | `LIMIT→FETCH→SORT_MERGE→IXSCAN` | 64 / 64 / 64 | 否 | 3–5 ms |
+| Charge Reconciler（orders 100k，500 GRANTING） | `SORT_MERGE(FETCH(IXSCAN))` | 65 / 64 / 64 | 否 | 15 ms |
+| Outbox Worker（roles 100k，1k 待发 + 300 到期清理） | `SORT(FETCH(OR(IXSCAN)))` | 1300 / 1300 / 64 | **是** | 5 ms |
 
-结论：前两个扫描器的复合 Keyset 与索引完全对齐，无阻塞排序。Outbox 的 `$or` 两分支各自命中偏索引，但 `sort(rid)` 无法由任一索引提供顺序，Mongo 需对候选集做内存排序；当前规模 1.3k 候选 / 5ms 可接受，**待发角色数增长到万级时每轮排序成本线性上升**。本轮不放宽架构，建议按 `_critical_outbox_pending_count > 0` 的角色数设监控阈值；超过阈值再考虑把 pending / cleanup 拆成两条各自有序的扫描。
+补充与更正：
 
-### 门禁
+- **Critical 不是无条件无阻塞排序。** 同一查询去掉 `limit`，只保留现有 `rid_op_id` / `state_lease` 时，计划退化为 `SORT→FETCH→IXSCAN(state_lease)`，keys = 99499、returned = 499、约 253 ms。临时加 `{state:1,rid:1,op_id:1}` 后无 limit 也走 `SORT_MERGE`（无 SORT），但该索引不在本轮落地范围，理由见 P2-2。
+- **Outbox 的排序成本是 O(n log n)**，不是线性上升；内存排序受 100 MiB 硬上限约束，候选集超限时 MongoDB 直接报错（`Sort exceeded memory limit`），不是“变慢”。`1.3k 候选 / 5 ms` 只是单机、小数据、无并发压力下的一次观察，不能当作 SLA；待发角色数到万级前应加监控阈值或拆分扫描。
+- 以上均不是生产副本集实测；切主、真实双节点迁移、TS SDK E2E 仍属“待环境”，未宣称已验证。
 
-`./bin/skyext test`：129 files / 129 passed / 0 failed / 0 errors；`luacheck .`：0 warnings；`stylua --check .`：通过。真实副本集切主、双节点迁移、TS SDK E2E 仍属"待环境"，未宣称已验证。
+### 10.4 门禁
+
+`./bin/skyext test`：129 files / 129 passed / 0 failed / 0 errors；`luacheck .`：0 warnings / 0 errors（316 files）；`stylua --check .`：通过；`git diff --check`：干净。真实副本集切主、双节点迁移、TS SDK E2E 仍未验证，因此不宣布 P0/P1 清零。

@@ -82,31 +82,11 @@ end
 -- 只有真正的唯一键冲突才允许走"回读已有订单"路径。
 -- 其它 REJECTED（权限、参数、命令级失败）是明确失败，用一个普通读把它
 -- 伪装成"重复回调"只会把存储故障变成一次成功 ACK。
+-- mongo_conn 在非 CONFIRMED 时只透传 errmsg 字符串（完整回复表留在服务层），
+-- 所以这里必须按字符串判定。旧实现只认表结构，生产链路永远返回 false，
+-- 等于把"仅 E11000 回读"整段删掉了。
 local function is_duplicate_key(detail)
-    if type(detail) ~= "table" then
-        return false
-    end
-    local function matches(err)
-        if type(err) ~= "table" then
-            return false
-        end
-        if err.code == 11000 then
-            return true
-        end
-        return type(err.errmsg) == "string" and err.errmsg:find("E11000", 1, true) ~= nil
-    end
-    if matches(detail) then
-        return true
-    end
-    local errors = detail.writeErrors
-    if type(errors) == "table" then
-        for _, err in ipairs(errors) do
-            if matches(err) then
-                return true
-            end
-        end
-    end
-    return false
+    return type(detail) == "string" and detail:find("E11000", 1, true) ~= nil
 end
 
 -- 重复订单必须用多数派读确认。普通 find_one 会读到主节点上尚未被多数派确认的
@@ -613,6 +593,66 @@ function M.unblock_reconcile(orders_coll, order, now)
     return ret.value
 end
 
+-- 阻断单清单：阻断标记是人工终态，订单会退出自动对账候选集，必须能被运维看见。
+-- 用与对账扫描相同的复合 Keyset（updated_at, provider, order_id），保证翻页稳定。
+function M.list_blocked(orders_coll, opts)
+    opts = opts or {}
+    if type(orders_coll) ~= "table" then
+        return nil, nil, "orders collection is required"
+    end
+    local limit = tonumber(opts.limit) or 50
+    limit = math.max(1, math.min(200, math.floor(limit)))
+    local query = { reconcile_blocked_at = { ["$exists"] = true } }
+    if type(opts.cursor) == "table" then
+        local cursor = opts.cursor
+        if math.type(cursor.updated_at) ~= "integer" then
+            return nil, nil, "cursor.updated_at must be an integer"
+        end
+        if type(cursor.provider) ~= "string" or type(cursor.order_id) ~= "string" then
+            return nil, nil, "cursor.provider and cursor.order_id are required"
+        end
+        query["$or"] = {
+            { updated_at = { ["$gt"] = cursor.updated_at } },
+            { updated_at = cursor.updated_at, provider = { ["$gt"] = cursor.provider } },
+            {
+                updated_at = cursor.updated_at,
+                provider = cursor.provider,
+                order_id = { ["$gt"] = cursor.order_id },
+            },
+        }
+    end
+    local called, docs, err = pcall(orders_coll.find_many, orders_coll, query, {
+        projection = {
+            provider = 1,
+            order_id = 1,
+            rid = 1,
+            amount = 1,
+            currency = 1,
+            action = 1,
+            status = 1,
+            updated_at = 1,
+            reconcile_blocked_at = 1,
+            reconcile_unblocked_at = 1,
+            last_error = 1,
+            _id = 0,
+        },
+        sort = { { updated_at = 1 }, { provider = 1 }, { order_id = 1 } },
+        limit = limit,
+    })
+    if not called then
+        return nil, nil, "blocked order scan failed: " .. tostring(docs)
+    end
+    if type(docs) ~= "table" then
+        return nil, nil, tostring(err or "blocked order scan failed")
+    end
+    local next_cursor
+    if #docs >= limit and #docs > 0 then
+        local last = docs[#docs]
+        next_cursor = { updated_at = last.updated_at, provider = last.provider, order_id = last.order_id }
+    end
+    return docs, next_cursor
+end
+
 -- 对账：GRANTED -> RECONCILED。
 --
 -- 只有拿到"角色文档里该 op 已 COMMITTED"的持久化证明才允许推进；凭"调用成功过"
@@ -637,7 +677,9 @@ function M.mark_reconciled(orders_coll, order, proof, now)
                 reconciled_at = now or os.time(),
                 reconcile_proof = proof,
             },
-            ["$unset"] = { reconcile_blocked_at = true },
+            -- 不在这里清 reconcile_blocked_at：人工阻断只能由人工解除。
+            -- 虽然当前 query 要求 status=GRANTED、阻断单停在 GRANTING 而不可达，
+            -- 但保留这条自动清理等于给未来留一个静默绕过人工的入口
         },
         new = true,
     })

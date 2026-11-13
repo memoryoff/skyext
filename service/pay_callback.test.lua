@@ -31,6 +31,12 @@ local function harness(opts)
                 end
                 return nil, h.probe_err
             end,
+            critical_find = function(_, query)
+                if h.blocked_order then
+                    return h.blocked_order
+                end
+                return nil, "not found: " .. tostring(query and query.order_id)
+            end,
         }
     h.pay_conf = opts.pay_conf
         or {
@@ -86,6 +92,17 @@ local function harness(opts)
                     return true
                 end
                 return nil, "duplicate key"
+            end,
+            unblock_reconcile = function(_, order)
+                return order
+            end,
+            list_blocked = function()
+                return h.blocked_orders or {}, nil, nil
+            end,
+        },
+        ["skyext.gm_api"] = {
+            register = function(commands)
+                h.gm_commands = commands
             end,
         },
         ["skyext.charge_reconcile"] = {
@@ -216,5 +233,59 @@ t.describe("pay_callback 启动门禁", function()
         assert(h.CMD.start())
         t.expect(h.CMD.stop()).to.equal(true)
         t.expect(h.CMD.start()).to.equal(true)
+    end)
+end)
+
+-- P2-1：阻断单退出自动对账后，系统内必须有人工解封入口和可巡检的清单；
+-- 否则只能 debug inject 或直连库改文档
+t.describe("pay_callback 人工阻断运维入口", function()
+    local function started()
+        local h = harness()
+        assert(h.CMD.start())
+        return h
+    end
+
+    t.it("registers the unblock and blocked-list GM commands", function()
+        local h = started()
+        t.expect(type(h.gm_commands)).to.equal("table")
+        t.expect(type(h.gm_commands.pay_unblock.handler)).to.equal("function")
+        t.expect(type(h.gm_commands.pay_blocked.handler)).to.equal("function")
+    end)
+
+    t.it("unblocks a blocked order after a majority read", function()
+        local h = started()
+        h.blocked_order = {
+            provider = "mock",
+            order_id = "o-1",
+            status = "GRANTING",
+            reconcile_blocked_at = 1700000000,
+        }
+        local ok, data = h.gm_commands.pay_unblock.handler({ provider = "mock", order_id = "o-1" })
+        t.expect(ok).to.equal(true)
+        t.expect(data.provider).to.equal("mock")
+        t.expect(data.order_id).to.equal("o-1")
+    end)
+
+    t.it("refuses to unblock an order that is not blocked", function()
+        local h = started()
+        h.blocked_order = { provider = "mock", order_id = "o-1", status = "GRANTED" }
+        local ok, err = h.gm_commands.pay_unblock.handler({ provider = "mock", order_id = "o-1" })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("order is not blocked")
+    end)
+
+    t.it("refuses to guess an order that a majority read cannot see", function()
+        local h = started()
+        local ok, err = h.gm_commands.pay_unblock.handler({ provider = "mock", order_id = "missing" })
+        t.expect(ok).to.equal(false)
+        t.expect(err:find("not found or not majority-visible", 1, true) ~= nil).to.equal(true)
+    end)
+
+    t.it("returns the blocked order list with its cursor", function()
+        local h = started()
+        h.blocked_orders = { { provider = "mock", order_id = "o-1", status = "GRANTING" } }
+        local ok, data = h.gm_commands.pay_blocked.handler({ limit = 10 })
+        t.expect(ok).to.equal(true)
+        t.expect(#data.orders).to.equal(1)
     end)
 end)

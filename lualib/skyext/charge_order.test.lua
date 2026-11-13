@@ -503,7 +503,8 @@ t.describe("charge_order 重复订单的多数派回读", function()
         local h = harness()
         local reads = 0
         h.orders.critical_find_and_modify = function()
-            return "REJECTED", { code = 11000, errmsg = "E11000 duplicate key" }
+            -- 生产形状：mongo_conn 非 CONFIRMED 时只回 errmsg 字符串
+            return "REJECTED", "E11000 duplicate key error collection: skyext.charge_order index: provider_order_id"
         end
         h.orders.critical_find = function()
             reads = reads + 1
@@ -528,7 +529,7 @@ t.describe("charge_order 重复订单的多数派回读", function()
             action = "grant",
         }
         h.orders.critical_find_and_modify = function()
-            return "REJECTED", { code = 11000, errmsg = "E11000 duplicate key" }
+            return "REJECTED", "E11000 duplicate key error collection: skyext.charge_order"
         end
         h.orders.critical_find = function()
             return nil
@@ -540,35 +541,32 @@ t.describe("charge_order 重复订单的多数派回读", function()
         t.expect(h.orders:find_one({ provider = "wechat", order_id = "ORDER-1" })).to.exist()
     end)
 
-    t.it("returns UNKNOWN when the majority read itself fails", function()
+    t.it("returns UNKNOWN when the majority read fails without throwing", function()
         local h = harness()
         h.orders.critical_find_and_modify = function()
-            return "REJECTED", { code = 11000, errmsg = "E11000 duplicate key" }
+            return "REJECTED", "E11000 duplicate key error collection: skyext.charge_order"
         end
+        -- 真实 critical_find 读失败是 2 元组 (nil, err)，不抛 Lua 错
         h.orders.critical_find = function()
-            error("majority read timeout")
+            return nil, "majority read timeout"
         end
         local order, err = h.record()
         t.expect(order).to.be_nil()
         t.expect(err).to.equal("UNKNOWN")
     end)
 
-    -- findAndModify 的唯一键冲突也可能以 ok=1 + writeErrors 的形状回来：
-    -- 只看 ret.ok 会把它当成功，必须按"多数派未确认"重新判定
-    t.it("treats ok=1 with duplicate writeErrors as a duplicate, not a success", function()
+    -- 传输层异常（驱动抛错）同样只能算未决，不能把订单当已存在
+    t.it("returns UNKNOWN when the majority read raises", function()
         local h = harness()
-        local reads = 0
         h.orders.critical_find_and_modify = function()
-            return "REJECTED", { ok = 1, writeErrors = { { code = 11000, errmsg = "E11000 duplicate key" } } }
+            return "REJECTED", "E11000 duplicate key error collection: skyext.charge_order"
         end
         h.orders.critical_find = function()
-            reads = reads + 1
-            return EXISTING
+            error("connection reset")
         end
-        local order, created = h.record()
-        t.expect(reads).to.equal(1)
-        t.expect(type(order)).to.equal("table")
-        t.expect(created).to.equal(false)
+        local order, err = h.record()
+        t.expect(order).to.be_nil()
+        t.expect(err).to.equal("UNKNOWN")
     end)
 
     -- 非重复键的 REJECTED 是明确失败：不能回读，更不能把旧订单当成功返回
@@ -594,5 +592,59 @@ t.describe("charge_order 重复订单的多数派回读", function()
         t.expect(order).to.be_nil()
         t.expect(err).to.match("not authorized")
         t.expect(reads).to.equal(0)
+    end)
+end)
+
+local h_charge = require "skyext.charge_order"
+
+-- P2-1：阻断单退出自动对账后，运维需要一个稳定翻页的清单
+t.describe("charge_order 阻断单清单", function()
+    local function coll(rows, err)
+        local seen
+        return {
+            find_many = function(_, query, opts)
+                seen = { query = query, opts = opts }
+                if err then
+                    return nil, err
+                end
+                return rows
+            end,
+        }, function()
+            return seen
+        end
+    end
+
+    t.it("returns a stable next cursor when the page is full", function()
+        local rows = {}
+        for i = 1, 3 do
+            rows[i] = { provider = "wechat", order_id = "o-" .. i, updated_at = i, status = "GRANTING" }
+        end
+        local orders, seen = coll(rows)
+        local list, cursor, err = h_charge.list_blocked(orders, { limit = 3 })
+        t.expect(err).to.be_nil()
+        t.expect(#list).to.equal(3)
+        t.expect(cursor.updated_at).to.equal(3)
+        t.expect(cursor.provider).to.equal("wechat")
+        t.expect(cursor.order_id).to.equal("o-3")
+        t.expect(seen().query.reconcile_blocked_at["$exists"]).to.equal(true)
+        t.expect(seen().opts.sort[1].updated_at).to.equal(1)
+    end)
+
+    t.it("rejects an incomplete keyset cursor", function()
+        local orders = coll({})
+        local list, _, err = h_charge.list_blocked(orders, {
+            cursor = { updated_at = 10, provider = "wechat" },
+        })
+        t.expect(list).to.be_nil()
+        t.expect(err).to.equal("cursor.provider and cursor.order_id are required")
+    end)
+
+    t.it("clamps the page size and fails closed on a read error", function()
+        local orders, seen = coll({}, "timeout")
+        local list, cursor, err = h_charge.list_blocked(orders, { limit = 1000 })
+        t.expect(list).to.be_nil()
+        t.expect(cursor).to.be_nil()
+        t.expect(err).to.match("timeout")
+        t.expect(seen().opts.limit).to.equal(200)
     end)
 end)

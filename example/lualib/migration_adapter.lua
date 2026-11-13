@@ -52,7 +52,8 @@ end
 
 -- pcall 只能接住错误，接不住一个永不回包的 cluster.call。这里用 fork + timeout
 -- 做有界等待：超时返回 "TIMEOUT"，调用方必须按"结果未知"处理，而不是"失败"。
--- 被放弃的调用协程无法从外部中止（skynet 没有这个能力），但它的结果不再被采用。
+-- 超时时用 killthread 回收本地协程与会话映射；远端 RPC 本身没有取消语义，
+-- 但它的结果不会再被采用。
 local function bounded_call(fn)
     if type(skynet.fork) ~= "function" or type(skynet.timeout) ~= "function" or type(skynet.wait) ~= "function" then
         -- 测试桩/非 skynet 环境：退化成同步调用
@@ -65,7 +66,7 @@ local function bounded_call(fn)
     local token = {}
     local finished = false
     local outcome, a, b, c
-    skynet.fork(function()
+    local thread = skynet.fork(function()
         local called, x, y, z = pcall(fn)
         if finished then
             return
@@ -84,6 +85,12 @@ local function bounded_call(fn)
         end
         finished = true
         outcome = "TIMEOUT"
+        -- 目标静默黑洞时，调用协程会一直卡在 yield_call。skynet 没有"取消 RPC"，
+        -- 但 killthread 会关闭协程并清掉 session 映射，避免逐轮累积孤儿会话。
+        -- 被放弃的调用即使远端稍后回包，也会因为 finished 已真而被丢弃。
+        if type(skynet.killthread) == "function" then
+            skynet.killthread(thread)
+        end
         skynet.wakeup(token)
     end)
     skynet.wait(token)
@@ -172,20 +179,41 @@ local function call_gate(conn_id, cmd, ...)
     return call_gate_raw(conn_id, cmd, ...)
 end
 
--- 新一轮开始时由协调器调用。上一轮 abort 可能留下踢失败的连接：
--- 先重试清理，清理不掉的**保留登记**，不能因为"轮次重置"把待清理任务丢掉。
+-- 新一轮开始时由协调器调用。上一轮 abort 可能留下两类未完成清理：
+--   1. 踢人失败：连接仍在网关屏障后面；
+--   2. 踢人成功但 migration_abort 没送达：目标端还留着暂存快照/取消标记。
+-- 两类都要在这里补一次；清理不掉的**保留登记**，不能因为"轮次重置"丢掉。
 function M.begin_round()
     g_aborted = false
-    local carried = 0
-    for key, info in pairs(g_inflight) do
+    local kick_tasks, notify_tasks = {}, {}
+    for _, info in pairs(g_inflight) do
         if info.conn_id then
-            local outcome, ok = bounded_call(function()
-                return call_gate_raw(info.conn_id, "kick", info.conn_id)
-            end)
-            if outcome == "OK" and ok then
-                info.conn_id = nil
+            kick_tasks[#kick_tasks + 1] = function()
+                local outcome, ok = bounded_call(function()
+                    return call_gate_raw(info.conn_id, "kick", info.conn_id)
+                end)
+                if outcome == "OK" and ok then
+                    info.conn_id = nil
+                end
             end
         end
+        if info.target then
+            notify_tasks[#notify_tasks + 1] = function()
+                local outcome, ok = bounded_call(function()
+                    return call_agent_raw(info.target, info.id, "migration_abort", info.id, info.barrier_id)
+                end)
+                if outcome == "OK" and ok then
+                    info.target = nil
+                end
+            end
+        end
+    end
+    -- 先踢再通知，与 abort 的顺序一致；两批各自有总预算，不会无限等
+    run_parallel(kick_tasks, g_abort_budget)
+    run_parallel(notify_tasks, g_abort_budget)
+
+    local carried = 0
+    for key, info in pairs(g_inflight) do
         if info.conn_id or info.target then
             carried = carried + 1
         else

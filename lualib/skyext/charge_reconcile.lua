@@ -336,6 +336,18 @@ end
 
 function M.index_specs(colls)
     return {
+        -- 阻断单清单：偏索引只收 reconcile_blocked_at 存在的订单，条目数远小于全量
+        {
+            colls.orders,
+            {
+                { reconcile_blocked_at = 1 },
+                { updated_at = 1 },
+                { provider = 1 },
+                { order_id = 1 },
+                name = "reconcile_blocked",
+                partialFilterExpression = { reconcile_blocked_at = { ["$exists"] = true } },
+            },
+        },
         {
             colls.orders,
             {

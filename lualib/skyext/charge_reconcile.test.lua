@@ -511,19 +511,25 @@ t.describe("charge_reconcile 索引门禁", function()
     end)
 
     t.it("accepts a confirmed build", function()
-        local seen
+        local seen = {}
         local coll = {
             create_index = function(_, keys)
-                seen = keys
+                seen[#seen + 1] = keys
                 return true
             end,
         }
         t.expect(charge_reconcile.ensure_indexes({ orders = coll })).to.equal(true)
-        t.expect(seen.name).to.equal("status_updated_at_order")
-        t.expect(seen[1].status).to.equal(1)
-        t.expect(seen[2].updated_at).to.equal(1)
-        t.expect(seen[3].provider).to.equal(1)
-        t.expect(seen[4].order_id).to.equal(1)
+        -- 阻断单清单需要自己的偏索引；顺序先建它，保证对账索引仍是最后一次调用
+        t.expect(#seen).to.equal(2)
+        t.expect(seen[1].name).to.equal("reconcile_blocked")
+        t.expect(seen[1][1].reconcile_blocked_at).to.equal(1)
+        t.expect(seen[1].partialFilterExpression.reconcile_blocked_at["$exists"]).to.equal(true)
+        local status = seen[2]
+        t.expect(status.name).to.equal("status_updated_at_order")
+        t.expect(status[1].status).to.equal(1)
+        t.expect(status[2].updated_at).to.equal(1)
+        t.expect(status[3].provider).to.equal(1)
+        t.expect(status[4].order_id).to.equal(1)
     end)
 end)
 
