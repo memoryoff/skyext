@@ -28,6 +28,8 @@ local M = {}
 
 M.DEFAULT_RPC_TIMEOUT_TICKS = 300 -- 3s：单个阶段 RPC 的等待上限
 M.DEFAULT_ABORT_BUDGET_TICKS = 500 -- 5s：一次 abort 清理的总预算
+M.DEFAULT_ABORT_CONCURRENCY = 32
+M.MAX_ABORT_CONCURRENCY = 64
 
 local g_type
 local g_self_node
@@ -45,9 +47,21 @@ local g_aborted = false
 local g_round = 0
 local g_rpc_timeout = M.DEFAULT_RPC_TIMEOUT_TICKS
 local g_abort_budget = M.DEFAULT_ABORT_BUDGET_TICKS
+local g_abort_concurrency = M.DEFAULT_ABORT_CONCURRENCY
 
 local function inflight_key(entity_id, barrier_id)
     return tostring(entity_id) .. "|" .. tostring(barrier_id)
+end
+
+-- 一个实体可能有多条历史屏障登记（旧轮次踢人失败、目标通知失败等）。
+-- 只要还有一条未解决，就不能再次把该实体交给新一轮迁移。
+local function has_pending_barrier(entity_id)
+    for _, info in pairs(g_inflight) do
+        if info.id == entity_id and (info.conn_id or info.target) then
+            return true
+        end
+    end
+    return false
 end
 
 -- pcall 只能接住错误，接不住一个永不回包的 cluster.call。这里用 fork + timeout
@@ -98,7 +112,8 @@ local function bounded_call(fn)
 end
 
 -- 有界并发：abort 时单个网关失联不能挡住其它连接的清理。
--- 返回超时后仍未完成的任务数；调用方据此决定能否摘掉登记。
+-- 固定 Worker 数，避免 3000 条连接一次性 fork 3000 个协程；超过总预算后
+-- 不再领取新任务，未完成任务数原样返回给调用方保留登记。
 local function run_parallel(tasks, budget)
     if #tasks == 0 then
         return 0
@@ -110,20 +125,30 @@ local function run_parallel(tasks, budget)
         return 0
     end
     local pending = #tasks
+    local expired = false
+    local next_index = 0
     local token = {}
-    for _, task in ipairs(tasks) do
-        skynet.fork(function()
-            pcall(task)
+    local workers = math.min(g_abort_concurrency or M.DEFAULT_ABORT_CONCURRENCY, #tasks)
+    local function worker()
+        while not expired do
+            local index = next_index + 1
+            if index > #tasks then
+                break
+            end
+            next_index = index
+            pcall(tasks[index])
             pending = pending - 1
             if pending == 0 then
                 skynet.wakeup(token)
             end
-        end)
+        end
+    end
+    for _ = 1, workers do
+        skynet.fork(worker)
     end
     skynet.timeout(budget, function()
-        if pending > 0 then
-            skynet.wakeup(token)
-        end
+        expired = true
+        skynet.wakeup(token)
     end)
     if pending > 0 then
         skynet.wait(token)
@@ -233,6 +258,8 @@ function M.init(conf)
     g_self_node = nil
     g_rpc_timeout = tonumber(conf.rpc_timeout_ticks) or M.DEFAULT_RPC_TIMEOUT_TICKS
     g_abort_budget = tonumber(conf.abort_budget_ticks) or M.DEFAULT_ABORT_BUDGET_TICKS
+    g_abort_concurrency = tonumber(conf.abort_concurrency) or M.DEFAULT_ABORT_CONCURRENCY
+    g_abort_concurrency = math.max(1, math.min(M.MAX_ABORT_CONCURRENCY, math.floor(g_abort_concurrency)))
     M.begin_round()
     log.info("migration adapter ready", "type", g_type, "node", self_node())
 end
@@ -244,11 +271,25 @@ function M.list_entities()
     if not mgr then
         return nil, "entity_agentmgr(" .. g_type .. ") is not running on this node"
     end
-    local list = skynet.call(mgr, "lua", "migration_list")
+    -- 枚举本身也可能卡在失联的实体管理器上；它不能成为迁移轮次的无界入口。
+    local outcome, list, lerr = bounded_call(function()
+        return skynet.call(mgr, "lua", "migration_list")
+    end)
+    if outcome ~= "OK" then
+        return nil, "migration_list " .. tostring(outcome) .. ": " .. tostring(list or lerr)
+    end
     local out = {}
     local skipped = 0
     for _, entity in ipairs(list or {}) do
-        if entity.conn_id and entity.persistent and not entity.busy and not entity.unresumable then
+        -- 历史轮次还有未解决的屏障时，不能把它再次交给迁移：旧登记可能在
+        -- 新一轮成功 activate 后仍然指向已经恢复的客户端，abort 时就会误踢。
+        if
+            entity.conn_id
+            and entity.persistent
+            and not entity.busy
+            and not entity.unresumable
+            and not has_pending_barrier(entity.id)
+        then
             out[#out + 1] = entity
         else
             skipped = skipped + 1
@@ -297,6 +338,12 @@ end
 function M.freeze(entity, barrier_id)
     if not entity.owner_epoch then
         return nil, "entity has no owner epoch"
+    end
+    -- 枚举和 freeze 之间状态可能已经变化。历史未解决屏障必须先处理，
+    -- 否则新屏障会覆盖网关上的 barrier_id，而适配器内存里还留着旧登记，
+    -- 后续 abort 会对着已经恢复的客户端执行旧 kick。
+    if has_pending_barrier(entity.id) then
+        return nil, "entity has an unresolved barrier from a previous migration round"
     end
     -- 先登记、再发 RPC：远端可能已经建立了屏障，而回包永远不回来（网络断、节点假死）。
     -- 等到返回才登记的话，这种"屏障已生效、源端并不知道"的连接在 abort 里找不到，
@@ -606,6 +653,18 @@ function M.fallback(entity, reason)
         "abandoned",
         abandoned
     )
+end
+
+-- 供停服协调器查询：当前还有多少条 (entity, barrier) 清理没有完成。
+-- 只统计真正有未解决连接/目标的登记，空壳条目不算 pending。
+function M.pending_count()
+    local n = 0
+    for _, info in pairs(g_inflight) do
+        if info.conn_id or info.target then
+            n = n + 1
+        end
+    end
+    return n
 end
 
 -- 停服截止：协调器的 cancel 只置标志，阶段协程可能仍卡在跨节点 RPC 里。这里做

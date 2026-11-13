@@ -254,12 +254,14 @@ GM_CMD.pay_unblock = {
 }
 
 GM_CMD.pay_blocked = {
-    desc = "列出处于人工阻断的订单（按 updated_at 复合 Keyset 翻页）",
+    desc = "列出处于人工阻断的订单（按 reconcile_blocked_at 复合 Keyset 翻页）",
     params = {
         limit = "返回条数，默认 50，最大 200",
-        cursor_updated_at = "上一页最后一条的 updated_at（可选）",
+        cursor_blocked_at = "上一页最后一条的 reconcile_blocked_at（可选）",
+        cursor_block_version = "上一页最后一条的 reconcile_block_version（可选，默认 0）",
         cursor_provider = "上一页最后一条的 provider（可选）",
         cursor_order_id = "上一页最后一条的 order_id（可选）",
+        cursor_updated_at = "旧游标字段，仅用于兼容已有调用方",
     },
     handler = function(params)
         if not g_orders then
@@ -267,7 +269,27 @@ GM_CMD.pay_blocked = {
         end
         params = type(params) == "table" and params or {}
         local opts = { limit = params.limit }
-        if params.cursor_updated_at ~= nil then
+        if params.cursor_blocked_at ~= nil then
+            local blocked_at = tonumber(params.cursor_blocked_at)
+            if not blocked_at or blocked_at ~= math.floor(blocked_at) then
+                return false, "cursor_blocked_at must be an integer"
+            end
+            local version = params.cursor_block_version
+            if version == nil then
+                version = 0
+            else
+                version = tonumber(version)
+                if not version or version ~= math.floor(version) or version < 0 then
+                    return false, "cursor_block_version must be a non-negative integer"
+                end
+            end
+            opts.cursor = {
+                blocked_at = math.tointeger(blocked_at),
+                block_version = math.tointeger(version),
+                provider = params.cursor_provider,
+                order_id = params.cursor_order_id,
+            }
+        elseif params.cursor_updated_at ~= nil then
             local updated_at = tonumber(params.cursor_updated_at)
             if not updated_at or updated_at ~= math.floor(updated_at) then
                 return false, "cursor_updated_at must be an integer"

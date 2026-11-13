@@ -47,6 +47,7 @@ const V2_GAP_LIMIT = 256;
 interface Pending {
     name: string;
     param?: ProtoArgs;
+    conn: TransportConn | null;
     resolve: (value: ProtoArgs | null) => void;
 }
 
@@ -167,9 +168,10 @@ export class SessionClient {
      */
     async request<T = ProtoArgs>(name: string, param?: ProtoArgs, timeoutMs?: number): Promise<T | null> {
         const reqId = ++this.nextReqId;
+        const connection = this.conn;
         let p: Pending;
         const promise = new Promise<ProtoArgs | null>((resolve) => {
-            p = { name, param, resolve };
+            p = { name, param, conn: connection, resolve };
         });
         this.pending.set(reqId, p!);
         this.send(reqId, p!);
@@ -351,6 +353,15 @@ export class SessionClient {
     private drop(conn: TransportConn | null): void {
         if (conn === null || this.conn !== conn) {
             return;
+        }
+        // 旧连接上的握手请求永远不会再有回包。只清这一代连接创建的握手 Pending，
+        // 业务 Pending 必须保留到续接成功按原 req_id 重发；也不能误清新连接
+        // 正在进行的握手。
+        for (const [reqId, p] of this.pending) {
+            if (p.conn === conn && UNCOUNTED_RESPONSE.has(p.name)) {
+                this.pending.delete(reqId);
+                p.resolve(null);
+            }
         }
         this.conn = null;
         this._online = false;

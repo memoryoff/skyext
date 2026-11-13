@@ -554,13 +554,18 @@ function M.block_reconcile(orders_coll, order, reason, now)
     if type(order) ~= "table" then
         return nil, "order is required"
     end
+    local at = now or os.time()
     local ret, state, ferr = write_order(orders_coll, {
         query = { provider = order.provider, order_id = order.order_id },
         update = {
             ["$set"] = {
-                reconcile_blocked_at = now or os.time(),
+                reconcile_blocked_at = at,
+                updated_at = at,
                 last_error = tostring(reason),
             },
+            -- 版本必须原子递增。人工解封按读取时的版本做 CAS，不能只按
+            -- provider/order_id 命中，否则会清掉并发产生的新阻断。
+            ["$inc"] = { reconcile_block_version = 1 },
         },
         new = true,
     })
@@ -572,14 +577,35 @@ end
 
 -- 解除人工对账阻断。调用方必须先确认补偿/重试策略；这里只负责把订单重新放回
 -- 自动对账候选，不猜测业务原因，也不删除 last_error 证据。
+--
+-- CAS 条件同时包含 blocked_at 和 block_version：GM 读取之后如果订单又被重新阻断，
+-- 版本已经前进，这次旧版本解封必须返回 CAS_CONFLICT，不能静默清掉新阻断。
 function M.unblock_reconcile(orders_coll, order, now)
     if type(order) ~= "table" then
         return nil, "order is required"
     end
+    if order.reconcile_blocked_at == nil then
+        return nil, "order is not blocked"
+    end
+    local query = {
+        provider = order.provider,
+        order_id = order.order_id,
+        reconcile_blocked_at = order.reconcile_blocked_at,
+    }
+    if order.reconcile_block_version == nil then
+        -- 旧阻断单没有版本字段；只允许命中“仍然没有版本”的文档。
+        -- 如果并发重新阻断已经创建了版本，本查询不会匹配，仍然安全失败。
+        query.reconcile_block_version = { ["$exists"] = false }
+    else
+        query.reconcile_block_version = order.reconcile_block_version
+    end
     local ret, state, ferr = write_order(orders_coll, {
-        query = { provider = order.provider, order_id = order.order_id },
+        query = query,
         update = {
-            ["$set"] = { reconcile_unblocked_at = now or os.time() },
+            ["$set"] = {
+                reconcile_unblocked_at = now or os.time(),
+                updated_at = now or os.time(),
+            },
             ["$unset"] = { reconcile_blocked_at = true },
         },
         new = true,
@@ -588,13 +614,14 @@ function M.unblock_reconcile(orders_coll, order, now)
         return nil, (type(ret) == "table" and ret.errmsg) or ferr or "unblock_reconcile failed"
     end
     if type(ret.value) ~= "table" then
-        return nil, "order not found"
+        return nil, "CAS_CONFLICT"
     end
     return ret.value
 end
 
 -- 阻断单清单：阻断标记是人工终态，订单会退出自动对账候选集，必须能被运维看见。
--- 用与对账扫描相同的复合 Keyset（updated_at, provider, order_id），保证翻页稳定。
+-- 排序/游标以 reconcile_blocked_at 为主键，reconcile_block_version 解决同秒重阻断；
+-- 旧的 updated_at 游标仍兼容，避免已有 GM 调用方升级时翻页失败。
 function M.list_blocked(orders_coll, opts)
     opts = opts or {}
     if type(orders_coll) ~= "table" then
@@ -603,8 +630,10 @@ function M.list_blocked(orders_coll, opts)
     local limit = tonumber(opts.limit) or 50
     limit = math.max(1, math.min(200, math.floor(limit)))
     local query = { reconcile_blocked_at = { ["$exists"] = true } }
-    if type(opts.cursor) == "table" then
-        local cursor = opts.cursor
+    local cursor = opts.cursor
+    local legacy_cursor = type(cursor) == "table" and cursor.blocked_at == nil and cursor.updated_at ~= nil
+    local sort
+    if legacy_cursor then
         if math.type(cursor.updated_at) ~= "integer" then
             return nil, nil, "cursor.updated_at must be an integer"
         end
@@ -620,6 +649,69 @@ function M.list_blocked(orders_coll, opts)
                 order_id = { ["$gt"] = cursor.order_id },
             },
         }
+        sort = { { updated_at = 1 }, { provider = 1 }, { order_id = 1 } }
+    else
+        if type(cursor) == "table" then
+            if math.type(cursor.blocked_at) ~= "integer" then
+                return nil, nil, "cursor.blocked_at must be an integer"
+            end
+            if type(cursor.provider) ~= "string" or type(cursor.order_id) ~= "string" then
+                return nil, nil, "cursor.provider and cursor.order_id are required"
+            end
+            local version = cursor.block_version
+            if version == nil then
+                version = 0
+            end
+            if math.type(version) ~= "integer" or version < 0 then
+                return nil, nil, "cursor.block_version must be a non-negative integer"
+            end
+            local b = cursor.blocked_at
+            local clauses = {
+                { reconcile_blocked_at = { ["$gt"] = b } },
+            }
+            if version == 0 then
+                -- 旧文档没有版本字段，Mongo 排序把它们排在数字之前。从旧文档
+                -- 翻页时必须按 provider/order_id 继续，不能直接跳到版本 > 0。
+                clauses[#clauses + 1] = {
+                    reconcile_blocked_at = b,
+                    reconcile_block_version = { ["$exists"] = false },
+                    provider = { ["$gt"] = cursor.provider },
+                }
+                clauses[#clauses + 1] = {
+                    reconcile_blocked_at = b,
+                    reconcile_block_version = { ["$exists"] = false },
+                    provider = cursor.provider,
+                    order_id = { ["$gt"] = cursor.order_id },
+                }
+                clauses[#clauses + 1] = {
+                    reconcile_blocked_at = b,
+                    reconcile_block_version = { ["$gt"] = 0 },
+                }
+            else
+                clauses[#clauses + 1] = {
+                    reconcile_blocked_at = b,
+                    reconcile_block_version = { ["$gt"] = version },
+                }
+                clauses[#clauses + 1] = {
+                    reconcile_blocked_at = b,
+                    reconcile_block_version = version,
+                    provider = { ["$gt"] = cursor.provider },
+                }
+                clauses[#clauses + 1] = {
+                    reconcile_blocked_at = b,
+                    reconcile_block_version = version,
+                    provider = cursor.provider,
+                    order_id = { ["$gt"] = cursor.order_id },
+                }
+            end
+            query["$or"] = clauses
+        end
+        sort = {
+            { reconcile_blocked_at = 1 },
+            { reconcile_block_version = 1 },
+            { provider = 1 },
+            { order_id = 1 },
+        }
     end
     local called, docs, err = pcall(orders_coll.find_many, orders_coll, query, {
         projection = {
@@ -632,11 +724,12 @@ function M.list_blocked(orders_coll, opts)
             status = 1,
             updated_at = 1,
             reconcile_blocked_at = 1,
+            reconcile_block_version = 1,
             reconcile_unblocked_at = 1,
             last_error = 1,
             _id = 0,
         },
-        sort = { { updated_at = 1 }, { provider = 1 }, { order_id = 1 } },
+        sort = sort,
         limit = limit,
     })
     if not called then
@@ -648,7 +741,16 @@ function M.list_blocked(orders_coll, opts)
     local next_cursor
     if #docs >= limit and #docs > 0 then
         local last = docs[#docs]
-        next_cursor = { updated_at = last.updated_at, provider = last.provider, order_id = last.order_id }
+        if legacy_cursor then
+            next_cursor = { updated_at = last.updated_at, provider = last.provider, order_id = last.order_id }
+        else
+            next_cursor = {
+                blocked_at = last.reconcile_blocked_at,
+                block_version = tonumber(last.reconcile_block_version) or 0,
+                provider = last.provider,
+                order_id = last.order_id,
+            }
+        end
     end
     return docs, next_cursor
 end

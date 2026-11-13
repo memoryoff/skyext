@@ -336,15 +336,16 @@ end
 
 function M.index_specs(colls)
     return {
-        -- 阻断单清单：偏索引只收 reconcile_blocked_at 存在的订单，条目数远小于全量
+        -- 阻断单清单：排序/游标与索引使用同一套字段。版本号作为同秒重阻断的
+        -- 稳定 tie-breaker；新索引名避免与旧 updated_at 索引在已有库上冲突。
         {
             colls.orders,
             {
                 { reconcile_blocked_at = 1 },
-                { updated_at = 1 },
+                { reconcile_block_version = 1 },
                 { provider = 1 },
                 { order_id = 1 },
-                name = "reconcile_blocked",
+                name = "reconcile_blocked_v2",
                 partialFilterExpression = { reconcile_blocked_at = { ["$exists"] = true } },
             },
         },

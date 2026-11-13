@@ -14,9 +14,10 @@ end
 
 -- 停服时回调本服务的 cmd 命令。phase：
 --   stop_accepting  卸载实体之前：关掉对外入口（gate、HTTP 端口），不再放新请求进来
+--   migrate         卸载实体之前：执行迁移；status_cmd 可选，用于超时后查询 Abort 是否完成
 --   release         实体全部落库之后、进程退出之前：释放其余资源
-function M.add_hook(phase, cmd)
-    return skynet.call(service(), "lua", "add_hook", phase, skynet.self(), cmd)
+function M.add_hook(phase, cmd, status_cmd)
+    return skynet.call(service(), "lua", "add_hook", phase, skynet.self(), cmd, status_cmd)
 end
 
 return M

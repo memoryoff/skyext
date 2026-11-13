@@ -40,6 +40,8 @@ local g_started = false
 local g_cancelled = false
 -- 最后一次取消的兜底清理结果，供 CMD.stats 观测
 local g_abort_stats
+-- 取消清理可能 yield（Adapter.abort 内部有并发 RPC）；重复 cancel 不能并发跑两遍
+local g_abort_in_progress = false
 -- 运行锁：同一时刻只允许一轮迁移
 local g_run_active = false
 
@@ -121,7 +123,7 @@ function CMD.start(conf)
     end
 
     -- 注册失败不能吞：否则停服时不会跑迁移，运维以为开了
-    local hook_ok, hook_err = pcall(node_shutdown_api.add_hook, "migrate", "run")
+    local hook_ok, hook_err = pcall(node_shutdown_api.add_hook, "migrate", "run", "stats")
     if not hook_ok then
         return false, "cannot register the migrate shutdown hook: " .. tostring(hook_err)
     end
@@ -235,14 +237,37 @@ end
 -- 停服截止时间到达：让正在跑的迁移在阶段边界停下，并做网关屏障兜底。
 -- 只置标志是不够的：卡在无超时 cluster.call 里的阶段协程收不到它，进程 abort
 -- 之后网关的 frozen_epoch 永远没人清，客户端上下行会被一直丢弃。
+local function current_abort_pending()
+    if g_adapter and type(g_adapter.pending_count) == "function" then
+        local called, n = pcall(g_adapter.pending_count)
+        if called and type(n) == "number" then
+            return n
+        end
+    end
+    if g_abort_stats and type(g_abort_stats.pending) == "number" then
+        return g_abort_stats.pending
+    end
+    return 0
+end
+
 function CMD.cancel(reason)
-    if g_cancelled then
+    -- 第一次 cancel 置位并清理；后续 cancel 只有在仍有未解决屏障时才重试。
+    -- 已清理完成时必须幂等返回，不能重复踢同一批连接。
+    local first = not g_cancelled
+    if first then
+        g_cancelled = true
+        m_cancel:inc(1, { reason = "shutdown_deadline" })
+    end
+    if g_abort_in_progress then
         return true
     end
-    g_cancelled = true
-    m_cancel:inc(1, { reason = "shutdown_deadline" })
+    if not first and current_abort_pending() == 0 then
+        return true
+    end
     if g_adapter and type(g_adapter.abort) == "function" then
+        g_abort_in_progress = true
         local called, stats = pcall(g_adapter.abort, reason)
+        g_abort_in_progress = false
         if not called then
             log.error("migration abort failed", "err", tostring(stats))
             m_abort:inc(1, { result = "raised" })
@@ -252,7 +277,7 @@ function CMD.cancel(reason)
             m_abort:inc(stats.failed or 0, { result = "failed" })
         end
     end
-    log.warn("migration cancelled", "reason", tostring(reason))
+    log.warn("migration cancelled", "reason", tostring(reason), "pending", current_abort_pending())
     return true
 end
 
@@ -263,6 +288,9 @@ function CMD.stats()
         type_name = g_conf and g_conf.type_name or nil,
         adapter = g_conf and g_conf.adapter or nil,
         cancelled = g_cancelled,
+        run_active = g_run_active,
+        abort_in_progress = g_abort_in_progress,
+        abort_pending = current_abort_pending(),
         abort = g_abort_stats,
     }
 end

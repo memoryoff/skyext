@@ -25,6 +25,9 @@ local g_hooks = {
     release = {},
 }
 local g_running = false
+-- 迁移钩子超时且 Abort 仍有未解决屏障时：进程必须活着，下一次 shutdown 只重试
+-- cancel/status，不能重新启动一轮正常迁移。
+local g_migration_cleanup_pending = false
 
 local function run_hooks(phase)
     for _, hook in ipairs(g_hooks[phase]) do
@@ -35,15 +38,52 @@ local function run_hooks(phase)
     end
 end
 
+local function cancel_hooks(phase, reason)
+    for _, hook in ipairs(g_hooks[phase]) do
+        local cancelled, cerr = pcall(skynet.send, hook.addr, "lua", "cancel", reason)
+        if not cancelled then
+            log.warn("shutdown hook cancel failed", "phase", phase, "addr", hook.addr, "err", cerr)
+        end
+    end
+end
+
+-- 只把实现 status_cmd 的钩子纳入完成判断。老钩子没有状态查询协议，
+-- 继续沿用原来的"超时后卸载"降级，不能因为无法查询就永久卡住。
+local function migration_pending()
+    for _, hook in ipairs(g_hooks.migrate) do
+        if hook.status_cmd then
+            local ok, status = pcall(skynet.call, hook.addr, "lua", hook.status_cmd)
+            if not ok then
+                log.error("shutdown migration status failed", "addr", hook.addr, "err", tostring(status))
+                return true
+            end
+            if type(status) == "table" then
+                if type(status.abort_pending) == "number" and status.abort_pending > 0 then
+                    return true
+                end
+                if status.abort_in_progress == true or status.run_active == true then
+                    return true
+                end
+            else
+                -- 有状态查询协议但没拿到状态表：无法证明清理完成，按未完成处理。
+                log.error("shutdown migration status was not a table", "addr", hook.addr, "status", tostring(status))
+                return true
+            end
+        end
+    end
+    return false
+end
+
 -- 带截止时间的钩子。迁移要跨节点 RPC，卡住的话停服会永久停在卸载之前，
 -- 而 g_running 已置位、再发一次 shutdown 只会得到 "already shutting down"。
 -- 超时后先给每个钩子发 cancel 让它在阶段边界停下，再继续卸载：
 -- 只停止等待是不够的，迁移协程会和卸载并行跑，源实体被卸掉之后还在写。
 -- migrate 阶段的钩子必须实现 cancel（migration_coordinator 实现了）。
+-- 返回 true 表示至少一个钩子超时。
 local function run_hooks_with_deadline(phase, timeout_sec)
     local hooks = g_hooks[phase]
     if #hooks == 0 then
-        return
+        return false
     end
     local pending = #hooks
     for _, hook in ipairs(hooks) do
@@ -62,16 +102,13 @@ local function run_hooks_with_deadline(phase, timeout_sec)
     end
     if pending > 0 then
         log.error("shutdown hook timed out", "phase", phase, "pending", pending, "timeout", timeout_sec)
-        for _, hook in ipairs(hooks) do
-            local cancelled, cerr = pcall(skynet.send, hook.addr, "lua", "cancel", "shutdown deadline")
-            if not cancelled then
-                log.warn("shutdown hook cancel failed", "phase", phase, "addr", hook.addr, "err", cerr)
-            end
-        end
+        cancel_hooks(phase, "shutdown deadline")
         -- cancel 是单向消息。给协调器一小段宽限，让它把「踢掉屏障期客户端」
         -- 的兜底清理跑完；否则进程紧接着 abort，cancel 可能根本没被处理。
         pcall(skynet.sleep, 10)
+        return true
     end
+    return false
 end
 
 -- 本节点上起了的 entity_agentmgr：按实体类型配置逐个查本地名字，没在本节点起的类型跳过
@@ -124,8 +161,25 @@ local function shutdown(timeout_sec)
     run_hooks("stop_accepting")
     -- 计划内迁移：必须在卸载之前。迁移不成功时实体照常卸载，玩家重登即可，
     -- 不能因为迁移失败就把进程留在半死不活的状态。超时用整个停服预算的一半，
-    -- 剩下的时间要留给卸载
-    run_hooks_with_deadline("migrate", math.max(1, math.floor(timeout_sec / 2)))
+    -- 剩下的时间要留给卸载。
+    local migration_timed_out
+    if g_migration_cleanup_pending then
+        -- 上一次停服已经超时并发出过 cancel；重试只清理 Abort，不重新开一轮迁移。
+        cancel_hooks("migrate", "shutdown retry")
+        pcall(skynet.sleep, 10)
+        migration_timed_out = true
+    else
+        migration_timed_out = run_hooks_with_deadline("migrate", math.max(1, math.floor(timeout_sec / 2)))
+    end
+    if migration_timed_out and migration_pending() then
+        -- Abort 还没完成，或迁移协程仍在跑：此时卸载会让实体在迁移写入之后被删。
+        -- 保留进程，让运维可以再次 shutdown 重试；g_running 复位以接受重试。
+        g_migration_cleanup_pending = true
+        log.error("node shutdown incomplete, migration abort still pending")
+        g_running = false
+        return
+    end
+    g_migration_cleanup_pending = false
     local remaining = unload_entities(timeout_sec)
     if remaining ~= 0 then
         log.error("node shutdown incomplete, process kept alive", "remaining", remaining)
@@ -149,16 +203,20 @@ end
 
 local CMD = {}
 
--- 停服时回调 addr 服务的 cmd 命令。同一个 (phase, addr, cmd) 只记一次，按注册顺序执行
-function CMD.add_hook(phase, addr, cmd)
+-- 停服时回调 addr 服务的 cmd 命令。同一个 (phase, addr, cmd) 只记一次，按注册顺序执行。
+-- status_cmd 可选：migrate 超时后用来确认 Abort 是否真的完成。
+function CMD.add_hook(phase, addr, cmd, status_cmd)
     local hooks = assert(g_hooks[phase], "unknown shutdown phase: " .. tostring(phase))
     assert(type(cmd) == "string" and cmd ~= "", "shutdown hook needs a command")
+    if status_cmd ~= nil then
+        assert(type(status_cmd) == "string" and status_cmd ~= "", "shutdown status command must be a string")
+    end
     for _, hook in ipairs(hooks) do
         if hook.addr == addr and hook.cmd == cmd then
             return true
         end
     end
-    hooks[#hooks + 1] = { addr = addr, cmd = cmd }
+    hooks[#hooks + 1] = { addr = addr, cmd = cmd, status_cmd = status_cmd }
     return true
 end
 

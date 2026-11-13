@@ -93,7 +93,7 @@
 | 方法 | 行 | 作用 |
 | --- | --- | --- |
 | `M.start()` | 11 | 起 `node_shutdown` 编排服务（同时注册 GM `shutdown`），节点启动时调一次 |
-| `M.add_hook(phase, cmd)` | 18 | 注册停服钩子。`phase` 两段：`stop_accepting`（卸载实体之前，关掉 gate/HTTP 入口）、`release`（实体全部落库之后，释放其余资源） |
+| `M.add_hook(phase, cmd, status_cmd)` | 19 | 注册停服钩子。`phase` 支持 `stop_accepting`（卸载实体之前，关掉 gate/HTTP 入口）、`migrate`（卸载前的计划内迁移）和 `release`（实体全部落库之后，释放其余资源）。`status_cmd` 可选：迁移钩子用它查询 Abort 是否清理完成 |
 
 ## `orm_compat.lua`（332 行，schema 兼容性检查）
 

@@ -36,6 +36,9 @@ local function fake_orders()
             for k, v in pairs(opts.update["$set"] or {}) do
                 existing[k] = v
             end
+            for k, v in pairs(opts.update["$inc"] or {}) do
+                existing[k] = (existing[k] or 0) + v
+            end
             for k in pairs(opts.update["$unset"] or {}) do
                 existing[k] = nil
             end
@@ -262,13 +265,35 @@ t.describe("charge_order 状态机", function()
     t.it("can clear a reconciliation block after manual review", function()
         local h = harness()
         local order = assert(h.record())
-        assert(h.charge.block_reconcile(h.orders, order, "manual review", 60))
+        local blocked = assert(h.charge.block_reconcile(h.orders, order, "manual review", 60))
         t.expect(h.orders.store["wechat:ORDER-1"].reconcile_blocked_at).to.equal(60)
+        t.expect(h.orders.store["wechat:ORDER-1"].reconcile_block_version).to.equal(1)
 
-        local cleared = assert(h.charge.unblock_reconcile(h.orders, order, 70))
+        local cleared = assert(h.charge.unblock_reconcile(h.orders, blocked, 70))
         t.expect(cleared.reconcile_blocked_at).to.be_nil()
         t.expect(cleared.reconcile_unblocked_at).to.equal(70)
         t.expect(cleared.last_error).to.equal("manual review")
+    end)
+
+    -- 资金安全核心：GM 读到版本 A 之后订单被重新阻断成版本 B，旧解封必须失败。
+    t.it("refuses to unblock a version that was superseded by a concurrent block", function()
+        local h = harness()
+        local order = assert(h.record())
+        local version_a = assert(h.charge.block_reconcile(h.orders, order, "first", 60))
+        local stale = {
+            provider = version_a.provider,
+            order_id = version_a.order_id,
+            reconcile_blocked_at = version_a.reconcile_blocked_at,
+            reconcile_block_version = version_a.reconcile_block_version,
+        }
+        -- 模拟另一个请求重新阻断，版本前进到 B
+        assert(h.charge.block_reconcile(h.orders, version_a, "second", 61))
+        local cleared, err = h.charge.unblock_reconcile(h.orders, stale, 70)
+        t.expect(cleared).to.be_nil()
+        t.expect(err).to.equal("CAS_CONFLICT")
+        -- 新阻断必须保持有效
+        t.expect(h.orders.store["wechat:ORDER-1"].reconcile_blocked_at).to.equal(61)
+        t.expect(h.orders.store["wechat:ORDER-1"].reconcile_block_version).to.equal(2)
     end)
 end)
 
@@ -617,16 +642,46 @@ t.describe("charge_order 阻断单清单", function()
     t.it("returns a stable next cursor when the page is full", function()
         local rows = {}
         for i = 1, 3 do
-            rows[i] = { provider = "wechat", order_id = "o-" .. i, updated_at = i, status = "GRANTING" }
+            rows[i] = {
+                provider = "wechat",
+                order_id = "o-" .. i,
+                updated_at = i,
+                reconcile_blocked_at = i,
+                reconcile_block_version = i,
+                status = "GRANTING",
+            }
         end
         local orders, seen = coll(rows)
         local list, cursor, err = h_charge.list_blocked(orders, { limit = 3 })
         t.expect(err).to.be_nil()
         t.expect(#list).to.equal(3)
-        t.expect(cursor.updated_at).to.equal(3)
+        t.expect(cursor.blocked_at).to.equal(3)
+        t.expect(cursor.block_version).to.equal(3)
         t.expect(cursor.provider).to.equal("wechat")
         t.expect(cursor.order_id).to.equal("o-3")
         t.expect(seen().query.reconcile_blocked_at["$exists"]).to.equal(true)
+        t.expect(seen().opts.sort[1].reconcile_blocked_at).to.equal(1)
+        t.expect(seen().opts.sort[2].reconcile_block_version).to.equal(1)
+    end)
+
+    t.it("supports the legacy updated_at cursor for existing GM callers", function()
+        local rows = {}
+        for i = 1, 3 do
+            rows[i] = {
+                provider = "wechat",
+                order_id = "o-" .. i,
+                updated_at = i,
+                reconcile_blocked_at = i,
+                reconcile_block_version = i,
+            }
+        end
+        local orders, seen = coll(rows)
+        local _, cursor, err = h_charge.list_blocked(orders, {
+            limit = 3,
+            cursor = { updated_at = 10, provider = "wechat", order_id = "o-2" },
+        })
+        t.expect(err).to.be_nil()
+        t.expect(cursor.updated_at).to.equal(3)
         t.expect(seen().opts.sort[1].updated_at).to.equal(1)
     end)
 

@@ -224,6 +224,27 @@ describe("client.session 登录", () => {
     });
 });
 
+describe("client.session Pending 清理", () => {
+    test("丢弃旧连接只清理握手 Pending，保留可续接的业务 Pending", async () => {
+        const h = harness();
+        await h.login();
+        const business = h.session.call("biz");
+        await h.settle();
+        const handshake = h.session.request("login.resume", {}, 5);
+        await sleep(20);
+        const pending = (h.session as unknown as { pending: Map<number, { name: string }> }).pending;
+        expect(pending.size).toBe(2);
+
+        h.session.reconnect();
+        // 旧连接的 login.resume 不会再回包；业务请求必须保留到续接后按原 id 重发
+        expect(pending.size).toBe(1);
+        expect([...pending.values()][0].name).toBe("biz");
+        h.session.close();
+        await business;
+        await handshake;
+    });
+});
+
 describe("client.session 下行计数", () => {
     test("业务回包和服务端推送都计数", async () => {
         const h = harness();

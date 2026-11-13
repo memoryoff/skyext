@@ -59,6 +59,10 @@ local function apply(doc, update)
             for k in pairs(fields) do
                 doc[k] = nil
             end
+        elseif op == "$inc" then
+            for k, v in pairs(fields) do
+                doc[k] = (tonumber(doc[k]) or 0) + v
+            end
         elseif op ~= "$setOnInsert" then
             error("unsupported update operator: " .. tostring(op))
         end

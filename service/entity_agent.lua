@@ -736,12 +736,20 @@ end
 -- 拆成两步是为了让 TRANSFER（送达）与 OWNER_HANDOFF（认领 + 安装）各自可观测、可重试；
 -- 合成一步的话，安装失败就分不清是没送到还是没认领上。
 local g_staged = {}
+-- 已成功提交的终态，按 entity 保存最近一轮。重复 commit / RPC 重试必须幂等返回，
+-- 不能因为暂存已清理而返回 no staged snapshot。
+local g_committed = {}
 -- 已被源端取消的迁移：entity_id -> { barrier_id, at }。
 -- 源端 abort 后可能仍有 commit/attach RPC 在路上（无超时的 cluster.call），
 -- 目标端必须据此拒绝接管，否则会出现「源端已放弃、目标端却完成了迁移」。
 local g_aborted_barriers = {}
 local STAGED_TTL = 60
+-- 终态要覆盖一次跨节点 RPC 的完整重试窗口，不能和暂存快照一样只留 60 秒：
+-- Commit 已成功但响应丢失时，源端稍后重试仍应幂等成功，而不是回到 no staged snapshot。
+local COMMITTED_TTL = 300
 local STAGED_MAX = 64
+local STAGE_STAGED = "STAGED"
+local STAGE_COMMITTING = "COMMITTING"
 
 -- 测试用的时钟偏移。TTL 过期是 A-07 的核心语义（陈旧取消标记必须自己过期，
 -- 不能靠"别的实体恰好来 stage"顺带清），而 os.time() 在单测里走不动，
@@ -770,6 +778,11 @@ local function prune_staged(now)
             g_aborted_barriers[id] = nil
         end
     end
+    for id, entry in pairs(g_committed) do
+        if now - entry.at > COMMITTED_TTL then
+            g_committed[id] = nil
+        end
+    end
     return count
 end
 
@@ -783,10 +796,41 @@ function CMD.migration_stage(entity_id, payload)
     -- 而这个实体在目标节点上就再也迁不进来了（停服重试时正好命中）。
     -- prune 原本只在"别的实体也来 stage"时才被顺带触发，等于没触发
     local count = prune_staged(now)
+    local barrier_id = payload.barrier_id
+    local existing = g_staged[entity_id]
+    if existing then
+        if existing.state == STAGE_COMMITTING then
+            return false, "migration commit in progress"
+        end
+        if existing.barrier_id ~= barrier_id then
+            -- 旧快照还没提交，不能用新快照覆盖：否则 Abort 正在处理旧 barrier 时
+            -- 新 barrier 的 payload 会被旧 Commit 误装进实体。
+            return false, "previous barrier still staged"
+        end
+        -- 同一 barrier 的重试是幂等的，允许刷新 payload 但不改变状态。
+        existing.payload = payload
+        existing.at = now
+        return true
+    end
+    local committed = g_committed[entity_id]
+    if committed and committed.barrier_id == barrier_id then
+        -- Commit 已经成功，只是回包丢了：再次 Stage 不应把实体重新拉回待提交状态。
+        return true
+    end
+    if
+        committed
+        and committed.owner_epoch
+        and tonumber(payload.owner_epoch)
+        and tonumber(payload.owner_epoch) <= committed.owner_epoch
+    then
+        -- 新一轮已经提交过更高的 owner_epoch。旧轮次迟到的 Stage 不能再把
+        -- 低代际快照放回队列，否则新一轮会被它挡住，甚至被旧 Commit 尝试安装。
+        return false, "stale barrier"
+    end
     -- 同一 barrier 已经被源端取消：迟到的 stage 不能重新建立暂存
     local aborted = g_aborted_barriers[entity_id]
     if aborted then
-        if aborted.barrier_id == payload.barrier_id then
+        if aborted.barrier_id == barrier_id then
             return false, "migration aborted"
         end
         -- 不同 barrier 说明是上一轮留下的标记，允许新轮次
@@ -796,7 +840,12 @@ function CMD.migration_stage(entity_id, payload)
     if count >= STAGED_MAX then
         return false, "too many staged snapshots"
     end
-    g_staged[entity_id] = { payload = payload, at = now }
+    g_staged[entity_id] = {
+        payload = payload,
+        at = now,
+        barrier_id = barrier_id,
+        state = STAGE_STAGED,
+    }
     return true
 end
 
@@ -810,9 +859,19 @@ function CMD.migration_abort(entity_id, barrier_id)
     -- 否则它会一直占着这个实体，把下一轮正常迁移挡在外面
     prune_staged(wall_now())
     local staged = g_staged[entity_id]
-    if staged and staged.payload and staged.payload.barrier_id ~= barrier_id then
+    if staged and staged.barrier_id ~= barrier_id then
         -- 旧轮次的取消请求：不能让它误伤当前这一轮
         return false, "barrier mismatch"
+    end
+    if staged and staged.state == STAGE_COMMITTING then
+        -- Commit 已经越过第一次 yield，正在实体队列里等待/安装。
+        -- 此时不能谎称取消成功，也不能清掉它正在使用的快照；源端必须按
+        -- COMMIT_IN_PROGRESS 处理，等 Commit 的终态。
+        return false, "commit in progress"
+    end
+    local committed = g_committed[entity_id]
+    if committed and committed.barrier_id == barrier_id then
+        return false, "already committed"
     end
     local current = g_aborted_barriers[entity_id]
     if current and current.barrier_id ~= barrier_id then
@@ -851,7 +910,7 @@ function CMD.migration_commit(entity_id, barrier_id)
     -- 先清过期标记，避免陈旧的取消记录挡住这一轮
     prune_staged(wall_now())
     local staged = g_staged[entity_id]
-    local staged_barrier = staged and staged.payload and staged.payload.barrier_id or nil
+    local staged_barrier = staged and staged.barrier_id or nil
 
     -- 调用方声明的轮次与暂存的轮次不一致：这是上一轮的迟到 commit。
     -- 绝不能拿新一轮的快照去安装上一轮的认领
@@ -860,28 +919,89 @@ function CMD.migration_commit(entity_id, barrier_id)
     end
 
     local round = barrier_id or staged_barrier
+    if not staged then
+        local committed = g_committed[entity_id]
+        if committed and (round == nil or committed.barrier_id == round) then
+            -- Commit 已经成功，RPC 响应丢失后的重试必须幂等成功。
+            return true
+        end
+        local aborted = g_aborted_barriers[entity_id]
+        if aborted and (round == nil or aborted.barrier_id == round) then
+            return false, "migration aborted"
+        end
+        return false, "no staged snapshot"
+    end
+
     local aborted = g_aborted_barriers[entity_id]
     if aborted and (round == nil or aborted.barrier_id == round) then
         -- 源端已经取消这一轮：即使 commit RPC 迟到，也不能接管
-        if staged and staged_barrier == aborted.barrier_id then
+        if staged_barrier == aborted.barrier_id then
             g_staged[entity_id] = nil
         end
         g_aborted_barriers[entity_id] = nil
         return false, "migration aborted"
     end
-    if not staged then
+    if staged.state == STAGE_COMMITTING then
+        return false, "commit in progress"
+    end
+    if staged.state ~= STAGE_STAGED then
         return false, "no staged snapshot"
     end
+
+    -- 第一次 yield 之前先占住 COMMITTING。这样 Abort 即使随后到达，也只能
+    -- 得到 COMMIT_IN_PROGRESS，不会清掉正在被安装的快照。
+    staged.state = STAGE_COMMITTING
+    staged.at = wall_now()
+    local imported
     local ok, result, err = in_entity(entity_id, function(entity)
-        return FRAMEWORK.session_import(entity, staged.payload)
+        local current = g_staged[entity_id]
+        if current ~= staged or current.state ~= STAGE_COMMITTING then
+            return false, "migration aborted"
+        end
+        local late_abort = g_aborted_barriers[entity_id]
+        if late_abort and (round == nil or late_abort.barrier_id == round) then
+            return false, "migration aborted"
+        end
+        local imported_result = FRAMEWORK.session_import(entity, current.payload)
+        if type(imported_result) == "table" then
+            imported = imported_result
+        end
+        return imported_result
     end)
     if not ok then
+        if type(imported) == "table" then
+            -- 回调已经成功安装，只是 with_entity 外层在归还租约时失败。
+            -- 不能把已经生效的导入退回去，否则重试会再装一次。
+            if g_staged[entity_id] == staged then
+                g_staged[entity_id] = nil
+            end
+            g_committed[entity_id] = {
+                barrier_id = round,
+                at = wall_now(),
+                owner_epoch = tonumber(staged.payload.owner_epoch),
+            }
+            return true
+        end
+        -- Claim 没拿到或 with_entity 外层失败：Import 还没执行，恢复成可重试。
+        if g_staged[entity_id] == staged then
+            staged.state = STAGE_STAGED
+        end
         return false, tostring(result)
     end
     if type(result) ~= "table" then
+        if g_staged[entity_id] == staged then
+            staged.state = STAGE_STAGED
+        end
         return false, tostring(err or "snapshot rejected")
     end
-    g_staged[entity_id] = nil
+    if g_staged[entity_id] == staged then
+        g_staged[entity_id] = nil
+    end
+    g_committed[entity_id] = {
+        barrier_id = round,
+        at = wall_now(),
+        owner_epoch = tonumber(staged.payload.owner_epoch),
+    }
     return true
 end
 

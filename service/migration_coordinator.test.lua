@@ -327,4 +327,33 @@ t.describe("migration_coordinator 取消", function()
         t.expect(h.CMD.stats().cancelled).to.equal(true)
         t.expect(h.CMD.stats().abort).to.be_nil()
     end)
+
+    t.it("retries abort while unresolved barriers remain", function()
+        local adapter = stage_adapter()
+        local pending = 1
+        local aborts = 0
+        adapter.pending_count = function()
+            return pending
+        end
+        adapter.abort = function()
+            aborts = aborts + 1
+            if aborts > 1 then
+                pending = 0
+            end
+            return { kicked = 1, failed = 0, pending = pending }
+        end
+        local h = harness({ modules = { ["game.migration_adapter"] = adapter } })
+        assert(h.CMD.start(enabled_conf({ adapter = "game.migration_adapter" })))
+        assert(h.CMD.run({}))
+        assert(h.CMD.cancel("deadline"))
+        t.expect(aborts).to.equal(1)
+        t.expect(h.CMD.stats().abort_pending).to.equal(1)
+        -- 还有未解决屏障：第二次 cancel 必须重试 abort
+        assert(h.CMD.cancel("deadline"))
+        t.expect(aborts).to.equal(2)
+        t.expect(h.CMD.stats().abort_pending).to.equal(0)
+        -- 清理完成后再 cancel 不重复 abort
+        assert(h.CMD.cancel("deadline"))
+        t.expect(aborts).to.equal(2)
+    end)
 end)

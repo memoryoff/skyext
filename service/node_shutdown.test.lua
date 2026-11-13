@@ -8,7 +8,7 @@ local source = fs.join(fs.absolute(os.getenv("SKYTEST_ROOT") or lfs.currentdir()
 -- opts.local_names 本节点起了的 entity_agentmgr：名字 -> 地址
 local function harness(opts)
     opts = opts or {}
-    local h = { calls = {}, logs = {}, remaining = {}, fail = {} }
+    local h = { calls = {}, logs = {}, remaining = {}, fail = {}, status = {} }
 
     local function record(addr, cmd)
         h.calls[#h.calls + 1] = addr .. " " .. cmd
@@ -25,6 +25,9 @@ local function harness(opts)
             end
             if cmd == "shutdown" then
                 return h.remaining[addr] or 0
+            end
+            if h.status[addr] then
+                return h.status[addr]
             end
             return true
         end,
@@ -261,5 +264,32 @@ t.describe("node_shutdown 迁移截止", function()
         t.expect(h.sent).to.be_nil()
         -- 钩子按时返回就不该有宽限等待
         t.expect(h.slept).to.be_nil()
+    end)
+
+    t.it("keeps the process alive until migration abort reports no pending work", function()
+        local h = harness({ local_names = { [".entity_agentmgr:role"] = ":mgr" } })
+        h.CMD.add_hook("migrate", ":migration", "run", "stats")
+        h.defer_fork_after = 1
+        h.status[":migration"] = { abort_pending = 1, run_active = true }
+
+        h.CMD.shutdown(2)
+        -- Abort 还没完成：不能卸载实体，也不能退出进程（这里只应有一次状态查询）
+        t.expect(h.calls).to.equal({ ":migration stats" })
+        t.expect(h.aborted).to.be_nil()
+        t.expect(logged(h, "error:node shutdown incomplete, migration abort still pending")).to.equal(true)
+
+        -- 第二次 shutdown 只重试 cancel/status，不能重新启动正常迁移
+        h.defer_fork_after = nil
+        h.status[":migration"] = { abort_pending = 0, abort_in_progress = false, run_active = false }
+        t.expect(h.CMD.shutdown()).to.equal(true)
+        t.expect(#h.sent).to.equal(2)
+        local unloaded = false
+        for _, call in ipairs(h.calls) do
+            if call == ":mgr shutdown" then
+                unloaded = true
+            end
+        end
+        t.expect(unloaded).to.equal(true)
+        t.expect(h.aborted).to.equal(true)
     end)
 end)

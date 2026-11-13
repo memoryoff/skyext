@@ -40,6 +40,9 @@ local function harness(opts)
             gates[id] = gate
         end
         return gate(function()
+            if h.pause_with_entity then
+                skynet.sleep(5)
+            end
             if h.with_entity_error then
                 return false, h.with_entity_error, h.with_entity_owner
             end
@@ -1135,10 +1138,8 @@ t.describe("entity_agent 迁移接管", function()
         t.expect(h.CMD.migration_commit(7)).to.equal(true)
         t.expect(h.entity.session_io.owner_epoch).to.equal(3)
         t.expect(h.entity.migration_target_epoch).to.equal(4)
-        -- 提交成功即清掉暂存：同一份快照不能被安装第二次
-        local again, err = h.CMD.migration_commit(7)
-        t.expect(again).to.equal(false)
-        t.expect(err).to.equal("no staged snapshot")
+        -- 提交成功即清掉暂存；同一 barrier 的重试必须幂等成功，而不是再报 no staged
+        t.expect(h.CMD.migration_commit(7)).to.equal(true)
     end)
 
     -- 安装失败要保留暂存，适配器才能在 FALLBACK 之前重试一次
@@ -1195,10 +1196,10 @@ t.describe("entity_agent 迁移接管", function()
         t.expect(ok).to.equal(false)
         t.expect(err).to.equal("migration aborted")
         t.expect(h.entity.session_io).to.be_nil()
-        -- 暂存已清：重试也不会再接管
+        -- 暂存已清：重试仍然必须拒绝，而不是重新接管
         local again, aerr = h.CMD.migration_commit(7)
         t.expect(again).to.equal(false)
-        t.expect(aerr).to.equal("no staged snapshot")
+        t.expect(aerr).to.equal("migration aborted")
     end)
 
     t.it("does not let a stale abort cancel the current round", function()
@@ -1271,6 +1272,98 @@ t.describe("entity_agent 迁移接管", function()
         local ok, err = h.CMD.migration_commit(7, 42)
         t.expect(ok).to.equal(false)
         t.expect(err).to.match("barrier_id")
+    end)
+
+    -- Commit 已经进入 with_entity 的等待队列，Abort 此时不能把正在安装的快照清掉。
+    -- 必须真正让 commit 协程 yield，不能只在顺序调用里假装覆盖并发。
+    t.it("reports COMMIT_IN_PROGRESS instead of cancelling a commit already in flight", function()
+        local h = harness()
+        local snapshot = exported()
+        assert(h.CMD.migration_stage(7, snapshot))
+        h.pause_with_entity = true
+        local commit_result
+        skynet.fork(function()
+            commit_result = { h.CMD.migration_commit(7) }
+        end)
+        skynet.sleep(1)
+
+        local ok, err = h.CMD.migration_abort(7, snapshot.barrier_id)
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("commit in progress")
+        t.expect(h.entity.session_io).to.be_nil()
+
+        h.pause_with_entity = false
+        skynet.sleep(10)
+        t.expect(commit_result[1]).to.equal(true)
+        t.expect(h.entity.session_io.owner_epoch).to.equal(3)
+
+        -- Commit 赢了之后，迟到的 Abort 不能把终态改回取消
+        local late_ok, late_err = h.CMD.migration_abort(7, snapshot.barrier_id)
+        t.expect(late_ok).to.equal(false)
+        t.expect(late_err).to.equal("already committed")
+    end)
+
+    -- 旧 Stage A 还没提交时，Stage B 不能覆盖它；否则 Commit A 会误装 B 的 payload。
+    t.it("does not let a new barrier overwrite a staged snapshot before commit", function()
+        local h = harness()
+        local a = exported()
+        local b = exported()
+        b.barrier_id = "b2"
+        assert(h.CMD.migration_stage(7, a))
+        local ok, err = h.CMD.migration_stage(7, b)
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("previous barrier still staged")
+        t.expect(h.CMD.migration_commit(7, a.barrier_id)).to.equal(true)
+    end)
+
+    t.it("refuses a late stage with an older owner epoch after a newer commit", function()
+        local h = harness()
+        local a = exported()
+        assert(h.CMD.migration_stage(7, a))
+        assert(h.CMD.migration_commit(7, a.barrier_id))
+
+        local b = exported()
+        b.barrier_id = "b2"
+        b.owner_epoch = 5
+        assert(h.CMD.migration_stage(7, b))
+        assert(h.CMD.migration_commit(7, b.barrier_id))
+
+        local stale = exported()
+        stale.barrier_id = "b-old"
+        stale.owner_epoch = 4
+        local ok, err = h.CMD.migration_stage(7, stale)
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("stale barrier")
+    end)
+
+    t.it("keeps a committed barrier idempotent beyond the staged snapshot TTL", function()
+        local h = harness()
+        local snapshot = exported()
+        assert(h.CMD.migration_stage(7, snapshot))
+        assert(h.CMD.migration_commit(7, snapshot.barrier_id))
+
+        h.CMD._test_advance_time(61)
+        t.expect(h.CMD.migration_commit(7, snapshot.barrier_id)).to.equal(true)
+
+        h.CMD._test_advance_time(240)
+        local ok = h.CMD.migration_commit(7, snapshot.barrier_id)
+        t.expect(ok).to.equal(false)
+    end)
+
+    t.it("clears the old terminal record when a newer barrier becomes active", function()
+        local h = harness()
+        local a = exported()
+        assert(h.CMD.migration_stage(7, a))
+        assert(h.CMD.migration_commit(7, a.barrier_id))
+        local b = exported()
+        b.barrier_id = "b2"
+        b.owner_epoch = 5
+        assert(h.CMD.migration_stage(7, b))
+        -- 旧 barrier 的迟到 Commit 不能命中新暂存
+        local ok, err = h.CMD.migration_commit(7, a.barrier_id)
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("barrier mismatch")
+        t.expect(h.CMD.migration_commit(7, "b2")).to.equal(true)
     end)
 end)
 

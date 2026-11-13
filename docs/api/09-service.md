@@ -191,8 +191,8 @@ GM 侧只读接口，读 `entity_dlq` 集合里的死信记录。
 | 方法 | 行 | 作用 | 边界 |
 | --- | --- | --- | --- |
 | `CMD.shutdown(timeout_sec)` | 119 | 开始停服：立即返回、`fork` 后台跑 | 已在停服中返回 `false, "already shutting down"`；GM 命令 `shutdown` 默认 60 秒 |
-| `shutdown(timeout_sec)` | 79 | 顺序：`stop_accepting` 钩子 → 卸载全部实体（并行、带超时）→ `release` 钩子 → `cluster_discovery.shutdown` → `node_lease.shutdown`（撤租约，键随之消失） | 实体没卸干净就**不继续**，记 error 并保进程存活 |
-| `CMD.add_hook(phase, addr, cmd)` | 106 | 注册钩子；同一 `(phase, addr, cmd)` 只记一次，按注册顺序执行 | 未知 phase 断言失败；`cmd` 必须非空串 |
+| `shutdown(timeout_sec)` | 79 | 顺序：`stop_accepting` 钩子 → `migrate` 钩子（有计划内迁移时）→ 卸载全部实体（并行、带超时）→ `release` 钩子 → `cluster_discovery.shutdown` → `node_lease.shutdown`（撤租约，键随之消失）。迁移超时且 Abort 仍有未解决屏障时保留进程 | 实体没卸干净就**不继续**，记 error 并保进程存活 |
+| `CMD.add_hook(phase, addr, cmd, status_cmd)` | 208 | 注册钩子；同一 `(phase, addr, cmd)` 只记一次，按注册顺序执行。`status_cmd` 可选，迁移钩子用它查询 Abort 是否清理完成 | 未知 phase 断言失败；`cmd` 必须非空串 |
 | `run_hooks(phase)` / `entity_managers()` / `unload_entities` / `count` | 25-64 | 逐个 `pcall` 调钩子（失败只 warn）；只查本节点真的起了的 `entity_agentmgr`；并行卸载并汇总剩余数；**不知道剩多少时至少算一个**，免得误以为卸干净 | — |
 
 两个阶段的分工：`stop_accepting` 在卸载实体**之前**（先关 gate/HTTP 入口），`release` 在实体全部落库**之后**。
