@@ -140,6 +140,20 @@ t.describe("entity types", function()
         t.expect(h.mod.calc_agent_index("role", 12345)).to.equal(1)
     end)
 
+    t.it("rejects a non-positive or non-integer agent_count before calculating an index", function()
+        for _, invalid in ipairs({ 0, -1, 1.5, "2" }) do
+            local h = harness({ role = { nodes = { "role1" }, agent_count = invalid } })
+            t.expect(function()
+                h.mod.get("role")
+            end).to
+                .throw("agent_count must be a positive integer")
+            t.expect(function()
+                h.mod.all()
+            end).to
+                .throw("agent_count must be a positive integer")
+        end
+    end)
+
     t.it("formats the agent service name", function()
         local h = harness({ role = ROLE_TYPE })
         t.expect(h.mod.format_agent_service_name("role", 2)).to.equal(".entity_agent:role:2")

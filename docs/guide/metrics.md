@@ -123,6 +123,13 @@ MongoDB 耗时在调用方计时，量到的是业务真正等了多久——既
 
 两个服务用同一个名字声明了不同类型，或者直方图的桶边界不一致，合不了：丢掉后来的那一份，并记一条 ERROR 日志，而不是让数据莫名其妙少一半。
 
+## 标签门禁
+
+`scripts/ci/check_metrics_labels.lua` 会完整解析 `metrics.counter/gauge/histogram` 的调用和标签表。
+标签参数必须是字面量表，且每项都是字符串；变量表、拼接表或动态元素会直接让 CI 失败，因为工具
+无法静态证明它们保持低基数。`--self-test` 覆盖长表、跨行调用和动态标签 fail-closed，并在
+`lint.yml` 中与实仓扫描一起执行。
+
 ## Prometheus 配置
 
 ```yaml

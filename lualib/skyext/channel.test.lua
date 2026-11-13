@@ -172,13 +172,56 @@ t.describe("channel directory", function()
     t.it("creates one channel per name and reuses it", function()
         channel.reset()
         local a = assert(channel.get_or_create({ name = "world" }))
-        local b = assert(channel.get_or_create({ name = "world" }))
+        local b = assert(channel.get_or_create({
+            name = "world",
+            max_members = channel.DEFAULT_MAX_MEMBERS,
+            batch_size = channel.DEFAULT_BATCH_SIZE,
+            max_failures = channel.DEFAULT_MAX_FAILURES,
+        }))
         t.expect(a).to.equal(b)
         t.expect(channel.list()).to.equal({ "world" })
         t.expect(channel.get("world")).to.equal(a)
         t.expect(channel.remove("world")).to.equal(true)
         t.expect(channel.get("world")).to.be_nil()
         t.expect(channel.remove("world")).to.equal(false)
+    end)
+
+    t.it("rejects a conflicting configuration instead of locking in the first one", function()
+        channel.reset()
+        local original = assert(channel.get_or_create({ name = "world", max_members = 10 }))
+        local same, same_err = channel.get_or_create({ name = "world", max_members = 10 })
+        t.expect(same).to.equal(original)
+        t.expect(same_err).to.be_nil()
+
+        local conflict, err = channel.get_or_create({ name = "world", max_members = 20 })
+        t.expect(conflict).to.be_nil()
+        t.expect(err).to.equal("channel configuration conflict")
+        t.expect(channel.get("world")).to.equal(original)
+        t.expect(original.max_members).to.equal(10)
+    end)
+
+    t.it("treats a different authorize function as a configuration conflict", function()
+        channel.reset()
+        local first = function()
+            return true
+        end
+        local second = function()
+            return false
+        end
+        local original = assert(channel.get_or_create({ name = "world", authorize = first }))
+        t.expect(channel.get_or_create({ name = "world", authorize = first })).to.equal(original)
+        local conflict, err = channel.get_or_create({ name = "world", authorize = second })
+        t.expect(conflict).to.be_nil()
+        t.expect(err).to.equal("channel configuration conflict")
+        t.expect(channel.get("world")).to.equal(original)
+    end)
+
+    t.it("rejects a non-function authorize callback", function()
+        channel.reset()
+        local created, err = channel.get_or_create({ name = "world", authorize = true })
+        t.expect(created).to.be_nil()
+        t.expect(err).to.equal("authorize must be a function")
+        t.expect(channel.get("world")).to.be_nil()
     end)
 
     t.it("rejects an empty name", function()

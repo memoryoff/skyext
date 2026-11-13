@@ -68,6 +68,13 @@ local function envelope()
 end
 
 t.describe("role outbox receiver", function()
+    t.it("registers payment grant as an explicit framework command", function()
+        local h = harness()
+        t.expect(type(h.handler.framework_commands)).to.equal("table")
+        t.expect(type(h.handler.framework_commands.charge_grant)).to.equal("function")
+        t.expect(h.handler.handlers.charge_grant).to.be_nil()
+    end)
+
     t.it("registers the __apply_outbox_event handler with a fixed op type whitelist", function()
         local h = harness({ handle_result = { status = "COMMITTED" } })
         local entity = { id = 7, type_name = "role" }
@@ -139,6 +146,23 @@ t.describe("role 充值发奖 handler", function()
         -- 整值浮点（JSON/BSON 往返常见）必须按整数收下，不能被当成非法
         t.expect(handlers.validate(entity, { amount = 100.0, currency = "CNY" })).to.equal(true)
         t.expect(#bag.items).to.equal(0)
+    end)
+
+    t.it("keeps the largest integer amount positive instead of accepting an overflow", function()
+        local h = harness()
+        local entity, bag = entity_with_bag()
+        local handlers = h.handler.charge_handlers(entity, {})
+        t.expect(handlers.validate(entity, { amount = math.maxinteger, currency = "CNY" })).to.equal(true)
+        t.expect(handlers.apply(entity, { amount = math.maxinteger, currency = "CNY" })).to.equal(true)
+        t.expect(bag.items[1].count).to.equal(math.maxinteger)
+        t.expect(bag.items[1].count > 0).to.equal(true)
+
+        -- Lua integer 溢出会绕回负数；负数是 truthy，必须在 validate 里挡住，
+        -- 不能让它以负 count 进 add_item（实际变成扣减）
+        local wrapped = math.maxinteger + 1
+        t.expect(math.type(wrapped)).to.equal("integer")
+        t.expect(wrapped < 0).to.equal(true)
+        t.expect(handlers.validate(entity, { amount = wrapped, currency = "CNY" })).to.equal(false)
     end)
 
     t.it("refuses to apply when the bag module is missing", function()

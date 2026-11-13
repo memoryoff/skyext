@@ -222,6 +222,9 @@ local function harness(opts)
             h.events[#h.events + 1] = "on_resume:" .. key
         end,
     }
+    if opts.framework_commands ~= nil then
+        h.handler.framework_commands = opts.framework_commands
+    end
     local fake_skynet = setmetatable({
         start = function(fn)
             h.boot = fn
@@ -740,13 +743,76 @@ t.describe("entity_agent 框架内部命令", function()
 
     t.it("does not let a business handler hijack a framework command", function()
         local h = harness()
-        h.handler.handlers.charge_grant = function()
+        local called = false
+        h.handler.handlers.critical_status = function()
+            called = true
             return "hijacked"
         end
-        local ok, result, err = h.CMD.entity_call(7, "charge_grant", {})
+        local ok, result = h.CMD.entity_call(7, "critical_status", "srv_" .. string.rep("a", 64))
         t.expect(ok).to.equal(true)
-        t.expect(result).to.be_nil()
-        t.expect(err).to.equal("entity handler has no charge_handlers")
+        t.expect(called).to.equal(false)
+        t.expect(result.status).to.equal("UNKNOWN")
+    end)
+
+    t.it("installs game-provided framework commands through the explicit extension point", function()
+        local h = harness({
+            framework_commands = {
+                domain_probe = function(entity, value)
+                    return "domain", entity.id, value
+                end,
+            },
+        })
+        local ok, name, id, value = h.CMD.entity_call(7, "domain_probe", "value")
+        t.expect(ok).to.equal(true)
+        t.expect(name).to.equal("domain")
+        t.expect(id).to.equal(7)
+        t.expect(value).to.equal("value")
+    end)
+
+    t.it("refuses a framework extension that tries to override a built-in command", function()
+        local h = harness({
+            manual_start = true,
+            framework_commands = {
+                critical_status = function()
+                    return "hijacked"
+                end,
+            },
+        })
+        t.expect(function()
+            h.CMD.start(h.start_conf)
+        end).to
+            .throw("conflicts with a built%-in command")
+    end)
+
+    t.it("refuses a framework extension that collides with a business handler", function()
+        local h = harness({
+            manual_start = true,
+            framework_commands = {
+                change = function()
+                    return "hijacked"
+                end,
+            },
+        })
+        t.expect(function()
+            h.CMD.start(h.start_conf)
+        end).to
+            .throw("conflicts with a business handler")
+    end)
+
+    t.it("starts without loading the optional payment domain package", function()
+        local loaded = false
+        local h = harness({
+            module_sources = {
+                ["skyext.charge_order"] = function()
+                    loaded = true
+                    error("payment domain must stay optional")
+                end,
+            },
+        })
+        t.expect(loaded).to.equal(false)
+        local ok, result = h.CMD.entity_call(7, "critical_status", "srv_" .. string.rep("a", 64))
+        t.expect(ok).to.equal(true)
+        t.expect(result.status).to.equal("UNKNOWN")
     end)
 
     t.it("still rejects a genuinely unknown command", function()

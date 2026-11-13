@@ -1,6 +1,7 @@
 local skynet = require "skynet"
 local cluster = require "skynet.cluster"
 local cmd_api = require "skyext.cmd_api"
+local critical_config = require "skyext.critical_config"
 local types = require "skyext.entity.types"
 local entitymgr_mod = require "skyext.entity.entitymgr"
 local distributed_lock = require "skyext.distributed_lock"
@@ -18,9 +19,6 @@ local session
 local g_data_modules = {}
 -- 数据模块的声明顺序（来自 conf.modules）：on_load 正序、on_unload 逆序
 local g_module_order = {}
--- 支付发奖的 capability 签发器与摘要函数（进程内单例）
-local g_charge_issuer
-local g_charge_hash
 
 local CMD = {}
 
@@ -111,8 +109,33 @@ end
 -- 框架内部命令：由框架模块（Outbox 调度器、支付回调、对账 worker）经 `router.call`
 -- 调用。它们不属于业务 handler——`router.call` 固定走 `entity_call`，
 -- 只认 `handler.handlers[cmd]`，所以框架命令必须在这里注册，否则永远"unknown command"。
--- 同名时框架优先：业务 handler 覆盖 `charge_grant` 会绕过 capability 签发。
+-- 同名时框架优先。游戏层需要扩展框架命令时，只能在 handler.framework_commands
+-- 显式声明，不能把同名函数塞进 handler.handlers 绕过命令归属检查。
 local FRAMEWORK = {}
+
+local function install_framework_commands(commands)
+    if commands == nil then
+        return
+    end
+    if type(commands) ~= "table" then
+        error("handler.framework_commands must be a table", 0)
+    end
+    for cmd, fn in pairs(commands) do
+        if type(cmd) ~= "string" or not cmd:match("^[%a_][%w_]*$") then
+            error("framework command name is invalid: " .. tostring(cmd), 0)
+        end
+        if type(fn) ~= "function" then
+            error("framework command must be a function: " .. cmd, 0)
+        end
+        if FRAMEWORK[cmd] ~= nil then
+            error("framework command conflicts with a built-in command: " .. cmd, 0)
+        end
+        if handler.handlers[cmd] ~= nil then
+            error("framework command conflicts with a business handler: " .. cmd, 0)
+        end
+        FRAMEWORK[cmd] = fn
+    end
+end
 
 local function handler_of(cmd)
     local framework = FRAMEWORK[cmd]
@@ -219,60 +242,11 @@ end
 -- 静默跳过会让维护扫描看起来在跑、实际什么都没做。
 -- 定义在所有 FRAMEWORK 命令之前，避免函数体把同名局部误解析成全局
 local function config_collection(spec)
-    if type(spec) ~= "table" or type(spec.db) ~= "string" or type(spec.coll) ~= "string" then
+    local valid = critical_config.validate_collection_spec(spec)
+    if not valid then
         return nil
     end
     return require("skyext.mongo_conn").get_collection(spec.db, spec.coll)
-end
-
--- 框架内部命令（`router.call` 的落点）。都在实体队列内执行，参数是已经解析好的
--- 业务值，不做任何鉴权——鉴权由调用方（框架模块）负责，它们不会暴露给客户端。
-local function framework_charge_grant(entity, order)
-    if type(order) ~= "table" then
-        return nil, "order is required"
-    end
-    if type(handler.charge_handlers) ~= "function" then
-        return nil, "entity handler has no charge_handlers"
-    end
-    local charge_order = require "skyext.charge_order"
-    local critical = require "skyext.critical"
-    local capability = require "skyext.capability"
-    if not g_charge_issuer then
-        -- 白名单限定框架真正会用到的操作：空白名单等于放行任意 op_type
-        g_charge_issuer = assert(capability.new_issuer("charge_order", { "grant", "compensate" }))
-        g_charge_hash = require("crypto").hmac_sha256
-    end
-    local op_type = charge_order.grant_op_type(order)
-    local params = charge_order.grant_params(order)
-    local param_hash, herr = critical.param_hash_of(op_type, params, g_charge_hash)
-    if not param_hash then
-        error(herr, 0)
-    end
-    -- rid 必须和 critical 的 ctx.rid 同源：那里优先取 db_coords/entity.rid，
-    -- 直接用 entity.id 在自定义主键的实体类型上会静默绑定失败
-    local ctx, cerr = critical.coords_of(entity)
-    if not ctx then
-        return nil, cerr
-    end
-    local now = os.time()
-    local cap, cap_err = capability.issue(g_charge_issuer, {
-        rid = ctx.rid,
-        service_op_id = order.service_op_id,
-        op_type = op_type,
-        payload_hash = param_hash,
-        source_id = charge_order.source_id(order),
-        now = now,
-    })
-    if not cap then
-        error(cap_err, 0)
-    end
-    return charge_order.grant(entity, order, handler.charge_handlers(entity, order), {
-        capability = cap,
-        hash_fn = g_charge_hash,
-        now = now,
-        -- 归档后同 service_op_id 的历史只在冷账本，提交内核靠它阻断二次发奖
-        ledger = config_collection(type_config.critical_ledger),
-    })
 end
 
 FRAMEWORK.outbox_pump = function(entity, limit)
@@ -324,8 +298,6 @@ FRAMEWORK.critical_status = function(entity, op_id)
         ledger = ledger,
     })
 end
-
-FRAMEWORK.charge_grant = framework_charge_grant
 
 -- 迁移（P15）：导出会话快照。调用方必须先确认网关屏障与实体队列排空，
 -- 否则导出的是一个还在变的 out_buf
@@ -944,6 +916,7 @@ function CMD.start(conf)
     end
 
     handler = require("entity_handler." .. type_name)
+    install_framework_commands(handler.framework_commands)
     -- 可靠消息投递也走同一套命令解析：Outbox 回执这类框架命令不在 handler.handlers 里，
     -- 只查业务表会让它们永远 "no handler" 并进死信队列
     handler.resolve = handler_of

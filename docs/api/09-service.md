@@ -29,6 +29,11 @@
 
 一个 `entity_agent:<类型>:<序号>` 服务持有该类型的若干实体；实体归属由 `distributed_lock` 决定。
 
+业务 handler 可以声明 `framework_commands = { name = function(entity, ...) ... end }`，让
+`router.call` 通过同一套实体队列调用领域命令。框架内置命令优先，且扩展命令不得与内置命令或
+`handler.handlers` 同名；支付示例的 `charge_grant` 就通过该扩展点留在游戏层，引擎服务不再直接
+`require` 支付领域包。
+
 | 方法 | 行 | 作用 | 边界 |
 | --- | --- | --- | --- |
 | `CMD.entity_call(entity_id, cmd, ...)` | 116 | 调用实体方法：先本地执行，锁在别的节点时转发过去 | 返回 `true, 返回值...` 或 `false, reason`（handler 没执行）；**handler 抛错照常抛给调用方** |

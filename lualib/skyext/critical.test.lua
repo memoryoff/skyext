@@ -741,6 +741,24 @@ t.describe("critical 操作键", function()
         t.expect(critical.validate_service_op_id(123)).to.equal(false)
     end)
 
+    t.it("accepts only canonical service or Grant op ids for queries", function()
+        local critical = require "skyext.critical"
+        t.expect(critical.validate_op_id("srv_" .. string.rep("a", 64))).to.equal(true)
+        t.expect(critical.validate_op_id(string.rep("a", 32) .. "_0001")).to.equal(true)
+        for _, invalid in ipairs({
+            nil,
+            "",
+            string.rep("A", 32) .. "_0001",
+            string.rep("a", 31) .. "_0001",
+            string.rep("a", 32) .. "_001",
+            string.rep("a", 32) .. "_0000",
+            "srv_" .. string.rep("A", 64),
+            "srv_" .. string.rep("a", 63),
+        }) do
+            t.expect(critical.validate_op_id(invalid)).to.equal(false)
+        end
+    end)
+
     t.it("rejects op ids that are not safe Mongo field names", function()
         local critical = require "skyext.critical"
         t.expect(critical.field_name_safe("abc_0001")).to.equal(true)
@@ -752,6 +770,28 @@ t.describe("critical 操作键", function()
 end)
 
 t.describe("critical 查询与恢复", function()
+    t.it("rejects a malformed op id before reading memory or persisted state", function()
+        local h = harness()
+        local reads = 0
+        local ledger = {
+            critical_find = function()
+                reads = reads + 1
+                return nil, "must not be read"
+            end,
+        }
+        h.store.persisted_critical = { _critical_intent_v1 = { op_id = "srv_" .. string.rep("a", 64) } }
+
+        local result = h.critical.query(h.entity, string.rep("A", 32) .. "_0001", {
+            majority_read = true,
+            ledger = ledger,
+        })
+        t.expect(result.status).to.equal(h.critical.STATUS.UNKNOWN)
+        t.expect(result.reason).to.equal("invalid op_id")
+        t.expect(reads).to.equal(0)
+        -- 没有发生多数派读，也就不会把任何持久化状态装回内存
+        t.expect(h.store.refresh_calls or 0).to.equal(0)
+    end)
+
     t.it("reports NOT_STARTED, IN_PROGRESS and the committed result", function()
         local h = harness()
         t.expect(h.critical.query(h.entity, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0001").status).to.equal("NOT_STARTED")

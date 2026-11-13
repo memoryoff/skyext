@@ -30,6 +30,11 @@ jobs:
     - name: Search path check
       run: lua scripts/ci/check_paths.lua .
 
+    - name: Metric label cardinality check
+      run: |
+        lua scripts/ci/check_metrics_labels.lua --self-test
+        lua scripts/ci/check_metrics_labels.lua .
+
     - name: Luacheck linter
       uses: lunarmodules/luacheck@v1
 

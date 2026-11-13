@@ -120,6 +120,8 @@ end
 -- 也就是 1 元 = 100 金币。写成 CNY = 100 会把分当元，每笔多发 100 倍
 local CHARGE_RATE = { CNY = 1 }
 local CHARGE_RES = { res_type = 1, res_id = 1 } -- 金币在 res 表里的坐标
+local g_charge_issuer
+local g_charge_hash
 
 -- validate 与 apply 必须用同一份换算：两边各写一遍迟早会在浮点/取整上分叉，
 -- 而分叉的后果是"校验通过、apply 算出的数量不同"
@@ -166,6 +168,66 @@ function M.charge_handlers(entity, _order)
         end,
     }
 end
+
+-- 支付领域命令由游戏层显式注册。框架只提供通用命令扩展点，不知道 charge_order；
+-- 这样删除可选支付领域包时，entity_agent / 引擎测试仍能启动。
+local function charge_grant(entity, order)
+    if type(order) ~= "table" then
+        return nil, "order is required"
+    end
+    local types = require "skyext.entity.types"
+    local critical_config = require "skyext.critical_config"
+    local tc = types.get("role")
+    local ledger_spec = tc.critical_ledger
+    if not critical_config.validate_collection_spec(ledger_spec) then
+        return nil, "critical_ledger is not configured"
+    end
+
+    local charge_order = require "skyext.charge_order"
+    local critical = require "skyext.critical"
+    local capability = require "skyext.capability"
+    if not g_charge_issuer then
+        -- 白名单限定框架真正会用到的操作：空白名单等于放行任意 op_type
+        g_charge_issuer = assert(capability.new_issuer("charge_order", { "grant", "compensate" }))
+        g_charge_hash = require("crypto").hmac_sha256
+    end
+    local op_type = charge_order.grant_op_type(order)
+    local params = charge_order.grant_params(order)
+    local param_hash, herr = critical.param_hash_of(op_type, params, g_charge_hash)
+    if not param_hash then
+        error(herr, 0)
+    end
+    -- rid 必须和 critical 的 ctx.rid 同源：那里优先取 db_coords/entity.rid，
+    -- 直接用 entity.id 在自定义主键的实体类型上会静默绑定失败
+    local ctx, cerr = critical.coords_of(entity)
+    if not ctx then
+        return nil, cerr
+    end
+    local now = os.time()
+    local cap, cap_err = capability.issue(g_charge_issuer, {
+        rid = ctx.rid,
+        service_op_id = order.service_op_id,
+        op_type = op_type,
+        payload_hash = param_hash,
+        source_id = charge_order.source_id(order),
+        now = now,
+    })
+    if not cap then
+        error(cap_err, 0)
+    end
+    local ledger = require("skyext.mongo_conn").get_collection(ledger_spec.db, ledger_spec.coll)
+    return charge_order.grant(entity, order, M.charge_handlers(entity, order), {
+        capability = cap,
+        hash_fn = g_charge_hash,
+        now = now,
+        -- 归档后同 service_op_id 的历史只在冷账本，提交内核靠它阻断二次发奖
+        ledger = ledger,
+    })
+end
+
+M.framework_commands = {
+    charge_grant = charge_grant,
+}
 
 function M.on_load(entity)
     log.info("role entity loaded", "rid", entity.id)

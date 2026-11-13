@@ -1,5 +1,6 @@
 local skynet = require "skynet"
 local config = require "skyext.config"
+local critical_config = require "skyext.critical_config"
 local log = require "skyext.log"
 local node_shutdown_api = require "skyext.node_shutdown_api"
 
@@ -75,7 +76,7 @@ function M.self_check()
         local tc = type(entity_types) == "table" and entity_types[type_name] or nil
         for _, key in ipairs({ "critical_ledger", "critical_jobs" }) do
             local spec = type(tc) == "table" and tc[key] or nil
-            if type(spec) ~= "table" or type(spec.db) ~= "string" or type(spec.coll) ~= "string" then
+            if not critical_config.validate_collection_spec(spec) then
                 report.problems[#report.problems + 1] = string.format(
                     "critical_maintenance is enabled but entity type %s has no valid %s config (db/coll required)",
                     tostring(type_name),

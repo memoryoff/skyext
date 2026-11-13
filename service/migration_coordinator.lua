@@ -12,8 +12,8 @@
 -- 适配器契约见 lualib/skyext/migration.lua 的 deps：
 --   list_entities() -> { { id, conn_id, owner_epoch, critical_unknown, busy }, ... }
 --   quiesce / freeze / export / transfer / handoff / activate(entity, barrier_id) -> true | nil, reason
+--   fallback(entity, reason)  失败/取消/不可续接时的安全出口；缺了会留下冻结客户端
 --   probe(entity) -> bool     可选，BUSY 实体的限时等待
---   fallback(entity, reason)  可选，降级通知（提示续接或重登）
 --   init(conf)                可选，拿到本服务的配置表
 --   begin_round()             可选，新一轮开始时清掉上一次取消的状态
 --   abort(reason)             可选，取消时清理还在屏障期的客户端（R-01 兜底）
@@ -41,7 +41,8 @@ local g_cancelled = false
 -- 最后一次取消的兜底清理结果，供 CMD.stats 观测
 local g_abort_stats
 
--- 六个阶段一个都不能少：缺哪一步都会得到一个"宣称迁移成功、会话没送到"的假象
+-- 正常阶段和失败出口一个都不能少：缺任何一项都会得到"宣称迁移成功、会话没送到"
+-- 或"迁移失败但客户端仍停在冻结态"的假象
 local REQUIRED_DEPS = {
     "list_entities",
     "quiesce",
@@ -50,12 +51,12 @@ local REQUIRED_DEPS = {
     "transfer",
     "handoff",
     "activate",
+    "fallback",
 }
 
--- 可选阶段：probe 只影响 BUSY 实体的等待策略，fallback 只影响降级提示
+-- 可选阶段：probe 只影响 BUSY 实体的等待策略
 local OPTIONAL_DEPS = {
     "probe",
-    "fallback",
 }
 
 local function missing_deps(adapter)

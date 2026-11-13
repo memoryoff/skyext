@@ -44,12 +44,16 @@ local DEFAULT_TTL = 30
 -- 只有这三条受信任分发链（加支付适配层）能持有 issuer。命名空间本身不是鉴权材料，
 -- 但把可签发来源收口到固定集合，可以挡住"随便造一个 issuer 再自签 cap"的路径。
 -- 同 VM 内可任意执行 Lua 的攻击者不是本模块的防御边界（见文件头注释）。
-M.ALLOWED_NAMESPACES = {
+local ALLOWED_NAMESPACES = {
     outbox = true,
     charge_order = true,
     payment = true,
     saga = true,
 }
+
+function M.is_allowed_namespace(namespace)
+    return type(namespace) == "string" and ALLOWED_NAMESPACES[namespace] == true
+end
 
 local function check_text(value, name)
     if type(value) ~= "string" or #value == 0 or #value > 256 then
@@ -64,7 +68,7 @@ function M.new_issuer(namespace, allowed_op_types)
     if not ns then
         return nil, err
     end
-    if not M.ALLOWED_NAMESPACES[ns] then
+    if not M.is_allowed_namespace(ns) then
         return nil, "namespace is not a trusted dispatch entry"
     end
     -- 空白名单原本等价于"放行任意 op_type"，等于把业务白名单交给了签发调用方。

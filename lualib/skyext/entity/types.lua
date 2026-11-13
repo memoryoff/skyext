@@ -5,6 +5,16 @@ local M = {}
 
 local g_types = nil
 
+local function validate_type(type_name, type_config)
+    if type(type_config) ~= "table" then
+        error(string.format("entity type %s config must be a table", tostring(type_name)), 0)
+    end
+    local agent_count = type_config.agent_count
+    if agent_count ~= nil and (math.type(agent_count) ~= "integer" or agent_count < 1) then
+        error(string.format("entity type %s agent_count must be a positive integer", tostring(type_name)), 0)
+    end
+end
+
 local function ensure_loaded()
     if g_types then
         return
@@ -14,6 +24,9 @@ local function ensure_loaded()
     local types = config.get_table("entity_types")
     if type(types) ~= "table" then
         error("entity_types is not configured")
+    end
+    for type_name, type_config in pairs(types) do
+        validate_type(type_name, type_config)
     end
     g_types = types
 end

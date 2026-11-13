@@ -23,6 +23,7 @@ local function stage_adapter()
         transfer = stage(),
         handoff = stage(),
         activate = stage(),
+        fallback = stage(),
     }
 end
 
@@ -131,6 +132,16 @@ t.describe("migration_coordinator 启动门禁", function()
         local ok, err = h.CMD.start(enabled_conf({ adapter = "game.migration_adapter" }))
         t.expect(ok).to.equal(false)
         t.expect(err:find("handoff", 1, true) ~= nil).to.equal(true)
+        t.expect(#h.hooks).to.equal(0)
+    end)
+
+    t.it("refuses to start without the failure fallback", function()
+        local adapter = stage_adapter()
+        adapter.fallback = nil
+        local h = harness({ modules = { ["game.migration_adapter"] = adapter } })
+        local ok, err = h.CMD.start(enabled_conf({ adapter = "game.migration_adapter" }))
+        t.expect(ok).to.equal(false)
+        t.expect(err:find("fallback", 1, true) ~= nil).to.equal(true)
         t.expect(#h.hooks).to.equal(0)
     end)
 

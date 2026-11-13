@@ -49,6 +49,9 @@ function M.new(opts)
     local max_members = opts.max_members or M.DEFAULT_MAX_MEMBERS
     local batch_size = opts.batch_size or M.DEFAULT_BATCH_SIZE
     local max_failures = opts.max_failures or M.DEFAULT_MAX_FAILURES
+    if opts.authorize ~= nil and type(opts.authorize) ~= "function" then
+        return nil, "authorize must be a function"
+    end
     for label, value in pairs({ max_members = max_members, batch_size = batch_size, max_failures = max_failures }) do
         if math.type(value) ~= "integer" or value < 1 then
             return nil, label .. " must be a positive integer"
@@ -203,6 +206,18 @@ function M.get_or_create(opts)
     end
     local existing = g_directory[name]
     if existing then
+        local candidate, err = M.new(opts)
+        if not candidate then
+            return nil, err
+        end
+        if
+            existing.max_members ~= candidate.max_members
+            or existing.batch_size ~= candidate.batch_size
+            or existing.max_failures ~= candidate.max_failures
+            or existing.authorize ~= candidate.authorize
+        then
+            return nil, "channel configuration conflict"
+        end
         return existing
     end
     local channel, err = M.new(opts)

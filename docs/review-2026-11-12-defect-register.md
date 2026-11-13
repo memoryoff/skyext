@@ -27,8 +27,8 @@
 | 对抗审查发现 · 已修 | 14 | A-01 ~ A-14，见 §8 |
 | 第二轮源码审计 · 已修 | 8 | B-01 ~ B-08（DB Fence / Critical Commit），见 §10 |
 | 第三轮对抗审查 · 已修 | 11 | C-01 ~ C-11，见 §11 |
-| 第四轮全量对抗审查 · 已修 | 27 | D-01 ~ D-25、D-36、D-37，见 §12 |
-| 第四轮全量对抗审查 · 待修 | 10 | D-26 ~ D-35（D-33/D-35 为部分修），见 §12 |
+| 第四轮全量对抗审查 · 已修 | 36 | D-01 ~ D-30、D-32 ~ D-37，见 §12 |
+| 第四轮全量对抗审查 · 待环境 | 1 | D-31 已改为切主前后双窗口门禁，待真实三节点副本集复跑 |
 | 复核 `5bc8073` · 已修 | 8 | RV-01 ~ RV-08，见 §13 |
 | 阻塞生产的 P0 | 1（已修） | 原有 5 条 P0 已收敛；本轮发现并修复 A-06 递归合并引入的配置执行环境回归，见 §12.7 |
 | 需真实环境验证 | 7 | V-01 / V-06 已实测通过；V-02 ~ V-05 需要多节点与故障注入；V-07 已提供可复跑脚本 |
@@ -87,7 +87,7 @@
 | R-04（完成） | `pump` 连续投递失败达到 `MAX_DELIVER_ATTEMPTS=5` 时把事件标 `FAILED` 并继续投后续事件，解决「毒事件永久阻塞同角色 outbox」；`FAILED` 可腾 | `outbox.test.lua` 3 例 |
 | R-09 | `critical` 在同一次 CAS 分配 `_critical_outbox_seq`，事件带 `causal_seq`；`pending_events` 优先按因果序号排序，缺失时回退 `created_at` | `critical.test.lua` 1 例、`outbox.test.lua` 2 例 |
 | R-10 | Saga 四组复杂交易：双角色 exactly-once、补偿 ACK 丢失、协调者崩溃接管、重复手工补偿拒绝 | `saga.test.lua` 4 例 |
-| R-12 | 新增 `scripts/ci/check_metrics_labels.lua`，禁止 `conn_id` / `rid` / `msg_id` 等高基数字段作指标标签，接入 `lint.yml` | 本地 185 files 通过 |
+| R-12 | 新增 `scripts/ci/check_metrics_labels.lua`，禁止 `conn_id` / `rid` / `msg_id` 等高基数字段作指标标签，接入 `lint.yml` | 本地 187 files 通过 |
 
 > R-01 只做到**兜底清理**，没有给跨节点 RPC 加 deadline；卡在 `cluster.call` 里的协程仍无法中断，
 > 见 R-01 条目的「建议修复 ②」，这一半仍未完成。
@@ -192,7 +192,7 @@
 
 | 编号 | 验证项 | 现状 | 通过标准 |
 | --- | --- | --- | --- |
-| V-01 · P1-06 | 三节点副本集 `rs.stepDown()` + 并发关键操作 | **已通过（2026-11-12 重跑，用加强后的脚本）**：`topology: set=rs0 members=3`、`primary moved: 27021 -> 27022`、`documents=1 version=8 hits=8`；连续两次执行 primary 分别换到 27022 / 27023，无重复文档。集成测试在同一副本集上 124/124。负例（连不上）确认 exit=1 | 无重复资产效果；所有 UNKNOWN 能被 `critical.query` 归位；`_critical_ops_v1` 同一 op_id 只有一条 |
+| V-01 · P1-06 | 三节点副本集 `rs.stepDown()` + 并发关键操作 | **待用新门禁复跑**：2026-11-12 的旧脚本已证明切主、无重复文档和负例失败；D-31 发现旧脚本不能证明切主瞬间仍有写入，现已改为持续 writer + `pre_hits/post_hits` 双窗口断言，需在真实三节点副本集重跑后更新证据 | 切主前后都有并发成功写；无重复资产效果；所有 UNKNOWN 能被 `critical.query` 归位；`_critical_ops_v1` 同一 op_id 只有一条 |
 | V-02 · P1-07 | 双 skynet 节点 + 真实客户端迁移回环 | 待跑 | 连接不断、`session_epoch` 不变、`owner_epoch` +1、下行序号不重不漏、在途上行不重复执行 |
 | V-03 | Mongo 网络分区（minority 侧写入） | 待跑 | 写入 fail-closed，恢复后对账收敛 |
 | V-04 | etcd 租约抖动（暂停 10s） | 待跑 | 实体不丢锁、不重复加载，恢复后服务发现收敛 |
@@ -617,8 +617,10 @@ D-17（TS SDK bigint/binary 契约）、D-18（ABORTED 维护归档水位）、D
 D-20（action 冲突）、D-21（解除对账阻断）、D-22（生产 schedule_grant）、D-23（非法摘要进 DLQ）、
 D-24/D-25/D-36（网关代际与不可续接会话）、D-37（Outbox 扫描页积压指标）。
 
-**仍未修（下一批）**：D-26 ~ D-35；其中 D-33（维护配置已 fail-fast，entity_agent 仍 fail-closed 返回
-UNKNOWN）与 D-35（fallback 失败保留 inflight 已修，但 fallback 仍不在必需依赖门禁里）为部分修。
+**后续批次已修（D-26 ~ D-35）**：capability 命名空间私有化、channel 配置冲突拒绝、critical query
+op_id 门禁、charge_count 边界回归、metrics label 完整解析并接入 lint CI、agent_count 启动校验、
+critical 配置统一校验、框架命令扩展点移除 entity_agent 对支付包的硬依赖、fallback 进入必需依赖。
+D-31 的切主脚本已改成前后双窗口门禁，但真实副本集复跑前只记“已修、待环境”。
 
 **结构性结论**：框架把"正常路径"写得很严密，但"异常路径的出口"普遍缺失。
 隔离、恢复任务、对账、迁移降级四处都是"进入条件清楚、退出条件没写"。
@@ -663,16 +665,16 @@ P0-1 与 P0-2 是同一个病的两个实例。
 | D-23 | 接收侧"永久无效"直接 ACK：资产已扣、无 FAILED 记录、不可重放；`outbox.event` 只校验 `param_hash` 长度不校验 hex。【已修 + 已验证：永久无效信封抛错进入可靠消息死信；64 字符摘要额外校验小写 hex；`outbox.test.lua`/`critical.test.lua` 覆盖】 |
 | D-24 | `replay` 下行不带 `owner_epoch`，`push_allowed` 对 nil 一律放行 → 屏障与代际过滤在重放路径失效。【已修 + 已验证：`session.replay` 的 push 携带当前 `owner_epoch`；`session.test.lua` 断言 attach 后重放代际】 |
 | D-25 | `unresumable` 会话仍被迁移并报 READY → 迁移"成功"但客户端存在永久缺口。【已修 + 已验证：实体枚举暴露 `unresumable`，适配器过滤，编排状态机兜底降级；`entitymgr.test.lua`、`migration.test.lua`、`migration_adapter.test.lua` 覆盖】 |
-| D-26 | `capability.ALLOWED_NAMESPACES` 是导出的可变普通表 → 任何模块一行赋值即可自签 cap |
-| D-27 | `channel.get_or_create` 静默忽略同名频道的第二份配置 → 鉴权策略被首个创建者锁定；`authorize` 未做类型校验 |
-| D-28 | `critical.query` 不校验 op_id 格式 → 大写 hex/少一位被当"从未执行" |
-| D-29 | 示例 `charge_count` 乘法溢出后负值仍通过 validate |
-| D-30 | `check_metrics_labels` 只扫 ≤400 字符的字面量标签表，变量/长表直接跳过 → 门禁假绿 |
-| D-31 | `verify_replica_stepdown.sh` 用 `sleep 0.5` 后 stepDown，不证明切主瞬间仍有并发写 |
-| D-32 | `entity_types.agent_count = 0` 无下界校验 → 节点"就绪"但无 agent，`% 0` 抛错 |
-| D-33 | `critical_ledger` 未配置时 maintenance 静默回退默认集合、entity_agent 返回 UNKNOWN，三处口径不一致 |
-| D-34 | 引擎硬依赖领域包 `skyext.charge_order`（`entity_agent.lua:230-237`）→ `framework_boundary_v1` 的"可删除"只在测试路径成立 |
-| D-35 | `fallback` 清空 `g_inflight` 抵消 abort 的"失败可重试"；且 `fallback` 不在 `REQUIRED_DEPS` |
+| D-26 | `capability.ALLOWED_NAMESPACES` 是导出的可变普通表 → 任何模块一行赋值即可自签 cap。【已修 + 已验证：命名空间表私有化，只暴露 `is_allowed_namespace`；`capability.test.lua` 验证外部写同名模块字段无法扩展签发边界】 |
+| D-27 | `channel.get_or_create` 静默忽略同名频道的第二份配置 → 鉴权策略被首个创建者锁定；`authorize` 未做类型校验。【已修 + 已验证：按有效配置和 `authorize` 身份比较，冲突返回 `channel configuration conflict`；`channel.test.lua` 覆盖复用、冲突及非法回调】 |
+| D-28 | `critical.query` 不校验 op_id 格式 → 大写 hex/少一位被当"从未执行"。【已修 + 已验证：只接受规范 `srv_<64 lowercase hex>` 或 Grant `<32 hex>_<4 hex>`，非法值在任何状态读取前返回 `UNKNOWN/invalid_op_id`；`critical.test.lua` 断言冷账本未读】 |
+| D-29 | 示例 `charge_count` 乘法溢出后负值仍通过 validate。【已修 + 已验证：现有 `math.type + count > 0` 防线保留，新增最大整数与绕回负数回归用例；`role.test.lua` 覆盖】 |
+| D-30 | `check_metrics_labels` 只扫 ≤400 字符的字面量标签表，变量/长表直接跳过 → 门禁假绿。【已修 + 已验证：完整匹配指标调用并平衡解析标签表，动态标签 fail-closed，加入自测并接入 `lint.yml`；本地 `--self-test` 6 例、实仓 187 files 通过】 |
+| D-31 | `verify_replica_stepdown.sh` 用 `sleep 0.5` 后 stepDown，不证明切主瞬间仍有并发写。【已修、待环境：writer 持续到新 primary 确认后停止，同一 CAS 原子累计 `pre_hits/post_hits`，门禁要求切主前后各自达到 worker 数；真实三节点副本集待复跑】 |
+| D-32 | `entity_types.agent_count = 0` 无下界校验 → 节点"就绪"但无 agent，`% 0` 抛错。【已修 + 已验证：类型配置首次加载统一校验，缺省仍为 1，0/负数/非整数直接拒绝；`types.test.lua` 覆盖】 |
+| D-33 | `critical_ledger` 未配置时 maintenance 静默回退默认集合、entity_agent 返回 UNKNOWN，三处口径不一致。【已修 + 已验证：新增 `critical_config` 共享形状校验，maintenance、launcher、entity_agent 同口径；`critical_config.test.lua`、`launcher.test.lua`、`entity_agent.test.lua` 覆盖】 |
+| D-34 | 引擎硬依赖领域包 `skyext.charge_order`（`entity_agent.lua:230-237`）→ `framework_boundary_v1` 的"可删除"只在测试路径成立。【已修 + 已验证：`entity_agent` 增加 `handler.framework_commands` 扩展点，支付发奖实现移回游戏层 role；内置命令和业务命令禁止被覆盖。`entity_agent.test.lua` 在禁止加载支付包的前提下启动并执行框架命令】 |
+| D-35 | `fallback` 清空 `g_inflight` 抵消 abort 的"失败可重试"；且 `fallback` 不在 `REQUIRED_DEPS`。【已修 + 已验证：保留失败 inflight 的既有修复，并将 fallback 提升为必需依赖；`migration_coordinator.test.lua` 缺 fallback 时拒绝启动】 |
 | D-36 | 迁移 `resume` 中网关 RPC 抛错时 `owner_epoch` 已推进且不回滚 → 下行被网关当迟到包丢弃。【已修 + 已验证：bind 用 pcall + 抛错/拒绝双回滚；`session.test.lua` 覆盖】 |
 | D-37 | `skyext_outbox_pending` gauge 是"最后一个被 pump 的角色"，不能当积压告警。【已修 + 已验证：移除错误的 last-role gauge，改为 `skyext_outbox_pending_scanned` 扫描页索引汇总；`outbox_worker.test.lua` 断言 `scan_pending`】 |
 
@@ -684,7 +686,9 @@ P0-1 与 P0-2 是同一个病的两个实例。
 2. **测试验证的是函数，不是调用链**。Outbox 124 个用例全绿，但生产链路
    `outbox_pump → pump_entity` 不传 `now`（上轮 C-01）、不传 `ledger`（本轮 D-03）。
    建议加契约测试：直接加载真实 `entity_agent` 的 `FRAMEWORK` 表，断言入口参数形状。
-3. **"可删除的领域包"是文档承诺而非可执行事实**（D-34）。
+3. **"可删除的领域包"已从文档承诺推进为可执行边界**（D-34）：`entity_agent` 不再硬依赖
+   `skyext.charge_order`，支付发奖通过游戏层框架命令扩展点接线；支付包自身仍留在
+   `lualib/skyext/`，后续是否移目录仍按 `framework_boundary_v1.md` 单独评估。
 
 ### 12.6 与 §11.3 推测的关系
 

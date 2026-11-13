@@ -14,6 +14,7 @@ local skynet = require "skynet"
 local cmd_api = require "skyext.cmd_api"
 local config = require "skyext.config"
 local critical = require "skyext.critical"
+local critical_config = require "skyext.critical_config"
 local critical_maintenance = require "skyext.critical_maintenance"
 local critical_reconciler = require "skyext.critical_reconciler"
 local gm_api = require "skyext.gm_api"
@@ -150,9 +151,9 @@ function CMD.start(conf)
     local ledger_spec = tc.critical_ledger
     local jobs_spec = tc.critical_jobs
     local invalid
-    if type(ledger_spec) ~= "table" or type(ledger_spec.db) ~= "string" or type(ledger_spec.coll) ~= "string" then
+    if not critical_config.validate_collection_spec(ledger_spec) then
         invalid = "critical_ledger"
-    elseif type(jobs_spec) ~= "table" or type(jobs_spec.db) ~= "string" or type(jobs_spec.coll) ~= "string" then
+    elseif not critical_config.validate_collection_spec(jobs_spec) then
         invalid = "critical_jobs"
     end
     if invalid then

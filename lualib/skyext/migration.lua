@@ -187,7 +187,7 @@ end
 -- deps:
 --   list_entities() -> { { id = , conn_id = , owner_epoch = , critical_unknown = bool }, ... }
 --   quiesce / freeze / export / transfer / handoff / activate
---   fallback(entity, reason)   降级处理（提示断线续接或重新登录）
+--   fallback(entity, reason)   必需：降级处理（解除屏障，提示断线续接或重新登录）
 --   now
 function M.run(deps, opts)
     opts = opts or {}

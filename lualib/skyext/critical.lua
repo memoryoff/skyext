@@ -195,6 +195,17 @@ function M.validate_service_op_id(service_op_id)
     return true
 end
 
+-- 查询键只允许两类规范形式：内部操作的 service_op_id，或客户端 Grant 的 op_id。
+-- 不做大小写/长度归一化：非法键若被当成 NOT_STARTED，调用方可能据此重放一次操作。
+function M.validate_op_id(op_id)
+    local ok = M.validate_service_op_id(op_id)
+    if ok then
+        return true
+    end
+    local parsed = grant.parse_op_id(op_id)
+    return parsed ~= nil
+end
+
 -- Mongo 字段名不能含 NUL / `.` / 以 `$` 开头。op_id 会直接拼进 `$set` 的路径
 local function field_name_safe(op_id)
     if type(op_id) ~= "string" or #op_id == 0 or #op_id > 128 then
@@ -1150,7 +1161,7 @@ function M.execute_internal(entity, service_op_id, op_type, params, handlers, op
     end
     -- cap 必须来自受信任分发入口的命名空间，不能是任意自造 issuer 签出来的
     local cap_namespace = capability.namespace_of(cap)
-    if not cap_namespace or not capability.ALLOWED_NAMESPACES[cap_namespace] then
+    if not capability.is_allowed_namespace(cap_namespace) then
         return decision(M.STATUS.INTERNAL_AUTH_DENIED, nil, M.NO_CACHE, {
             reason = "capability has an untrusted namespace",
         })
@@ -1197,6 +1208,9 @@ end
 -- 只报告**持久化消费状态**，不报告未持久化的纯读预检
 function M.query(entity, op_id, opts)
     opts = opts or {}
+    if not M.validate_op_id(op_id) then
+        return { status = M.STATUS.UNKNOWN, reason = "invalid op_id" }
+    end
     local ctx, cerr = coords_of(entity)
     if not ctx then
         return { status = M.STATUS.UNKNOWN, reason = cerr }

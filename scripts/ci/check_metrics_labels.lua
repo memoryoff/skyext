@@ -87,6 +87,14 @@ local function mask(src)
                 out[#out + 1] = (src:sub(i, stop - 1):gsub("[^\n]", " "))
                 i = stop
             end
+        elseif c == "[" and src:match("^%[(=*)%[", i) then
+            -- 长字符串也可能包含括号、逗号或伪指标调用；整体遮罩，避免破坏调用解析
+            local eq = src:match("^%[(=*)%[", i)
+            local closer = "]" .. eq .. "]"
+            local stop = src:find(closer, i + 2 + #eq, true)
+            stop = stop and (stop + #closer - 1) or n
+            out[#out + 1] = (src:sub(i, stop):gsub("[^\n]", " "))
+            i = stop + 1
         elseif c == '"' or c == "'" then
             local quote = c
             local j = i + 1
@@ -111,29 +119,114 @@ local function mask(src)
     return table.concat(out)
 end
 
--- 找到一次指标调用里的标签表：调用起点之后、右括号之前的第一对花括号。
--- 没有标签表（两参数形式）就跳过，不能把后面无关的 table 当标签。
--- 位置全部在遮罩上算，返回的区间用于从原文取标签名
-local function label_block(masked, from)
-    local close_paren = masked:find(")", from, true)
-    local open = masked:find("{", from, true)
-    if not open or (close_paren and open > close_paren) then
-        return nil, from
+local function trimmed(masked, first, last)
+    while first <= last and masked:sub(first, first):match("%s") do
+        first = first + 1
     end
+    while last >= first and masked:sub(last, last):match("%s") do
+        last = last - 1
+    end
+    return first, last
+end
+
+-- 找到与调用左括号配对的右括号。指标 help 文本已经先被遮罩，里面的括号
+-- 不会干扰；这里不设长度上限，避免跨行长表被静默跳过。
+local function call_close(masked, open_paren)
     local depth = 0
-    local limit = math.min(#masked, open + 400)
-    for i = open, limit do
+    for i = open_paren, #masked do
+        local c = masked:sub(i, i)
+        if c == "(" then
+            depth = depth + 1
+        elseif c == ")" then
+            depth = depth - 1
+            if depth == 0 then
+                return i
+            end
+        end
+    end
+    return nil
+end
+
+-- 在调用参数里按顶层逗号分段；括号、方括号和花括号内的逗号不属于参数分隔符。
+local function split_args(masked, first, last)
+    local ranges = {}
+    local start = first
+    local parens, brackets, braces = 0, 0, 0
+    for i = first, last do
+        local c = masked:sub(i, i)
+        if c == "(" then
+            parens = parens + 1
+        elseif c == ")" then
+            parens = parens - 1
+        elseif c == "[" then
+            brackets = brackets + 1
+        elseif c == "]" then
+            brackets = brackets - 1
+        elseif c == "{" then
+            braces = braces + 1
+        elseif c == "}" then
+            braces = braces - 1
+        elseif c == "," and parens == 0 and brackets == 0 and braces == 0 then
+            ranges[#ranges + 1] = { first = start, last = i - 1 }
+            start = i + 1
+        end
+    end
+    ranges[#ranges + 1] = { first = start, last = last }
+    return ranges
+end
+
+local function matching_brace(masked, open)
+    local depth = 0
+    for i = open, #masked do
         local c = masked:sub(i, i)
         if c == "{" then
             depth = depth + 1
         elseif c == "}" then
             depth = depth - 1
             if depth == 0 then
-                return { open = open, stop = i }, i
+                return i
             end
         end
     end
-    return nil, from
+    return nil
+end
+
+-- 标签参数必须是静态字面量表，且每个元素都是字符串。变量表、拼接表或表内
+-- 动态表达式都无法由 CI 证明低基数，必须 fail-closed，而不是静默跳过。
+local function label_names(src, masked, first, last)
+    first, last = trimmed(masked, first, last)
+    if first > last or masked:sub(first, first) ~= "{" then
+        return nil, "metric labels must be a literal table; dynamic labels cannot be audited"
+    end
+    local close = matching_brace(masked, first)
+    if not close or close ~= last then
+        return nil, "metric labels must be one complete literal table"
+    end
+    if close == first + 1 then
+        return {}
+    end
+
+    local labels = {}
+    local ranges = split_args(masked, first + 1, close - 1)
+    for index, range in ipairs(ranges) do
+        local a, b = trimmed(masked, range.first, range.last)
+        if a > b then
+            if index == #ranges then
+                -- 允许尾随逗号
+                break
+            end
+            return nil, "metric labels must not contain empty entries"
+        end
+        local quote = masked:sub(a, a)
+        if (quote ~= '"' and quote ~= "'") or masked:sub(b, b) ~= quote then
+            return nil, "metric labels must contain only literal strings"
+        end
+        if masked:sub(a + 1, b - 1):find("%S") then
+            return nil, "metric labels must contain only literal strings"
+        end
+        labels[#labels + 1] = src:sub(a + 1, b - 1)
+    end
+    return labels
 end
 
 local function check_file(path, src)
@@ -151,26 +244,83 @@ local function check_file(path, src)
         if not start_pos then
             break
         end
-        local block, block_end = label_block(masked, end_pos)
-        if block then
-            -- 从原文取标签名：遮罩把字符串内容抹掉了
-            local text = src:sub(block.open, block.stop)
-            for label in text:gmatch('"([%w_%-%.]+)"') do
-                if FORBIDDEN[label] then
-                    problems[#problems + 1] = string.format(
-                        "%s:%d: metric label %q is high-cardinality; use a result/state category instead",
-                        path,
-                        line_of(src, start_pos),
-                        label
-                    )
+        local close_paren = call_close(masked, end_pos)
+        if not close_paren then
+            problems[#problems + 1] =
+                string.format("%s:%d: metric call has no matching close parenthesis", path, line_of(src, start_pos))
+            break
+        end
+        local args = split_args(masked, end_pos + 1, close_paren - 1)
+        if #args > 3 then
+            problems[#problems + 1] =
+                string.format("%s:%d: metric call has unexpected extra arguments", path, line_of(src, start_pos))
+        elseif #args == 3 then
+            local labels, label_err = label_names(src, masked, args[3].first, args[3].last)
+            if not labels then
+                problems[#problems + 1] = string.format("%s:%d: %s", path, line_of(src, start_pos), label_err)
+            else
+                for _, label in ipairs(labels) do
+                    if FORBIDDEN[label] then
+                        problems[#problems + 1] = string.format(
+                            "%s:%d: metric label %q is high-cardinality; use a result/state category instead",
+                            path,
+                            line_of(src, start_pos),
+                            label
+                        )
+                    end
                 end
             end
-            cursor = block_end + 1
-        else
-            cursor = end_pos
         end
+        cursor = close_paren + 1
     end
     return problems
+end
+
+local function self_test()
+    local cases = {
+        { name = "short literal label", source = [[metrics.counter("x", "help", { "rid" })]], expected = 1 },
+        {
+            name = "long literal label table",
+            source = 'metrics.counter("x", "help", {' .. string.rep(" ", 500) .. '"rid"})',
+            expected = 1,
+        },
+        {
+            name = "dynamic labels fail closed",
+            source = [[local labels = { "ok" }; metrics.gauge("x", "help", labels)]],
+            expected = 1,
+        },
+        {
+            name = "dynamic label entry fails closed",
+            source = [[metrics.histogram("x", "help", { "ok", some_label })]],
+            expected = 1,
+        },
+        {
+            name = "balanced multiline table",
+            source = 'metrics.counter(\n "x",\n "help (total)",\n {\n  "status",\n  "rid",\n }\n)',
+            expected = 1,
+        },
+        { name = "safe table", source = [[metrics.counter("x", "help", { "status", "reason" })]], expected = 0 },
+    }
+    for _, case in ipairs(cases) do
+        local got = #check_file("self-test.lua", case.source)
+        if got ~= case.expected then
+            io.stderr:write(
+                string.format(
+                    "metrics label self-test %q failed: expected %d problem(s), got %d\n",
+                    case.name,
+                    case.expected,
+                    got
+                )
+            )
+            os.exit(1)
+        end
+    end
+    print(string.format("metrics label self-test passed (%d cases)", #cases))
+end
+
+if arg[1] == "--self-test" then
+    self_test()
+    os.exit(0)
 end
 
 local files = {}
