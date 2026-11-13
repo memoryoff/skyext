@@ -6,16 +6,21 @@
 export const CRITICAL_GRANT_VERSION = 1;
 export const MAX_SEQ = 0xffff;
 
+/** 64-bit 实体 ID：安全范围内用 number，超出时用 bigint 或十进制字符串 */
+export type CriticalRid = bigint | number | string;
+
+/** sproto binary 字段：浏览器侧通常是 Uint8Array，也允许已编码的字符串透传 */
+export type CriticalMac = string | Uint8Array;
+
 export interface OperationGrantV1 {
     version: 1;
-    /** 64-bit ID 建议用字符串，避免 JS Number 截断 */
-    rid: number | string;
+    rid: CriticalRid;
     grant_id: string;
     issued_at: number;
     expires_at: number;
     max_seq: number;
     key_id: string;
-    mac: string;
+    mac: CriticalMac;
 }
 
 export interface CriticalRequestV1 {
@@ -43,6 +48,17 @@ export type BuildResult<T> = { ok: true; value: T } | { ok: false; error: string
 
 const isInteger = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v);
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+const isRid = (v: unknown): v is CriticalRid => {
+    if (typeof v === "bigint") {
+        return v > 0n;
+    }
+    if (typeof v === "number") {
+        return Number.isSafeInteger(v) && v > 0;
+    }
+    return typeof v === "string" && /^[1-9]\d*$/.test(v);
+};
+const isMac = (v: unknown): v is CriticalMac =>
+    (typeof v === "string" && v.length > 0) || (v instanceof Uint8Array && v.byteLength > 0);
 
 /** 结构校验；返回 null 表示通过，否则返回错误信息 */
 export function validateGrant(grant: unknown): string | null {
@@ -53,7 +69,7 @@ export function validateGrant(grant: unknown): string | null {
     if (g.version !== CRITICAL_GRANT_VERSION) {
         return "unsupported grant version";
     }
-    if (!isInteger(g.rid) && !nonEmpty(g.rid)) {
+    if (!isRid(g.rid)) {
         return "invalid rid";
     }
     if (!nonEmpty(g.grant_id) || g.grant_id.length !== 32) {
@@ -71,7 +87,7 @@ export function validateGrant(grant: unknown): string | null {
     if (!nonEmpty(g.key_id)) {
         return "invalid key_id";
     }
-    if (!nonEmpty(g.mac)) {
+    if (!isMac(g.mac)) {
         return "invalid mac";
     }
     return null;

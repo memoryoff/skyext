@@ -1119,6 +1119,7 @@ function M:list_loaded()
             conn_id = conn and conn.key or nil,
             owner_epoch = io_ and io_.owner_epoch or nil,
             session_epoch = io_ and io_.session_epoch or nil,
+            unresumable = io_ and io_.unresumable == true or false,
             critical_unknown = self:_has_pending_intent(entity),
             busy = entity.migrating == true or entity.unloading == true,
             persistent = entity.persistent ~= false,

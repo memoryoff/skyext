@@ -1622,12 +1622,22 @@ t.describe("entitymgr 计划内迁移", function()
         t.expect(list[1].conn_id).to.equal("conn-7")
         t.expect(list[1].owner_epoch).to.equal(3)
         t.expect(list[1].session_epoch).to.equal("epoch-a")
+        t.expect(list[1].unresumable).to.equal(false)
         t.expect(list[1].critical_unknown).to.equal(false)
         t.expect(list[1].busy).to.equal(false)
         -- 8 号没有会话，但有未决意图：禁止无感移交
         t.expect(list[2].id).to.equal(8)
         t.expect(list[2].conn_id).to.be_nil()
         t.expect(list[2].critical_unknown).to.equal(true)
+    end)
+
+    t.it("reports a session with a replay gap as unresumable", function()
+        local h = harness()
+        assert(h.mgr:ensure_loaded(7))
+        local entity = with_session(h, 7)
+        entity.session_io.unresumable = true
+        local list = h.mgr:list_loaded()
+        t.expect(list[1].unresumable).to.equal(true)
     end)
 
     t.it("freezes upstream and stops the idle unload timer on quiesce", function()

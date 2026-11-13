@@ -11,8 +11,43 @@ local log = require "skyext.log"
 local mongo_conn = require "skyext.mongo_conn"
 local pay_webhook = require "skyext.pay_webhook"
 local router = require "skyext.entity.router"
+local skynet = require "skynet"
 
 local g_webhook
+
+local function grant_via_router(conf, order)
+    -- router.call 返回 (true, decision) 或 (false, reason)，pcall 多插一个 true
+    local called, ok, result = pcall(router.call, conf.role_type or "role", order.rid, "charge_grant", order)
+    if not called then
+        log.error("charge grant call failed", "order", tostring(order.order_id), "err", tostring(ok))
+        return nil, ok
+    end
+    if ok ~= true then
+        return nil, result
+    end
+    return result
+end
+
+local function schedule_grant(conf, order)
+    -- ack_before_grant 的回调已经先 ACK；这里异步跑一次发奖，失败仍由对账兜底。
+    -- 不能把 router.call 放回 HTTP 请求协程里阻塞响应。
+    local called, err = pcall(skynet.fork, function()
+        local decision, gerr = grant_via_router(conf, order)
+        if not decision then
+            log.error(
+                "scheduled pay grant failed; reconciliation will retry",
+                "order",
+                tostring(order.order_id),
+                "err",
+                tostring(gerr)
+            )
+        end
+    end)
+    if not called then
+        return nil, err
+    end
+    return true
+end
 
 local function build()
     local conf = config.get_table("pay_callback") or {}
@@ -34,16 +69,10 @@ local function build()
         orders_coll = mongo_conn.get_collection(orders.db or "game", orders.coll or "charge_order"),
         hash_fn = require("crypto").hmac_sha256,
         grant = function(order)
-            -- router.call 返回 (true, decision) 或 (false, reason)，pcall 多插一个 true
-            local called, ok, result = pcall(router.call, conf.role_type or "role", order.rid, "charge_grant", order)
-            if not called then
-                log.error("charge grant call failed", "order", tostring(order.order_id), "err", tostring(ok))
-                return nil, ok
-            end
-            if ok ~= true then
-                return nil, result
-            end
-            return result
+            return grant_via_router(conf, order)
+        end,
+        schedule_grant = function(order)
+            return schedule_grant(conf, order)
         end,
     })
     if not webhook then

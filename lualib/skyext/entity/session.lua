@@ -360,17 +360,22 @@ function M.resume(conn_id, entity, owner_service, nonce, recv, opts)
     -- 续接是一次所有权切换：owner_epoch 前进一格，网关据此拒绝旧 owner 的迟到下行。
     -- wire 上的 session_epoch 与 seq 都不动，客户端看到的是同一个逻辑会话
     io_.owner_epoch = (io_.owner_epoch or 1) + 1
-    if
-        not gate_call(
-            parsed.gate_node,
-            parsed.gate_service,
-            "bind",
-            conn_id,
-            self_node(),
-            owner_service,
-            io_.owner_epoch
-        )
-    then
+    local called, bound = pcall(
+        gate_call,
+        parsed.gate_node,
+        parsed.gate_service,
+        "bind",
+        conn_id,
+        self_node(),
+        owner_service,
+        io_.owner_epoch
+    )
+    if not called then
+        io_.owner_epoch = io_.owner_epoch - 1
+        log.error("resume gate bind raised", "id", entity.id, "err", tostring(bound))
+        return errcode.SESSION_CLOSED
+    end
+    if not bound then
         io_.owner_epoch = io_.owner_epoch - 1
         return errcode.SESSION_CLOSED
     end
@@ -482,7 +487,7 @@ function M.replay(entity)
             kick_conn(conn)
             return false
         end
-        gate_send(conn, "push", conn.conn_id, pack)
+        gate_send(conn, "push", conn.conn_id, pack, io_.owner_epoch)
     end
     io_.replaying = false
     return true

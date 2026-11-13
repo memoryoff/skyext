@@ -90,6 +90,9 @@ local function harness(opts)
             t.expect(proto).to.equal("lua")
             record_call("local", nil, addr, cmd, ...)
             if cmd == "bind" then
+                if h.gate_bind_raises then
+                    error("gate bind timeout")
+                end
                 return h.gate_bind_result ~= false
             end
             if cmd == "resume_owner" then
@@ -111,6 +114,9 @@ local function harness(opts)
         call = function(node, addr, cmd, ...)
             record_call("cluster", node, addr, cmd, ...)
             if cmd == "bind" then
+                if h.gate_bind_raises then
+                    error("gate bind timeout")
+                end
                 return h.gate_bind_result ~= false
             end
             if cmd == "resume_owner" then
@@ -787,6 +793,16 @@ t.describe("session resume", function()
         t.expect(h.entity.session.conn_id).to.equal(cid(9))
     end)
 
+    -- 网关 RPC 抛错与明确拒绝同样不能留下已推进的 owner_epoch
+    t.it("rolls back owner_epoch when the gate bind raises", function()
+        local h = harness()
+        local _, nonce = bind_and_push(h, 0)
+        local before = h.entity.session_io.owner_epoch
+        h.gate_bind_raises = true
+        t.expect(h.session.resume(cid(20), h.entity, OWNER, nonce, 0)).to.equal(errcode.SESSION_CLOSED)
+        t.expect(h.entity.session_io.owner_epoch).to.equal(before)
+    end)
+
     -- 会话和传输无关：TCP 断了可以从 WS 接回来，也可以换一个网关节点
     t.it("accepts a resume from another gate node and another transport", function()
         local h = harness()
@@ -1046,6 +1062,12 @@ t.describe("session 迁移接管", function()
         t.expect(#out).to.equal(2)
         t.expect(out[1]).to.equal("PACK-2")
         t.expect(out[2]).to.equal("PACK-3")
+        -- replay 也属于新 owner 的下行，必须带新代际，否则网关会把迟到旧包放行
+        for _, op in ipairs(h.gate_ops) do
+            if op[2] == "push" then
+                t.expect(op[5]).to.equal(4)
+            end
+        end
         t.expect(h.entity.session_io.replaying).to.equal(false)
     end)
 

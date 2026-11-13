@@ -215,15 +215,20 @@ function Webhook:handle(req)
     m_grant:inc(1, { status = tostring(status) })
 
     if status == "COMMITTED" or decision.duplicate then
-        charge_order.transition(
+        local moved = charge_order.transition(
             self.orders_coll,
             name,
             order.order_id,
             charge_order.STATUS.GRANTING,
             charge_order.STATUS.GRANTED,
             { granted_at = now },
-            now
+            now,
+            { reconcile_blocked_at = true }
         )
+        if not moved and order.status == charge_order.STATUS.GRANTED then
+            -- 已 GRANTED 的重复回调不会再触发状态迁移，但仍应解除此前的人工阻断
+            charge_order.unblock_reconcile(self.orders_coll, order, now)
+        end
         self:ack(name, order, now)
         m_requests:inc(1, { result = "granted" })
         return { status = 200, body = { result = "accepted", status = charge_order.STATUS.GRANTED } }

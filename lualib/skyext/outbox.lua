@@ -64,7 +64,6 @@ local m_failed = metrics.counter(
     "Outbox events quarantined as FAILED after repeated delivery failures",
     { "op_type" }
 )
-local m_pending = metrics.gauge("skyext_outbox_pending", "Outbox events still PENDING in this VM", { "type" })
 local m_unknown = metrics.counter(
     "skyext_outbox_status_unknown_total",
     "Outbox status CAS whose result could not be confirmed",
@@ -572,12 +571,10 @@ function M.pump(ctx, deliver, opts)
     end
     local events = M.pending_events(critical_table, limit)
     if #events == 0 then
-        m_pending:set(0, { type = ctx.dbcoll })
         stats.pending = 0
         stats.oldest_age = 0
         return M._finish_pump(ctx, now, stats)
     end
-    m_pending:set(M.count_pending(critical_table), { type = ctx.dbcoll })
 
     for _, event in ipairs(events) do
         local envelope, eerr = M.envelope(event, source)
@@ -703,7 +700,6 @@ function M.pump(ctx, deliver, opts)
     end
     stats.pending = M.count_pending(critical_table)
     stats.oldest_age = M.oldest_age(critical_table, now)
-    m_pending:set(stats.pending, { type = ctx.dbcoll })
     return M._finish_pump(ctx, now, stats)
 end
 

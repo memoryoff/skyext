@@ -252,6 +252,20 @@ t.describe("pay_webhook 落单与发奖", function()
         t.expect(#order.service_op_id).to.equal(68)
     end)
 
+    t.it("clears an old reconciliation block when a retry finally grants", function()
+        local h = harness()
+        h.decision = { status = "UNKNOWN", reason = "write concern timeout" }
+        assert(h.webhook:handle(fake_req("/pay/wechat/callback", h.body)))
+        local order = h.orders.store.docs[1]
+        assert(charge_order.block_reconcile(h.orders, order, "manual review", 1700000001))
+
+        h.decision = { status = "COMMITTED" }
+        local out = h.webhook:handle(fake_req("/pay/wechat/callback", h.body))
+        t.expect(out.status).to.equal(200)
+        t.expect(h.orders.store.docs[1].status).to.equal("GRANTED")
+        t.expect(h.orders.store.docs[1].reconcile_blocked_at).to.be_nil()
+    end)
+
     -- UNKNOWN 不能回 500：订单已经落库，对账会收尾；让渠道重推只会制造重复回调
     t.it("acks an unknown grant and leaves the order in GRANTING", function()
         local h = harness()

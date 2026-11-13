@@ -272,14 +272,18 @@ function M.record(orders_coll, opts)
 end
 
 -- 状态推进：只在 from 状态上做 CAS，避免重复回调把 GRANTED 退回 GRANTING
-function M.transition(orders_coll, provider, order_id, from, to, extra, now)
+function M.transition(orders_coll, provider, order_id, from, to, extra, now, unset)
     local set = { status = to, updated_at = now or os.time() }
     for k, v in pairs(extra or {}) do
         set[k] = v
     end
+    local update = { ["$set"] = set }
+    if unset then
+        update["$unset"] = unset
+    end
     local ret, err = write_order(orders_coll, {
         query = { provider = provider, order_id = order_id, status = from },
-        update = { ["$set"] = set },
+        update = update,
         new = true,
     })
     if type(ret) ~= "table" or ret.ok ~= 1 then
@@ -341,6 +345,9 @@ function M.grant(entity, order, handlers, opts)
     end
     if order.status ~= M.STATUS.VERIFIED_RECEIVED and order.status ~= M.STATUS.GRANTING then
         -- 已经 GRANTED 的订单不能重复发奖；状态由对账推进
+        if order.status == M.STATUS.GRANTED and order.reconcile_blocked_at and opts.orders_coll then
+            M.unblock_reconcile(opts.orders_coll, order, opts.now)
+        end
         return { status = order.status, duplicate = true }
     end
 
@@ -373,7 +380,8 @@ function M.grant(entity, order, handlers, opts)
                 order.status,
                 M.STATUS.GRANTED,
                 { granted_at = opts.now or os.time() },
-                opts.now
+                opts.now,
+                { reconcile_blocked_at = true }
             )
         end
     elseif result.status == critical.STATUS.UNKNOWN then
@@ -468,6 +476,29 @@ function M.block_reconcile(orders_coll, order, reason, now)
     return type(ret.value) == "table" and ret.value or nil
 end
 
+-- 解除人工对账阻断。调用方必须先确认补偿/重试策略；这里只负责把订单重新放回
+-- 自动对账候选，不猜测业务原因，也不删除 last_error 证据。
+function M.unblock_reconcile(orders_coll, order, now)
+    if type(order) ~= "table" then
+        return nil, "order is required"
+    end
+    local ret, ferr = write_order(orders_coll, {
+        query = { provider = order.provider, order_id = order.order_id },
+        update = {
+            ["$set"] = { reconcile_unblocked_at = now or os.time() },
+            ["$unset"] = { reconcile_blocked_at = true },
+        },
+        new = true,
+    })
+    if type(ret) ~= "table" or ret.ok ~= 1 then
+        return nil, (type(ret) == "table" and ret.errmsg) or ferr or "unblock_reconcile failed"
+    end
+    if type(ret.value) ~= "table" then
+        return nil, "order not found"
+    end
+    return ret.value
+end
+
 -- 对账：GRANTED -> RECONCILED。
 --
 -- 只有拿到"角色文档里该 op 已 COMMITTED"的持久化证明才允许推进；凭"调用成功过"
@@ -492,6 +523,7 @@ function M.mark_reconciled(orders_coll, order, proof, now)
                 reconciled_at = now or os.time(),
                 reconcile_proof = proof,
             },
+            ["$unset"] = { reconcile_blocked_at = true },
         },
         new = true,
     })

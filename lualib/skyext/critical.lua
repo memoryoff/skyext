@@ -53,6 +53,7 @@ M.STATUS = {
 -- 单文档 16 MB 上限之前的安全阈值。超过就受控拒绝新的关键操作并告警，
 -- 靠归档吞吐保证平时不触达；不能等 Mongo 报文档过大再处理
 M.MAX_OPS = 512
+M.CAPACITY_ARCHIVE_LIMIT = 64
 -- 归档保留期与单次搬运上限
 M.ARCHIVE_RETENTION = 7 * 24 * 3600
 M.ARCHIVE_LIMIT = 64
@@ -258,7 +259,7 @@ local function validate_outbox_events(events)
         if type(ev.op_type) ~= "string" or #ev.op_type == 0 then
             return nil, "outbox event #" .. i .. " needs op_type"
         end
-        if type(ev.param_hash) ~= "string" or #ev.param_hash ~= 64 then
+        if type(ev.param_hash) ~= "string" or #ev.param_hash ~= 64 or not ev.param_hash:match("^[0-9a-f]+$") then
             return nil, "outbox event #" .. i .. " needs a 64 hex param_hash"
         end
         if ev.status ~= "PENDING" then
@@ -604,8 +605,46 @@ local function commit_core(ctx, req, handlers)
         op_count = op_count + 1
     end
     if op_count >= M.MAX_OPS then
-        log.error("critical op ledger is full", "rid", tostring(ctx.rid), "count", op_count, "max", M.MAX_OPS)
-        return decision(M.STATUS.CAPACITY_EXCEEDED, nil, M.NO_CACHE, { reason = "critical op ledger is full" })
+        -- 满了不能只拒绝：COMMITTED/BUSINESS_REJECTED 都是已结算事实，可以安全
+        -- 先搬到冷账本再从热账本删除。没有这一步，持续的业务拒绝能让角色永久被
+        -- CAPACITY_EXCEEDED 锁死，支付发奖也拿不到提交机会。
+        if req.ledger then
+            local result, aerr = M.archive_ops(ctx, { ledger = req.ledger }, {
+                now = req.now,
+                retention = 0,
+                limit = M.CAPACITY_ARCHIVE_LIMIT,
+            })
+            local archived = result and result.archived or 0
+            if archived > 0 then
+                critical = critical_of(ctx)
+                if critical == nil then
+                    return decision(M.STATUS.UNKNOWN, nil, M.NO_CACHE, {
+                        reason = "critical cache disappeared after capacity archive",
+                    })
+                end
+                op_count = 0
+                for _ in pairs(critical[M.OPS_FIELD] or {}) do
+                    op_count = op_count + 1
+                end
+                log.info(
+                    "critical op ledger archived at capacity",
+                    "rid",
+                    tostring(ctx.rid),
+                    "archived",
+                    archived,
+                    "remaining",
+                    op_count
+                )
+            elseif aerr then
+                log.error("critical op ledger capacity archive failed", "rid", tostring(ctx.rid), "err", tostring(aerr))
+            end
+        end
+        if op_count >= M.MAX_OPS then
+            log.error("critical op ledger is full", "rid", tostring(ctx.rid), "count", op_count, "max", M.MAX_OPS)
+            return decision(M.STATUS.CAPACITY_EXCEEDED, nil, M.NO_CACHE, {
+                reason = "critical op ledger is full",
+            })
+        end
     end
     if op_count >= M.MAX_OPS * M.CAPACITY_WARN_RATIO then
         -- 只告警一次（按实体）：否则 80% 之后每条操作都刷一行
@@ -1255,16 +1294,22 @@ function M.abort_intent(ctx_or_entity, opts)
     if not intent then
         return "REJECTED", "no pending intent"
     end
+    local now = opts.now or os.time()
     local op_doc = {
         status = "ABORTED",
         op_type = intent.op_type,
         param_hash = intent.param_hash,
         source_namespace = intent.source_namespace,
         source_id = intent.source_id,
-        at = opts.now or os.time(),
+        at = now,
     }
+    local write = { ["$set"] = { [M.OPS_FIELD .. "." .. intent.op_id] = op_doc } }
+    local oldest = critical[M.OPS_OLDEST_FIELD]
+    if math.type(oldest) ~= "integer" or now < oldest then
+        write["$set"][M.OPS_OLDEST_FIELD] = now
+    end
     local state, detail = dbmgr.critical_update(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, ctx.doc._version, {
-        ["$set"] = { [M.OPS_FIELD .. "." .. intent.op_id] = op_doc },
+        ["$set"] = write["$set"],
         ["$unset"] = { [M.INTENT_FIELD] = true },
     }, { handle = ctx.handle, allow_quarantined_intent_abort = true })
     if state ~= "CONFIRMED" then
@@ -1274,6 +1319,10 @@ function M.abort_intent(ctx_or_entity, opts)
     copy[M.INTENT_FIELD] = nil
     copy[M.OPS_FIELD] = copy[M.OPS_FIELD] or {}
     copy[M.OPS_FIELD][intent.op_id] = op_doc
+    oldest = copy[M.OPS_OLDEST_FIELD]
+    if math.type(oldest) ~= "integer" or now < oldest then
+        copy[M.OPS_OLDEST_FIELD] = now
+    end
     dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, copy, ctx.handle)
     -- 隔离态取消意图之后，内存里的普通字段仍可能带着 apply 的痕迹，不能回 NORMAL
     -- 继续服务。标作废，让 unload 直接丢弃，下一次请求从库重读就是干净状态。

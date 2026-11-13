@@ -170,6 +170,22 @@ t.describe("migration 批次", function()
         t.expect(fallen[1].status).to.equal("critical_unknown")
     end)
 
+    t.it("never reports an unresumable session as READY", function()
+        local d = deps()
+        d.list_entities = function()
+            return { entity({ id = 1, unresumable = true }) }
+        end
+        local fallen
+        d.fallback = function(e, reason)
+            fallen = { id = e.id, reason = reason }
+        end
+        local stats = assert(migration.run(d, {}))
+        t.expect(stats.ready).to.equal(0)
+        t.expect(stats.unresumable).to.equal(1)
+        t.expect(fallen).to.equal({ id = 1, reason = "unresumable" })
+        t.expect(d.calls).to.equal({})
+    end)
+
     t.it("counts a failed entity as fallback and keeps going", function()
         local d = deps()
         local first = true

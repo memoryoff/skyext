@@ -202,12 +202,26 @@ function M.run(deps, opts)
         return nil, tostring(lerr or "list_entities returned no list")
     end
 
-    local stats = { total = #entities, ready = 0, fallback = 0, critical_unknown = 0, busy = 0, cancelled = 0 }
+    local stats = {
+        total = #entities,
+        ready = 0,
+        fallback = 0,
+        critical_unknown = 0,
+        unresumable = 0,
+        busy = 0,
+        cancelled = 0,
+    }
     local started = 0
 
     local function migrate_one(entity)
         local status, reason
-        if entity.critical_unknown then
+        if entity.unresumable then
+            -- 重放缓冲已经有缺口：迁移只会把不可续接状态搬到另一个节点，客户端仍会丢包
+            status = M.STATUS.FALLBACK
+            reason = "unresumable"
+            stats.unresumable = stats.unresumable + 1
+            m_fallback:inc(1, { reason = "unresumable" })
+        elseif entity.critical_unknown then
             -- 关键操作未决：禁止无感移交。留下持久化 PREPARED/记录后走降级路径，
             -- 单个玩家不能永久阻塞整节点退出
             status = M.STATUS.CRITICAL_UNKNOWN
@@ -295,6 +309,8 @@ function M.run(deps, opts)
         stats.fallback,
         "critical_unknown",
         stats.critical_unknown,
+        "unresumable",
+        stats.unresumable,
         "cancelled",
         stats.cancelled
     )

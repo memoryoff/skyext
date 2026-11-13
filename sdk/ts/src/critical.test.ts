@@ -58,6 +58,28 @@ describe("client critical request", () => {
         expect(validateGrant(grant({ key_id: "" }))).toBe("invalid key_id");
     });
 
+    test("keeps a 17-digit rid exact as bigint", () => {
+        const rid = 70067467908940524n;
+        const result = buildRequest(opts({ grant: grant({ rid }) }));
+        expect(result.ok).toBe(true);
+        if (result.ok) {
+            expect(result.value.request.grant.rid).toBe(rid);
+        }
+        expect(validateGrant(grant({ rid: "70067467908940524" }))).toBeNull();
+        expect(validateGrant(grant({ rid: 0 }))).toBe("invalid rid");
+        expect(validateGrant(grant({ rid: "0" }))).toBe("invalid rid");
+    });
+
+    test("accepts a binary mac as well as an encoded string", () => {
+        const mac = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+        const result = buildRequest(opts({ grant: grant({ mac }) }));
+        expect(result.ok).toBe(true);
+        if (result.ok) {
+            expect(result.value.request.grant.mac).toBe(mac);
+        }
+        expect(validateGrant(grant({ mac: new Uint8Array() }))).toBe("invalid mac");
+    });
+
     test("requires op_type, protocol and an object params", () => {
         expect(buildRequest(opts({ op_type: "" })).ok).toBe(false);
         expect(buildRequest(opts({ protocol: "" })).ok).toBe(false);

@@ -95,7 +95,8 @@ curl http://127.0.0.1:9190/metrics
 | `skyext_gate_stale_pushes_total{gate}` | counter | 因 owner_epoch 过期被丢弃的下行包数 |
 | `skyext_gate_stale_binds_total{gate}` | counter | 因 epoch 不够新被拒绝的 owner 绑定数 |
 | `skyext_outbox_enqueued_total{op_type}` | counter | Outbox 事件确认入队数 |
-| `skyext_outbox_pending{type}` | gauge | 本 VM 上仍为 `PENDING` 的 Outbox 事件数 |
+| `skyext_outbox_pending_scanned{type}` | gauge | 最近一次 Outbox 扫描页内按索引字段汇总的 PENDING 事件数；不是全库总量 |
+| `skyext_outbox_scan_candidates{type}` | gauge | 最近一次 Outbox 扫描页命中的角色数 |
 | `skyext_outbox_status_unknown_total{op_type}` | counter | Outbox 状态 CAS 结果未决的次数 |
 | `skyext_charge_orders_total{status}` | counter | 支付订单进入各状态的次数 |
 | `skyext_charge_grant_unknown_total{provider}` | counter | 发奖结果未决的次数（订单停在 `GRANTING`） |

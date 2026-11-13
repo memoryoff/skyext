@@ -70,6 +70,10 @@ local function apply(doc, update)
             for k, v in pairs(fields) do
                 doc[k] = copy(v)
             end
+        elseif op == "$unset" then
+            for k in pairs(fields) do
+                doc[k] = nil
+            end
         elseif op ~= "$setOnInsert" then
             error("unsupported update operator: " .. tostring(op))
         end

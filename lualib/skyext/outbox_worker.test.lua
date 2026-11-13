@@ -194,6 +194,8 @@ t.describe("outbox_worker 单轮调度", function()
         t.expect(stats.pumped).to.equal(2)
         t.expect(stats.enqueued).to.equal(2)
         t.expect(stats.pending).to.equal(2)
+        -- 这是本轮扫描页内索引字段的汇总，不再让最后一个被 pump 的角色覆盖全局 gauge
+        t.expect(stats.scan_pending).to.equal(3)
     end)
 
     t.it("skips roles whose indexed count is already zero", function()

@@ -167,6 +167,7 @@ t.describe("migration_adapter 枚举", function()
                 { id = 8, owner_epoch = 2, persistent = true, busy = false },
                 entity({ id = 9, busy = true }),
                 entity({ id = 10, persistent = false }),
+                entity({ id = 11, unresumable = true }),
             },
         })
         local list = h.adapter.list_entities()
@@ -346,6 +347,11 @@ t.describe("migration_adapter 降级", function()
         local kick = h.last_call("kick")
         t.expect(kick).to_not.be_nil()
         t.expect(kick.args[1]).to.equal("conn-7")
+        -- 仅踢客户端不够：旧实体仍带 migrating=true，重连 bind 会再次命中它。
+        -- 必须强制卸载，下一次请求才会从库重载干净实体。
+        local unload = h.last_call("unload_entity")
+        t.expect(unload).to_not.be_nil()
+        t.expect(unload.args[1]).to.equal(7)
     end)
 
     -- D-12 回归：quiesce + freeze 都成功（网关 frozen_epoch 已建立、_barrier 已打），
@@ -366,6 +372,8 @@ t.describe("migration_adapter 降级", function()
         local kick = h.last_call("kick")
         t.expect(kick).to_not.be_nil()
         t.expect(kick.args[1]).to.equal("conn-7")
+        -- 这里的 unquiesce 成功，实体已恢复可服务，只需要踢掉被冻结的连接
+        t.expect(h.last_call("unload_entity")).to.be_nil()
     end)
 
     -- 没走到 freeze（_barrier 从未建立），网关没有屏障；unquiesce 成功后实体

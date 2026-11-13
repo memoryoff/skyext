@@ -36,6 +36,9 @@ local function fake_orders()
             for k, v in pairs(opts.update["$set"] or {}) do
                 existing[k] = v
             end
+            for k in pairs(opts.update["$unset"] or {}) do
+                existing[k] = nil
+            end
             return { ok = 1, value = existing, lastErrorObject = { n = 1, updatedExisting = true } }
         end
         if not opts.upsert then
@@ -255,6 +258,18 @@ t.describe("charge_order 状态机", function()
         t.expect(order.status).to.equal("VERIFIED_RECEIVED")
         t.expect(h.charge.ack(h.orders, "wechat", "ORDER-1", "MAYBE", 51)).to.be_nil()
     end)
+
+    t.it("can clear a reconciliation block after manual review", function()
+        local h = harness()
+        local order = assert(h.record())
+        assert(h.charge.block_reconcile(h.orders, order, "manual review", 60))
+        t.expect(h.orders.store["wechat:ORDER-1"].reconcile_blocked_at).to.equal(60)
+
+        local cleared = assert(h.charge.unblock_reconcile(h.orders, order, 70))
+        t.expect(cleared.reconcile_blocked_at).to.be_nil()
+        t.expect(cleared.reconcile_unblocked_at).to.equal(70)
+        t.expect(cleared.last_error).to.equal("manual review")
+    end)
 end)
 
 t.describe("charge_order 发奖", function()
@@ -323,6 +338,21 @@ t.describe("charge_order 发奖", function()
         t.expect(h.calls[1].opts.source_namespace).to.equal("charge_order")
         t.expect(h.calls[1].opts.source_id).to.equal("wechat:ORDER-1")
         t.expect(h.orders.store["wechat:ORDER-1"].status).to.equal("GRANTED")
+    end)
+
+    t.it("clears a stale reconciliation block when a grant finally succeeds", function()
+        local h = harness_with_critical({ status = "COMMITTED" })
+        local order = assert(h.record())
+        assert(h.charge.block_reconcile(h.orders, order, "manual review", 100))
+        local result = h.charge.grant({ rid = 7 }, order, {}, {
+            capability = {},
+            hash_fn = HASH,
+            orders_coll = h.orders,
+            now = 110,
+        })
+        t.expect(result.status).to.equal("COMMITTED")
+        t.expect(h.orders.store["wechat:ORDER-1"].status).to.equal("GRANTED")
+        t.expect(h.orders.store["wechat:ORDER-1"].reconcile_blocked_at).to.be_nil()
     end)
 
     -- UNKNOWN 不能重试成"没发"，也不能宣称已发：保持 GRANTING 等对账

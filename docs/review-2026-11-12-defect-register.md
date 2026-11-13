@@ -27,8 +27,8 @@
 | 对抗审查发现 · 已修 | 14 | A-01 ~ A-14，见 §8 |
 | 第二轮源码审计 · 已修 | 8 | B-01 ~ B-08（DB Fence / Critical Commit），见 §10 |
 | 第三轮对抗审查 · 已修 | 11 | C-01 ~ C-11，见 §11 |
-| 第四轮全量对抗审查 · 已修 | 16 | D-01 ~ D-07、D-09 ~ D-12、D-14 ~ D-16、D-19、D-20，见 §12 |
-| 第四轮全量对抗审查 · 待修 | 21 | D-08、D-13、D-17、D-18、D-21 ~ D-37（D-23 部分修），见 §12 |
+| 第四轮全量对抗审查 · 已修 | 27 | D-01 ~ D-25、D-36、D-37，见 §12 |
+| 第四轮全量对抗审查 · 待修 | 10 | D-26 ~ D-35（D-33/D-35 为部分修），见 §12 |
 | 复核 `5bc8073` · 已修 | 8 | RV-01 ~ RV-08，见 §13 |
 | 阻塞生产的 P0 | 1（已修） | 原有 5 条 P0 已收敛；本轮发现并修复 A-06 递归合并引入的配置执行环境回归，见 §12.7 |
 | 需真实环境验证 | 7 | V-01 / V-06 已实测通过；V-02 ~ V-05 需要多节点与故障注入；V-07 已提供可复跑脚本 |
@@ -611,12 +611,14 @@
 | D-14 | `sproto_api` 的 RESPONSE 分支校验 `pending.fd == fd`，外来连接不能注入他人响应 |
 | D-15 | `session.with_request` 入口拒绝非 u32 的 `req_id`，避免快照 `string.pack` 抛错导致角色永久不可迁移 |
 
-**后续批次已修**：D-10（对账稳定排序 + 轮转游标）、D-11（容量超限返回可重试 503）、
-D-12（迁移 FALLBACK 解网关屏障）、D-16（启动依赖检查）、D-19（`VERIFIED_RECEIVED + COMMITTED`
-补状态）、D-20（重复回调 action 冲突显式拒绝）。
+**后续批次已修**：D-08（满容量先归档）、D-10（对账 keyset 游标）、D-11（容量超限可重试）、
+D-12（迁移 FALLBACK 解屏障）、D-13（迁移取消后强制卸载源实体）、D-16（启动依赖检查）、
+D-17（TS SDK bigint/binary 契约）、D-18（ABORTED 维护归档水位）、D-19（对账结案）、
+D-20（action 冲突）、D-21（解除对账阻断）、D-22（生产 schedule_grant）、D-23（非法摘要进 DLQ）、
+D-24/D-25/D-36（网关代际与不可续接会话）、D-37（Outbox 扫描页积压指标）。
 
-**仍未修（下一批）**：D-08（容量降级口径）、D-13（迁移 `migrating` 复位）、D-17（TS SDK 类型）、
-D-18、D-21 ~ D-37；其中 D-23 已部分修（永久无效信封已进失败/死信，`param_hash` hex 校验仍待补）。
+**仍未修（下一批）**：D-26 ~ D-35；其中 D-33（维护配置已 fail-fast，entity_agent 仍 fail-closed 返回
+UNKNOWN）与 D-35（fallback 失败保留 inflight 已修，但 fallback 仍不在必需依赖门禁里）为部分修。
 
 **结构性结论**：框架把"正常路径"写得很严密，但"异常路径的出口"普遍缺失。
 隔离、恢复任务、对账、迁移降级四处都是"进入条件清楚、退出条件没写"。
@@ -638,29 +640,29 @@ P0-1 与 P0-2 是同一个病的两个实例。
 | --- | --- | --- |
 | D-06 | **Outbox CAS 失败不计投递次数**：`_advance` 返回 BLOCKED/REJECTED 时只 `break`，`_note_deliver_attempt` 只在投递器明确失败时调用 → 毒事件阈值对"CAS 卡住"无效，事件永远 PENDING、每 5 秒重投一条（约 1.7 万条/天），且 `_advance` 重试读的是同一份内存缓存，必然耗尽 | `outbox.lua:636`、`:738-762` |
 | D-07 | **同一批 `event_id` 重复静默丢分片**：`validate_outbox_events` 不查批内唯一性 → `$set` 同路径写两次只留最后一份，但 `pending_count += #new_events` 按 2 计 → 第二个分片的业务效果永久丢失，且计数比真实事件多，`scan` 每轮命中该角色永不收敛 | `critical.lua:212-244`、`:821-832` |
-| D-08 | **热账本 512 无降级路径**：`op_count >= MAX_OPS` 直接 `CAPACITY_EXCEEDED`，归档只搬超过 7 天的；`BUSINESS_REJECTED` 与 COMMITTED 同占额度 → 客户端持续发起被业务拒绝的操作即可把自己锁死；`charge_grant` 走同一内核，付费订单会一直拿到 CAPACITY_EXCEEDED | `critical.lua:55`、`:576-583`、`:839-877` |
+| D-08 | **热账本 512 无降级路径**：`op_count >= MAX_OPS` 直接 `CAPACITY_EXCEEDED`，归档只搬超过 7 天的；`BUSINESS_REJECTED` 与 COMMITTED 同占额度 → 客户端持续发起被业务拒绝的操作即可把自己锁死；`charge_grant` 走同一内核，付费订单会一直拿到 CAPACITY_EXCEEDED | `critical.lua:55`、`:576-583`、`:839-877`；**已修 + 已验证**：触顶时先用 `req.ledger` 同步归档最多 64 条已结算热记录，再重新计数；归档失败才继续拒绝。`critical.test.lua`「archives settled operations before rejecting a full ledger」 |
 | D-09 | **归档扫描无轮转**：`scan_archive` 只有 limit 无 skip/游标，卡住的文档不会离开候选集；≥32 个卡住文档后后续角色永远排不进这一页 | `critical_maintenance.lua:51-74` |
 | D-10 | **对账扫描被毒单饿死**：注释称"不排序避免卡住的单占住队头"，但无显式 sort 时 Mongo 走 `{status, updated_at}` 索引就是 updated_at 升序；PENDING 分支不写任何字段，毒单永远留在最老位置 | `charge_reconcile.lua:45-66`；**已修 + 已验证**：`scan_orders` 显式按 `(updated_at, provider, order_id)` 排序并用 keyset 游标续扫，`run_once` 用 `deps.scan_cursors` 持久化游标；`charge_reconcile.test.lua` 稳定排序/游标推进用例 |
 | D-11 | **`CAPACITY_EXCEEDED` 被 ACK**：webhook 回 200 + ACK，渠道不再重推，订单留 GRANTING；对账重投仍是 CAPACITY_EXCEEDED，永远 RETRY、不 block、不告警；唯一出路 `critical_maintenance` 在示例配置默认关闭 | `pay_webhook.lua:232-246`；**已修 + 已验证**：返回 `503 capacity_exceeded` + `retryable=true`，不 ACK，订单留 GRANTING 并记录错误；`pay_webhook.test.lua` 容量超限用例 |
 | D-12 | **迁移 FALLBACK 只解实体冻结、不解网关屏障**：`unquiesce` 成功即 `unfrozen=true` → 不踢人，但 `unquiesce` 只清 `entity.migrating`，从不调 `resume_owner` → 网关 `frozen_epoch` 仍在，双向静默黑洞直到客户端心跳判死 | `migration_adapter.lua:236-280`；`entitymgr.lua:1180-1207`；**已修 + 已验证**：fallback 检测 `_barrier` 并必踢，kick 失败保留 inflight 供 abort 重试；`migration_adapter.test.lua` 4 个新增用例 |
-| D-13 | **迁移取消后 `entity.migrating` 不复位**：fallback 踢客户端后实体仍带 `migrating=true`，客户端重连 `bind` 成功但每条上行在 `CMD.client_msg` 被丢 → "在线但操作无响应" | `migration.lua:158-160`；`session.lua:283-311`；`entity_agent.lua:644` |
+| D-13 | **迁移取消后 `entity.migrating` 不复位**：fallback 踢客户端后实体仍带 `migrating=true`，客户端重连 `bind` 成功但每条上行在 `CMD.client_msg` 被丢 → "在线但操作无响应" | `migration.lua:158-160`；`session.lua:283-311`；`entity_agent.lua:644`；**已修 + 已验证**：已导出/释放且无法 unquiesce 的源实体在踢客户端后强制走 `unload_entity`，重连必须从库重载；`migration_adapter.test.lua` 覆盖强制卸载与可恢复场景不卸载 |
 | D-14 | **`sproto_api` 响应不校验来源连接**：`g_sessions` 只按客户端可选的 session 编号做键，RESPONSE 分支丢弃 `fd` 直接唤醒 → 任意连接发 `session=N` 即可注入/伪造他人 pending 响应 | `sproto_api.lua:315-321`、`:346-360` |
 | D-15 | **`req_id >= 2^32` 让快照编码抛错**：`with_request` 只判下界不判上界，`session_snapshot.encode` 用 `string.pack("<I4", req_id)` 无符号溢出抛错（不是返回 nil,err）→ 迁移每次失败，角色被钉在本节点 | `session.lua:174-192`；`session_snapshot.lua:119` |
 | D-16 | **`launcher.self_check` 只打日志不阻断**：`pay_callback` 无 `depends_on`，单开它不检查 `critical_maintenance` → 热账本永不归档 → 约 512 笔充值后新发奖全被拒，渠道已 ACK、玩家不到账 | `launcher.lua:18-27`、`:57-70`、`:135`；**已修 + 已验证**：启动自检阻断 `pay_callback`/`outbox_worker` 缺少 `critical_maintenance` 的配置，维护服务缺失 `critical_ledger/jobs` 也 fail-fast；`launcher.test.lua` 18 例覆盖依赖与阻断 |
-| D-17 | **TS SDK 与服务端契约不一致**：`OperationGrantV1.rid` 为 `number | string` 不含 `bigint`（17 位 rid 必超 2^53），`mac: string` 而文档写"二进制" → 长 rid 的 Grant 三条路都不通 | `sdk/ts/src/critical.ts:12,18`；`critical_grant_v1.md:38` |
+| D-17 | **TS SDK 与服务端契约不一致**：`OperationGrantV1.rid` 为 `number | string` 不含 `bigint`（17 位 rid 必超 2^53），`mac: string` 而文档写"二进制" → 长 rid 的 Grant 三条路都不通 | `sdk/ts/src/critical.ts:12,18`；`critical_grant_v1.md:38`；**已修 + 已验证**：`rid` 接受安全整数、`bigint` 或规范十进制字符串，`mac` 接受非空字符串或 `Uint8Array`；`critical.test.ts` 覆盖 17 位 rid 与二进制 mac，`tsc --noEmit` 通过 |
 
 ### 12.4 P2（状态错乱 / 可观测性 / 门禁）
 
 | 编号 | 问题 |
 | --- | --- |
-| D-18 | `abort_intent` 写已结算 op 却不维护 `_critical_ops_oldest_at` → 纯 abort 的账本只增不减，撞 512 后无法自愈 |
+| D-18 | `abort_intent` 写已结算 op 却不维护 `_critical_ops_oldest_at` → 纯 abort 的账本只增不减，撞 512 后无法自愈。【已修 + 已验证：ABORTED CAS 同步推进库与内存归档水位；`critical.test.lua` 断言 oldest_at】 |
 | D-19 | `VERIFIED_RECEIVED + COMMITTED` 永远无法结案：`mark_reconciled` 的 CAS 只认 GRANTED。【已修 + 已验证：`charge_reconcile` 先 CAS 到 GRANTED 再结案；`charge_reconcile.test.lua` 覆盖 COMMITTED 结案与 CAS 落空】 |
 | D-20 | 重复回调冲突校验漏 `action`：退款/拒付回调被当"重复发奖"静默 ACK，漏补偿。【已修 + 已验证：保留 `(provider, order_id)` 唯一索引，在冲突路径显式返回 `order conflict` 并记录 action 差异，不再静默返回旧单；`charge_order.test.lua` 覆盖不同 action 拒绝与同 action 幂等】 |
-| D-21 | `block_reconcile` 无解封路径，发奖成功后也不清标记 → 已发货订单永久停在 GRANTED |
-| D-22 | `ack_before_grant` 生产接线没有 `schedule_grant`（只在测试注入）→ 先 ACK 后只能等对账，发货延迟约 90s |
-| D-23 | 接收侧"永久无效"直接 ACK：资产已扣、无 FAILED 记录、不可重放；`outbox.event` 只校验 `param_hash` 长度不校验 hex。【部分修：永久无效信封已改为抛错进入失败/死信路径，`outbox.test.lua`/`role.test.lua` 覆盖；`param_hash` hex 校验仍待补】 |
-| D-24 | `replay` 下行不带 `owner_epoch`，`push_allowed` 对 nil 一律放行 → 屏障与代际过滤在重放路径失效 |
-| D-25 | `unresumable` 会话仍被迁移并报 READY → 迁移"成功"但客户端存在永久缺口 |
+| D-21 | `block_reconcile` 无解封路径，发奖成功后也不清标记 → 已发货订单永久停在 GRANTED。【已修 + 已验证：新增 `unblock_reconcile`；成功 transition/mark_reconciled 原子 `$unset` 阻断标记；`charge_order.test.lua`、`pay_webhook.test.lua` 覆盖】 |
+| D-22 | `ack_before_grant` 生产接线没有 `schedule_grant`（只在测试注入）→ 先 ACK 后只能等对账，发货延迟约 90s。【已修 + 已验证：HTTP 路由用 `skynet.fork` 异步发奖，失败仍交对账；`pay_callback_router.test.lua` 覆盖生产接线】 |
+| D-23 | 接收侧"永久无效"直接 ACK：资产已扣、无 FAILED 记录、不可重放；`outbox.event` 只校验 `param_hash` 长度不校验 hex。【已修 + 已验证：永久无效信封抛错进入可靠消息死信；64 字符摘要额外校验小写 hex；`outbox.test.lua`/`critical.test.lua` 覆盖】 |
+| D-24 | `replay` 下行不带 `owner_epoch`，`push_allowed` 对 nil 一律放行 → 屏障与代际过滤在重放路径失效。【已修 + 已验证：`session.replay` 的 push 携带当前 `owner_epoch`；`session.test.lua` 断言 attach 后重放代际】 |
+| D-25 | `unresumable` 会话仍被迁移并报 READY → 迁移"成功"但客户端存在永久缺口。【已修 + 已验证：实体枚举暴露 `unresumable`，适配器过滤，编排状态机兜底降级；`entitymgr.test.lua`、`migration.test.lua`、`migration_adapter.test.lua` 覆盖】 |
 | D-26 | `capability.ALLOWED_NAMESPACES` 是导出的可变普通表 → 任何模块一行赋值即可自签 cap |
 | D-27 | `channel.get_or_create` 静默忽略同名频道的第二份配置 → 鉴权策略被首个创建者锁定；`authorize` 未做类型校验 |
 | D-28 | `critical.query` 不校验 op_id 格式 → 大写 hex/少一位被当"从未执行" |
@@ -671,8 +673,8 @@ P0-1 与 P0-2 是同一个病的两个实例。
 | D-33 | `critical_ledger` 未配置时 maintenance 静默回退默认集合、entity_agent 返回 UNKNOWN，三处口径不一致 |
 | D-34 | 引擎硬依赖领域包 `skyext.charge_order`（`entity_agent.lua:230-237`）→ `framework_boundary_v1` 的"可删除"只在测试路径成立 |
 | D-35 | `fallback` 清空 `g_inflight` 抵消 abort 的"失败可重试"；且 `fallback` 不在 `REQUIRED_DEPS` |
-| D-36 | 迁移 `resume` 中网关 RPC 抛错时 `owner_epoch` 已推进且不回滚 → 下行被网关当迟到包丢弃 |
-| D-37 | `skyext_outbox_pending` gauge 是"最后一个被 pump 的角色"，不能当积压告警 |
+| D-36 | 迁移 `resume` 中网关 RPC 抛错时 `owner_epoch` 已推进且不回滚 → 下行被网关当迟到包丢弃。【已修 + 已验证：bind 用 pcall + 抛错/拒绝双回滚；`session.test.lua` 覆盖】 |
+| D-37 | `skyext_outbox_pending` gauge 是"最后一个被 pump 的角色"，不能当积压告警。【已修 + 已验证：移除错误的 last-role gauge，改为 `skyext_outbox_pending_scanned` 扫描页索引汇总；`outbox_worker.test.lua` 断言 `scan_pending`】 |
 
 ### 12.5 架构级观察
 

@@ -35,6 +35,8 @@ export {
     validateGrant,
     buildRequest,
     buildQuery,
+    type CriticalRid,
+    type CriticalMac,
     type OperationGrantV1,
     type CriticalRequestV1,
     type CriticalRequestOptions,

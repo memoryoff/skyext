@@ -29,7 +29,7 @@
 | I14 | Outbox 投递未确认 | 保持 PENDING，本批停止 | `outbox.test.lua` |
 | I15 | Outbox 状态 CAS 未命中 | 读后像重试；已被推进则不再减计数 | `outbox.test.lua` |
 | I16 | Outbox 状态 CAS UNKNOWN | 停批 + 多数派读对齐版本，**不隔离玩家资产** | `outbox.test.lua`、`dbmgr.test.lua` |
-| I17 | Outbox 事件错投/摘要不符 | 永久无效，ACK 不进 DLQ | `outbox.test.lua` |
+| I17 | Outbox 事件错投/摘要不符 | 永久无效，抛错计入 attempts 并最终进入可靠消息 DLQ | `outbox.test.lua` |
 | I18 | 接收方 UNKNOWN / IN_PROGRESS | `delivery.retryable`，保留 pending | `outbox.test.lua`、`entitymgr.test.lua` |
 | I19 | 接收方契约类失败 | 抛错计入 attempts，最终进 DLQ | `outbox.test.lua` |
 | I20 | Saga 补偿失败 | 保持 COMPENSATING，不宣称结案 | `saga.test.lua` |
@@ -66,7 +66,7 @@ primary 连续两次换人、`documents=1 version=hits`），不再列为未覆�
 | `skyext_critical_decisions_total{status}` | 关键操作三态分布 | UNKNOWN 比例 |
 | `skyext_critical_quarantined_total{reason}` | 隔离次数 | 应为 0 |
 | `skyext_critical_same_owner_resume_total` | 同 owner 续做率 | PREPARED 卡住的比例 |
-| `skyext_outbox_pending`、`skyext_outbox_pending_age_seconds` | 待发积压与最老事件年龄 | 年龄持续增长=投递跟不上 |
+| `skyext_outbox_pending_scanned`、`skyext_outbox_pending_age_seconds` | 扫描页内待发积压与最老事件年龄 | 年龄持续增长=投递跟不上；前者不是全库总量 |
 | `skyext_outbox_cas_retry_total` | 状态 CAS 冲突 | 突然升高=有绕过实体队列的写入 |
 | `skyext_charge_reconcile_total{outcome}` | 对账结果分布 | `UNKNOWN` 长期不降 |
 | `skyext_saga_state_total{state}` | Saga 状态迁移 | `COMPENSATING` 堆积 |

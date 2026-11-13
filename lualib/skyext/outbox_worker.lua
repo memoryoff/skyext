@@ -42,6 +42,11 @@ local m_age = metrics.histogram(
     { "type" }
 )
 local m_scan_size = metrics.gauge("skyext_outbox_scan_candidates", "Roles found by the last scan round", { "type" })
+local m_scan_pending = metrics.gauge(
+    "skyext_outbox_pending_scanned",
+    "Indexed PENDING events across roles in the last scan page",
+    { "type" }
+)
 
 -- 索引门禁：`_critical_outbox_pending_count > 0` 是偏索引，只为待发角色建条目。
 -- 清理标记单独一条偏索引：它只在"有终态事件待清理"时存在，条目数远小于角色总数
@@ -227,6 +232,7 @@ function M.run_once(deps, opts)
 
     local stats = {
         scanned = #list,
+        scan_pending = 0,
         pumped = 0,
         enqueued = 0,
         failed = 0,
@@ -239,6 +245,13 @@ function M.run_once(deps, opts)
         cleaned = 0,
         retryable = 0,
     }
+    for _, entry in ipairs(list) do
+        local pending = entry.pending or 0
+        if math.type(pending) == "integer" and pending > 0 then
+            stats.scan_pending = stats.scan_pending + pending
+        end
+    end
+    m_scan_pending:set(stats.scan_pending, { type = opts.type_name or "role" })
     for _, entry in ipairs(list) do
         if (entry.pending or 0) <= 0 and not entry.cleanup_due then
             -- 索引字段是陈旧的（事件已被消费但计数没来得及更新）：不加载、不投递

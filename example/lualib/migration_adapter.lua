@@ -104,7 +104,7 @@ function M.list_entities()
     local out = {}
     local skipped = 0
     for _, entity in ipairs(list or {}) do
-        if entity.conn_id and entity.persistent and not entity.busy then
+        if entity.conn_id and entity.persistent and not entity.busy and not entity.unresumable then
             out[#out + 1] = entity
         else
             skipped = skipped + 1
@@ -301,6 +301,35 @@ function M.fallback(entity, reason)
         end
     end
 
+    -- 源端已经导出快照或释放过锁时，即使踢掉客户端也不能让旧实体继续被绑定：
+    -- 重连的 bind 会命中同一个 self.entities 条目，而 client_msg 看到 migrating=true
+    -- 后把所有上行丢掉。强制走正常 unload（落库 + 释放锁 + 重试）把内存条目清掉，
+    -- 下一次重连才会从库重新加载一个干净实体。
+    local cannot_resume = released or unquiesce_refused
+    local abandoned = false
+    if cannot_resume then
+        local called, ok, err = pcall(call_agent_raw, self_node(), entity.id, "unload_entity", entity.id)
+        if not called then
+            log.error(
+                "migration fallback could not abandon the source entity",
+                "id",
+                tostring(entity.id),
+                "err",
+                tostring(ok)
+            )
+        elseif not ok then
+            log.error(
+                "migration fallback source entity is still unloading",
+                "id",
+                tostring(entity.id),
+                "err",
+                tostring(err)
+            )
+        else
+            abandoned = true
+        end
+    end
+
     -- 只有确认无需踢、或踢成功，屏障才算处理完，才能摘掉登记；
     -- 踢失败/被拒时保留 g_inflight，让后续 M.abort() 的兜底还能重试踢人。
     if not need_kick or kicked then
@@ -322,7 +351,11 @@ function M.fallback(entity, reason)
         "need_kick",
         need_kick,
         "kicked",
-        kicked
+        kicked,
+        "cannot_resume",
+        cannot_resume,
+        "abandoned",
+        abandoned
     )
 end
 

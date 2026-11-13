@@ -237,7 +237,16 @@ local function harness()
         return handlers
     end
 
-    function h.client(seq, params, over)
+    function h.client(seq, params, over, opts_over)
+        local opts = {
+            hmac_fn = HASH,
+            hash_fn = HASH,
+            equal_fn = EQ,
+            now = h.now,
+        }
+        for k, v in pairs(opts_over or {}) do
+            opts[k] = v
+        end
         return h.critical.execute_client(
             h.entity,
             h.new_grant(),
@@ -245,12 +254,7 @@ local function harness()
             "shop.buy",
             params or { amount = 1 },
             h.handlers(over),
-            {
-                hmac_fn = HASH,
-                hash_fn = HASH,
-                equal_fn = EQ,
-                now = h.now,
-            }
+            opts
         )
     end
 
@@ -899,6 +903,7 @@ t.describe("critical 查询与恢复", function()
         t.expect(detail.op_id).to.equal("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0001")
         t.expect(h.store.critical._critical_intent_v1).to.be_nil()
         t.expect(h.store.critical._critical_ops_v1["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0001"].status).to.equal("ABORTED")
+        t.expect(h.store.critical._critical_ops_oldest_at).to.equal(h.now)
         -- ABORTED 不等于已消费：查询回到 NOT_STARTED
         t.expect(h.critical.query(h.entity, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0001").status).to.equal("NOT_STARTED")
     end)
@@ -1184,6 +1189,40 @@ t.describe("critical 隔离路径", function()
         t.expect(#h.store.updates).to.equal(0)
     end)
 
+    t.it("archives settled operations before rejecting a full ledger", function()
+        local h = harness()
+        local ops = {}
+        for i = 1, h.critical.MAX_OPS do
+            ops[string.format("%032x_%04x", i, i)] = {
+                status = "COMMITTED",
+                op_type = "shop.buy",
+                param_hash = string.rep("a", 64),
+                at = h.now - 100,
+            }
+        end
+        h.store.critical._critical_ops_v1 = ops
+        h.store.critical._critical_ops_oldest_at = h.now - 100
+        local archived = 0
+        local ledger = {
+            critical_find = function()
+                return nil
+            end,
+            critical_find_and_modify = function()
+                archived = archived + 1
+                return "CONFIRMED", { n = 1, nModified = 1 }
+            end,
+        }
+
+        local result = h.client(1, nil, nil, { ledger = ledger })
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+        t.expect(archived).to.equal(h.critical.CAPACITY_ARCHIVE_LIMIT)
+        local left = 0
+        for _ in pairs(h.store.critical._critical_ops_v1) do
+            left = left + 1
+        end
+        t.expect(left).to.equal(h.critical.MAX_OPS - h.critical.CAPACITY_ARCHIVE_LIMIT + 1)
+    end)
+
     -- 纯读预检拒绝不产生写入，也不该烧掉内部凭证
     t.it("does not consume the capability on a precheck rejection", function()
         local h = harness()
@@ -1464,6 +1503,25 @@ t.describe("critical 源侧 Outbox", function()
         })
         t.expect(result.status).to.equal(h.critical.STATUS.PRECHECK_REJECTED)
         t.expect(h.applied).to.equal(0)
+        t.expect(#h.store.updates).to.equal(0)
+    end)
+
+    t.it("refuses a param_hash that is 64 characters but not hex", function()
+        local h = harness()
+        local event = {
+            event_id = EVENT_ID,
+            target_type = "role",
+            target_id = 9,
+            op_type = "mail.send",
+            param_hash = string.rep("z", 64),
+            payload = PAYLOAD,
+            status = "PENDING",
+            attempt = 0,
+            created_at = h.now,
+        }
+        local result = internal(h, { outbox = { event } })
+        t.expect(result.status).to.equal(h.critical.STATUS.PRECHECK_REJECTED)
+        t.expect(result.reason).to.match("64 hex param_hash")
         t.expect(#h.store.updates).to.equal(0)
     end)
 
