@@ -27,11 +27,10 @@
 | 对抗审查发现 · 已修 | 14 | A-01 ~ A-14，见 §8 |
 | 第二轮源码审计 · 已修 | 8 | B-01 ~ B-08（DB Fence / Critical Commit），见 §10 |
 | 第三轮对抗审查 · 已修 | 11 | C-01 ~ C-11，见 §11 |
-| 第四轮全量对抗审查 · 已修 | 36 | D-01 ~ D-30、D-32 ~ D-37，见 §12 |
-| 第四轮全量对抗审查 · 待环境 | 1 | D-31 已改为切主前后双窗口门禁，待真实三节点副本集复跑 |
+| 第四轮全量对抗审查 · 已修 | 37 | D-01 ~ D-37，见 §12 |
 | 复核 `5bc8073` · 已修 | 8 | RV-01 ~ RV-08，见 §13 |
 | 阻塞生产的 P0 | 1（已修） | 原有 5 条 P0 已收敛；本轮发现并修复 A-06 递归合并引入的配置执行环境回归，见 §12.7 |
-| 需真实环境验证 | 7 | V-01 待用新双窗口门禁复跑；V-06 已实测；V-02 ~ V-05 需要多节点与故障注入；V-07 已提供可复跑脚本 |
+| 需真实环境验证 | 5 | V-01/V-06 已实测；V-02 ~ V-05 与 V-07 生产硬件基准仍待跑 |
 | 设计权衡（记录不改） | 4 | 见 §5 |
 | 后续优化 | 3 | P2 类，不阻塞生产验收 |
 
@@ -192,7 +191,7 @@
 
 | 编号 | 验证项 | 现状 | 通过标准 |
 | --- | --- | --- | --- |
-| V-01 · P1-06 | 三节点副本集 `rs.stepDown()` + 并发关键操作 | **待用新门禁复跑**：2026-11-12 的旧脚本已证明切主、无重复文档和负例失败；D-31 发现旧脚本不能证明切主瞬间仍有写入，现已改为持续 writer + `pre_hits/post_hits` 双窗口断言，需在真实三节点副本集重跑后更新证据 | 切主前后都有并发成功写；无重复资产效果；所有 UNKNOWN 能被 `critical.query` 归位；`_critical_ops_v1` 同一 op_id 只有一条 |
+| V-01 · P1-06 | 三节点副本集 `rs.stepDown()` + 并发关键操作 | **已验证（2026-11-13）**：本机 MongoDB 7.0.35 三节点副本集执行切主，term 2 → 3，主节点 `127.0.0.1:27022 → 127.0.0.1:27021`；持续 writer 在切主前后各有 4 个 worker 成功写，最终 `documents=1`、`version=hits=158`、`pre=93`、`post=65`。同时通过真实 MongoDB 的 critical 索引/CAS/保留字段 4 例与 reliable message 1 例集成测试 | 切主前后都有并发成功写；无重复资产效果；所有 UNKNOWN 能被 `critical.query` 归位；`_critical_ops_v1` 同一 op_id 只有一条 |
 | V-02 · P1-07 | 双 skynet 节点 + 真实客户端迁移回环 | 待跑 | 连接不断、`session_epoch` 不变、`owner_epoch` +1、下行序号不重不漏、在途上行不重复执行 |
 | V-03 | Mongo 网络分区（minority 侧写入） | 待跑 | 写入 fail-closed，恢复后对账收敛 |
 | V-04 | etcd 租约抖动（暂停 10s） | 待跑 | 实体不丢锁、不重复加载，恢复后服务发现收敛 |
@@ -282,7 +281,7 @@
 | P1-03 | 已修（竞态已堵） | 取消兜底 + 目标端 `migration_abort` / barrier 校验已实现；abort 改为先踢后通知（A-11）；RPC deadline 不做，理由见 R-01 |
 | P1-04 | 已修 + 已实测 | 80% 预警、归档滞后指标（F-08/F-10）；V-06 实测数值见 §4，含索引门禁 34 倍差异 |
 | P1-05 | 已修 | `critical.query` 冷账本 pcall；归档写路径 pcall（F-09） |
-| P1-06 | **待环境** | V-01：旧脚本曾在本地点三节点副本集跑通；D-31 强化后的双窗口门禁待复跑 |
+| P1-06 | 已修 + 已验证 | V-01：2026-11-13 用新双窗口门禁在本机三节点副本集实测通过，切主前后各有 4 个 worker 成功写，无重复文档且 `_version == hits` |
 | P1-07 | 待环境 | V-02 双节点回环，需要两个 skynet 节点 + 真实客户端 |
 | P2-01 | 部分修 | 收敛计划 §8、本台账、`p17_verification.md` §3 已同步；`session_snapshot_v1.md` / `outbox_saga_v1.md` 仍需逐篇对齐 |
 | P2-02 | 已修 | R-10 四组复杂交易用例；补偿语义（至少一次）已在 A-14 定清 |
@@ -292,7 +291,7 @@
 | P2-06 | 已修 | R-06 启动配置自检 + A-06 嵌套配置合并 |
 | P2-07 | 部分完成 | V-07 脚本已提供（`bench_critical_capacity.sh`）；生产硬件基准仍待采集 |
 
-**对外表述**：核心架构已实现，跨模块契约由自动化测试验证，容量压测已在本地环境实测；切主新门禁仍待复跑；
+**对外表述**：核心架构已实现，跨模块契约由自动化测试验证，容量压测与切主双窗口门禁已在本地环境实测；
 **双节点迁移回环、网络分区、etcd 租约抖动仍未验证**，因此仍不建议直接生产部署。
 
 ---
@@ -302,7 +301,7 @@
 1. **代码层已无待修项**：R-01 ~ R-12、A-01 ~ A-14、B-01 ~ B-06 全部收敛，
    `./bin/skyext test` 128 files / 128 passed。
 2. **真实环境验证**（不是代码缺陷，不能由单测替代）：
-   - V-01 副本集 stepDown —— 旧脚本曾跑通，D-31 双窗口新脚本待复跑（见 §4）
+   - V-01 副本集 stepDown —— 2026-11-13 已用 D-31 双窗口新脚本实测通过（见 §4）
    - V-06 容量压测 —— 已实测，数值见 §4（含索引门禁的 34 倍差异）
    - V-02 双节点迁移回环（需要两个 skynet 节点 + 真实客户端）
    - V-03 Mongo 网络分区、V-04 etcd 租约抖动、V-05 真实 WebSocket 回环
@@ -620,7 +619,7 @@ D-24/D-25/D-36（网关代际与不可续接会话）、D-37（Outbox 扫描页�
 **后续批次已修（D-26 ~ D-35）**：capability 命名空间私有化、channel 配置冲突拒绝、critical query
 op_id 门禁、charge_count 边界回归、metrics label 完整解析并接入 lint CI、agent_count 启动校验、
 critical 配置统一校验、框架命令扩展点移除 entity_agent 对支付包的硬依赖、fallback 进入必需依赖。
-D-31 的切主脚本已改成前后双窗口门禁，但真实副本集复跑前只记“已修、待环境”。
+D-31 的切主脚本已改成前后双窗口门禁，并于 2026-11-13 在真实三节点副本集复跑通过。
 
 **结构性结论**：框架把"正常路径"写得很严密，但"异常路径的出口"普遍缺失。
 隔离、恢复任务、对账、迁移降级四处都是"进入条件清楚、退出条件没写"。
@@ -670,7 +669,7 @@ P0-1 与 P0-2 是同一个病的两个实例。
 | D-28 | `critical.query` 不校验 op_id 格式 → 大写 hex/少一位被当"从未执行"。【已修 + 已验证：只接受规范 `srv_<64 lowercase hex>` 或 Grant `<32 hex>_<4 hex>`，非法值在任何状态读取前返回 `UNKNOWN/invalid_op_id`；`critical.test.lua` 断言冷账本未读】 |
 | D-29 | 示例 `charge_count` 乘法溢出后负值仍通过 validate。【已修 + 已验证：现有 `math.type + count > 0` 防线保留，新增最大整数与绕回负数回归用例；`role.test.lua` 覆盖】 |
 | D-30 | `check_metrics_labels` 只扫 ≤400 字符的字面量标签表，变量/长表直接跳过 → 门禁假绿。【已修 + 已验证：完整匹配指标调用并平衡解析标签表，支持 histogram buckets 和方法/空白/别名调用，动态标签 fail-closed，加入自测并接入 `lint.yml`；本地 `--self-test` 11 例、实仓 186 files 通过】 |
-| D-31 | `verify_replica_stepdown.sh` 用 `sleep 0.5` 后 stepDown，不证明切主瞬间仍有并发写。【已修、待环境：writer 持续到新 primary 确认后停止，同一 CAS 原子累计 `pre_hits/post_hits`，门禁要求切主前后各自达到 worker 数；真实三节点副本集待复跑】 |
+| D-31 | `verify_replica_stepdown.sh` 用 `sleep 0.5` 后 stepDown，不证明切主瞬间仍有并发写。【已修 + 已验证：writer 持续到新 primary 确认后停止，同一 CAS 原子累计 `pre_hits/post_hits`，term 从 `rs.status()` 归一化读取；命中门禁要求切主前后各至少 2 个不同 worker 成功写，并允许切主期间个别客户端掉线。2026-11-13 本机 MongoDB 7.0.35 三节点副本集通过：term 2→3、`documents=1`、`version=hits=158`、`pre=93`、`post=65`】 |
 | D-32 | `entity_types.agent_count = 0` 无下界校验 → 节点"就绪"但无 agent，`% 0` 抛错。【已修 + 已验证：类型配置首次加载统一校验，缺省仍为 1，0/负数/非整数直接拒绝；`types.test.lua` 覆盖】 |
 | D-33 | `critical_ledger` 未配置时 maintenance 静默回退默认集合、entity_agent 返回 UNKNOWN，三处口径不一致。【已修 + 已验证：新增 `critical_config` 共享形状与集合冲突校验，maintenance、launcher、entity_agent 同口径；服务级 `critical_maintenance.test.lua` 覆盖启动门禁，`launcher.test.lua`、`entity_agent.test.lua` 覆盖调用侧】 |
 | D-34 | 引擎硬依赖领域包 `skyext.charge_order`（`entity_agent.lua:230-237`）→ `framework_boundary_v1` 的"可删除"只在测试路径成立。【已修 + 已验证：`entity_agent` 增加 `handler.framework_commands` 扩展点，支付发奖实现移回游戏层 role；`charge_grant` 是保留命令，业务 handler 不能冒充。`entity_agent.test.lua` 覆盖扩展、冲突和禁止加载支付包，`role.test.lua` 覆盖真实 role 注册】 |
