@@ -181,6 +181,21 @@ function CMD.start(conf)
             if not ok or type(result) ~= "table" then
                 return { status = "UNKNOWN", reason = tostring(result) }
             end
+            if result.discard == true then
+                -- 意图已确认取消，但内存可能带着 apply 的痕迹。卸载实体让下一次
+                -- 请求从库重读——不这么做，被污染的副本会继续服务到 idle 超时。
+                -- 这一步必须在 resolve 返回之后做：resolve 本身在实体队列里
+                local unloaded, uerr = call_owner(g_opts.type_name, rid, "unload_entity", rid)
+                if not unloaded then
+                    log.warn(
+                        "critical resolve could not unload the entity",
+                        "rid",
+                        tostring(rid),
+                        "err",
+                        tostring(uerr)
+                    )
+                end
+            end
             return result
         end,
         finish = function(rid, op_id, version, state)

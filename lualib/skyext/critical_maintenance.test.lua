@@ -35,6 +35,36 @@ t.describe("critical_maintenance 扫描", function()
         t.expect(coll.calls[1].query[critical.OPS_OLDEST_FIELD]["$lte"]).to.equal(500)
     end)
 
+    -- 卡住的文档不会离开候选集：不轮转的话它会永远占住前 limit 个名额，
+    -- 后面的角色一个都排不进来，最终撞上 MAX_OPS 后该角色所有关键操作被拒
+    t.it("rotates the archive scan so stuck documents cannot starve the rest", function()
+        local page1 = {
+            { rid = 1, [critical.OPS_OLDEST_FIELD] = 100 },
+            { rid = 2, [critical.OPS_OLDEST_FIELD] = 101 },
+        }
+        local page2 = { { rid = 3, [critical.OPS_OLDEST_FIELD] = 102 } }
+        -- 顺序：第一轮 archive -> intents；第二轮 archive -> intents
+        local coll = fake_coll(page1, {}, page2, {})
+        local deps = {
+            role_coll = coll,
+            archive = function()
+                return true, { archived = 0 }
+            end,
+            ensure_job = function() end,
+        }
+        local opts = { now = 1000, retention = 500, limit = 2 }
+
+        assert(maintenance.run_once(deps, opts))
+        t.expect(coll.calls[1].opts.skip).to.equal(0)
+        -- 满页：游标翻到下一页
+        t.expect(deps.archive_cursor).to.equal(2)
+
+        assert(maintenance.run_once(deps, opts))
+        t.expect(coll.calls[3].opts.skip).to.equal(2)
+        -- 不满页：回到开头，下一轮从第一个角色重新开始
+        t.expect(deps.archive_cursor).to.equal(0)
+    end)
+
     t.it("queries roles that still hold a PREPARED intent", function()
         local coll = fake_coll({
             { rid = 2, [critical.INTENT_FIELD] = { op_id = "srv_x", prepared_at = 10 } },

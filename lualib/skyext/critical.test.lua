@@ -70,6 +70,25 @@ local function fake_dbmgr(store)
         return store.critical
     end
 
+    -- 多数派读：真实实现从库里重新提取关键元数据并推进 _version。
+    -- 桩用 persisted_critical / persisted_version 模拟"库里的真相"——
+    -- 它可以比内存多一条 PREPARE 意图（PREPARE 落库但 ACK 丢失就是这个状态）
+    function M.refresh_critical()
+        if store.refresh_fails then
+            return nil, store.refresh_fails
+        end
+        if store.persisted_version and store.doc then
+            while store.doc._version < store.persisted_version do
+                local current = store.doc._version
+                assert(orm.advance_persisted_version(store.doc, current, current + 1))
+            end
+        end
+        if store.persisted_critical then
+            store.critical = store.persisted_critical
+        end
+        return true, store.doc and store.doc._version or 0
+    end
+
     function M.set_critical(_, _, _, critical)
         store.critical = critical
         return true
@@ -95,6 +114,15 @@ local function fake_dbmgr(store)
         return true
     end
 
+    -- 隔离态取消意图之后标作废：内存可能带着 apply 的痕迹，不能再回 NORMAL
+    function M.mark_discarded()
+        if store.state ~= M.STATE.CRITICAL_QUARANTINED then
+            return false, store.state
+        end
+        store.state = M.STATE.DISCARDED
+        return true
+    end
+
     function M.quarantine_critical()
         store.state = M.STATE.CRITICAL_QUARANTINED
         return true
@@ -103,7 +131,7 @@ local function fake_dbmgr(store)
     function M.critical_update(_, _, _, _, expected, update, opts)
         store.updates[#store.updates + 1] = { expected = expected, update = update, handle = opts and opts.handle }
         local n = #store.updates
-        if store.state == M.STATE.CRITICAL_QUARANTINED then
+        if store.state == M.STATE.CRITICAL_QUARANTINED and not (opts and opts.allow_quarantined_intent_abort) then
             return "REJECTED", "CRITICAL_QUARANTINED", M.REASON.STATE_INVALID
         end
         -- unknown_at / reject_at 只让第 N 次写入失败，用来单独覆盖 PREPARE 与 COMMIT 两条路径
@@ -737,6 +765,50 @@ t.describe("critical 查询与恢复", function()
         t.expect(q2.intent_op_id).to.equal(own)
     end)
 
+    -- PREPARE 落库但 ACK 丢失：commit_core 的 UNKNOWN 分支不会 set_critical，
+    -- 所以内存里没有意图，而库里有一条 PREPARED。恢复任务若按内存判定，
+    -- 会把"已写入 PREPARE"当成"从未执行"，任务写成 COMPLETED 后再也复不开
+    t.it("reads the persisted intent when asked for a majority read", function()
+        local h = harness()
+        local own = "srv_" .. string.rep("c", 64)
+        h.store.persisted_critical = { _critical_intent_v1 = { op_id = own, state = "PREPARED" } }
+        h.store.persisted_version = 2
+
+        -- 默认读内存：看不到库里的意图
+        t.expect(h.critical.query(h.entity, own).status).to.equal("NOT_STARTED")
+
+        -- 多数派读：看到库里的 PREPARED，并带回归属
+        local proof = h.critical.query(h.entity, own, { majority_read = true })
+        t.expect(proof.status).to.equal(h.critical.STATUS.IN_PROGRESS)
+        t.expect(proof.intent_op_id).to.equal(own)
+        t.expect(h.doc._version).to.equal(2)
+    end)
+
+    t.it("reports UNKNOWN instead of NOT_STARTED when the majority read fails", function()
+        local h = harness()
+        h.store.refresh_fails = "socket closed"
+        local proof = h.critical.query(h.entity, "srv_" .. string.rep("d", 64), { majority_read = true })
+        t.expect(proof.status).to.equal(h.critical.STATUS.UNKNOWN)
+    end)
+
+    -- abort_intent 也要能按库里的意图取消：只读内存会回 "no pending intent"，
+    -- 库里那条 PREPARED 就永远清不掉，角色重载后所有关键操作回 IN_PROGRESS
+    t.it("aborts a persisted intent after aligning with the majority read", function()
+        local h = harness()
+        local own = "srv_" .. string.rep("e", 64)
+        h.store.persisted_critical = {
+            _critical_intent_v1 = { op_id = own, op_type = "buy", param_hash = string.rep("a", 64) },
+        }
+        h.store.persisted_version = 1
+        h.store.state = h.dbmgr.STATE.CRITICAL_QUARANTINED
+
+        local state = h.critical.abort_intent(h.entity, { majority_read = true })
+        t.expect(state).to.equal("CONFIRMED")
+        -- 隔离态取消意图后必须标作废：内存可能带着 apply 的痕迹，不能回 NORMAL
+        t.expect(h.store.state).to.equal(h.dbmgr.STATE.DISCARDED)
+        t.expect(h.store.critical._critical_intent_v1).to.be_nil()
+    end)
+
     t.it("reports EXPIRED_NOT_EXECUTED only when there is no record", function()
         local h = harness()
         local q = h.critical.query(h.entity, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0002", {
@@ -1365,6 +1437,28 @@ t.describe("critical 源侧 Outbox", function()
         local result = internal(h, {
             outbox = { { event_id = "evt_short", status = "PENDING" } },
         })
+        t.expect(result.status).to.equal(h.critical.STATUS.PRECHECK_REJECTED)
+        t.expect(h.applied).to.equal(0)
+        t.expect(#h.store.updates).to.equal(0)
+    end)
+
+    -- 同一批里两个分片用了同一个 event_id：`$set` 同一路径写两次只留最后一份，
+    -- 但 pending_count 按 #events 计。第二个分片的业务效果永久丢失，计数还永不收敛
+    t.it("refuses a batch that reuses an event_id", function()
+        local h = harness()
+        local event_id = "evt_" .. string.rep("1", 64)
+        local function shard()
+            return {
+                event_id = event_id,
+                target_type = "role",
+                target_id = 9,
+                op_type = "mail.send",
+                param_hash = string.rep("a", 64),
+                status = "PENDING",
+            }
+        end
+
+        local result = internal(h, { outbox = { shard(), shard() } })
         t.expect(result.status).to.equal(h.critical.STATUS.PRECHECK_REJECTED)
         t.expect(h.applied).to.equal(0)
         t.expect(#h.store.updates).to.equal(0)

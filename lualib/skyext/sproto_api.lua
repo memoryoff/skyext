@@ -316,6 +316,20 @@ function M.raw_dispatch(fd, type, request_name, request, response_cb, req_id)
         local sess = request_name
         local pending = g_sessions[sess]
         if pending then
+            -- 必须校验来源连接：session 编号是客户端自己选的，只按编号唤醒的话，
+            -- 任意连接（含未登录连接）发一个 session=N 就能注入/伪造别人的响应
+            if pending.fd ~= nil and pending.fd ~= fd then
+                log.warn(
+                    "drop a sproto response from a foreign connection",
+                    "session",
+                    tostring(sess),
+                    "expected",
+                    tostring(pending.fd),
+                    "got",
+                    tostring(fd)
+                )
+                return false
+            end
             return wakeup_call(pending, request)
         end
     end

@@ -213,6 +213,10 @@ local function validate_outbox_events(events)
     if type(events) ~= "table" then
         return nil, "outbox must be a table"
     end
+    -- 批内 event_id 必须唯一：同一次 CAS 里 `$set` 同一路径写两次只留最后一份，
+    -- 而 pending_count 按 #events 计。结果是第二个分片的业务效果永久丢失，
+    -- 计数还比真实事件多，worker 每轮命中该角色永不收敛
+    local seen = {}
     for i, ev in ipairs(events) do
         if type(ev) ~= "table" then
             return nil, "outbox event #" .. i .. " must be a table"
@@ -220,6 +224,10 @@ local function validate_outbox_events(events)
         if not field_name_safe(ev.event_id) then
             return nil, "outbox event #" .. i .. " has an invalid event_id"
         end
+        if seen[ev.event_id] then
+            return nil, "outbox event #" .. i .. " duplicates event_id " .. ev.event_id
+        end
+        seen[ev.event_id] = true
         local _, oerr = M.service_op_id_from_event(ev.event_id)
         if oerr then
             return nil, "outbox event #" .. i .. " has an invalid event_id"
@@ -1141,6 +1149,20 @@ function M.query(entity, op_id, opts)
         -- 读不到不等于没执行过
         return { status = M.STATUS.UNKNOWN, reason = "document not loaded" }
     end
+    if opts.majority_read then
+        -- 内存副本可能落后于库：PREPARE 落库但 ACK 丢失时，`commit_core` 的 UNKNOWN
+        -- 分支不会 `set_critical`，内存里根本没有那条意图。恢复任务若按内存判定，
+        -- 就会把"已写入 PREPARE"当成"从未执行"，把任务写成 COMPLETED 后再也复不开。
+        -- 这里用多数派读把版本与关键元数据对齐，之后的判断才代表持久化事实
+        local ok, ver = dbmgr.refresh_critical(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, { handle = ctx.handle })
+        if not ok then
+            return { status = M.STATUS.UNKNOWN, reason = "majority read failed: " .. tostring(ver) }
+        end
+        critical = critical_of(ctx)
+        if critical == nil then
+            return { status = M.STATUS.UNKNOWN, reason = "document not loaded" }
+        end
+    end
     local op = lookup_op(critical, op_id)
     if not op and opts.ledger then
         -- 热条目已经被归档：不查冷账本就会把"已提交"报成"没执行"，
@@ -1203,6 +1225,13 @@ function M.abort_intent(ctx_or_entity, opts)
     if not ctx then
         return "REJECTED", "invalid context"
     end
+    if opts.majority_read then
+        -- 与 query 同因：内存里没有意图不代表库里没有。恢复任务必须先对齐持久化状态
+        local ok, ver = dbmgr.refresh_critical(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, { handle = ctx.handle })
+        if not ok then
+            return "UNKNOWN", "majority read failed: " .. tostring(ver)
+        end
+    end
     local critical = critical_of(ctx)
     local intent = critical and critical[M.INTENT_FIELD]
     if not intent then
@@ -1219,7 +1248,7 @@ function M.abort_intent(ctx_or_entity, opts)
     local state, detail = dbmgr.critical_update(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, ctx.doc._version, {
         ["$set"] = { [M.OPS_FIELD .. "." .. intent.op_id] = op_doc },
         ["$unset"] = { [M.INTENT_FIELD] = true },
-    }, { handle = ctx.handle })
+    }, { handle = ctx.handle, allow_quarantined_intent_abort = true })
     if state ~= "CONFIRMED" then
         return state, detail
     end
@@ -1228,6 +1257,9 @@ function M.abort_intent(ctx_or_entity, opts)
     copy[M.OPS_FIELD] = copy[M.OPS_FIELD] or {}
     copy[M.OPS_FIELD][intent.op_id] = op_doc
     dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, copy, ctx.handle)
+    -- 隔离态取消意图之后，内存里的普通字段仍可能带着 apply 的痕迹，不能回 NORMAL
+    -- 继续服务。标作废，让 unload 直接丢弃，下一次请求从库重读就是干净状态
+    dbmgr.mark_discarded(ctx.dbname, ctx.dbcoll, ctx.unique_id, ctx.handle)
     return "CONFIRMED", { version = detail.version, op_id = intent.op_id }
 end
 

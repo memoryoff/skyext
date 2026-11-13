@@ -57,6 +57,9 @@ function M.scan_archive(role_coll, opts)
     local called, docs, err = pcall(role_coll.find_many, role_coll, critical.archive_query(opts.now, opts.retention), {
         projection = { [key] = 1, [critical.OPS_OLDEST_FIELD] = 1, _id = 0 },
         limit = opts.limit or M.DEFAULT_SCAN,
+        -- 轮转：卡住的文档不会离开候选集，不 skip 的话它会永远占住前 N 个名额，
+        -- 后面的角色一个都排不进来
+        skip = opts.skip or 0,
     })
     if not called then
         return nil, "scan failed: " .. tostring(docs)
@@ -121,9 +124,24 @@ function M.run_once(deps, opts)
     end
     local stats = { archived = 0, intents = 0, skipped = 0, failed = 0 }
 
-    local candidates, aerr = M.scan_archive(deps.role_coll, opts)
+    -- 归档候选的轮转游标：卡住的文档（加载失败、节点不可达）不会离开候选集，
+    -- 每轮都从 0 开始扫的话，≥limit 个卡住文档就能让后面的角色永远排不进来，
+    -- 最终撞上 MAX_OPS 后该角色所有关键操作被拒。满页就翻页，不满页回到开头
+    local archive_skip = deps.archive_cursor or 0
+    local candidates, aerr = M.scan_archive(deps.role_coll, {
+        now = opts.now,
+        retention = opts.retention,
+        limit = opts.limit,
+        key = opts.key,
+        skip = archive_skip,
+    })
     if not candidates then
         return nil, aerr
+    end
+    if #candidates >= (opts.limit or M.DEFAULT_SCAN) then
+        deps.archive_cursor = archive_skip + #candidates
+    else
+        deps.archive_cursor = 0
     end
     m_candidates:set(#candidates, { task = "archive" })
     -- 滞后用扫描结果里的 oldest 算：不用等归档跑完就能看出积压

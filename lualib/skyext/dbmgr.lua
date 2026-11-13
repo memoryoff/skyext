@@ -673,6 +673,44 @@ local ALLOWED_UPDATE_OPERATORS = {
     ["$unset"] = true,
 }
 
+-- 隔离态唯一允许的写入形状：把未决意图转成 ABORTED 终态并清掉意图。
+-- 只碰 `_critical_ops_v1.<op_id>` 与 `_critical_intent_v1`，不碰任何业务字段，
+-- 所以不会把 apply 污染过的内存副本写回库。
+--
+-- 没有这条通道时隔离是单行道：恢复任务唯一能写库的入口就是 critical_update，
+-- 而它在隔离态一律 REJECTED，任务只能永远 RETRY_WAIT，角色永久卡死。
+local function is_intent_abort_shape(update)
+    local set = update["$set"]
+    local unset = update["$unset"]
+    if type(set) ~= "table" or type(unset) ~= "table" then
+        return false
+    end
+    -- $unset 必须且只能是意图字段
+    local unset_count = 0
+    for path in pairs(unset) do
+        if path ~= critical_fields.INTENT then
+            return false
+        end
+        unset_count = unset_count + 1
+    end
+    if unset_count ~= 1 then
+        return false
+    end
+    -- $set 必须且只能是一条操作记录
+    local prefix = critical_fields.OPS .. "."
+    local set_count = 0
+    for path, value in pairs(set) do
+        if type(path) ~= "string" or path:sub(1, #prefix) ~= prefix then
+            return false
+        end
+        if type(value) ~= "table" then
+            return false
+        end
+        set_count = set_count + 1
+    end
+    return set_count == 1
+end
+
 -- 关键 CAS。
 -- expected_version 是调用方认为的当前持久化版本，函数内部补齐 key/_version/_fence 三个条件，
 -- 调用方只需要给 update（只允许 $set / $unset）。
@@ -700,8 +738,15 @@ function M.critical_update(dbname, dbcoll, key, unique_id, expected_version, upd
             return "REJECTED", "owner changed", M.REASON.OWNER_CHANGED
         end
         local state = entry.state or M.STATE.NORMAL
-        if state == M.STATE.CRITICAL_QUARANTINED or state == M.STATE.DISCARDED then
+        if state == M.STATE.DISCARDED then
             return "REJECTED", state, M.REASON.STATE_INVALID
+        end
+        if state == M.STATE.CRITICAL_QUARANTINED then
+            -- 隔离态只有一条写通道：取消未决意图。它不碰业务字段，
+            -- 因此不会把 apply 污染过的内存副本写回库；恢复任务靠它才能推进
+            if not opts.allow_quarantined_intent_abort or not is_intent_abort_shape(update) then
+                return "REJECTED", state, M.REASON.STATE_INVALID
+            end
         end
         if entry.doc._version ~= expected_version then
             -- 内存版本和调用方的预期已经不一致，再发出去只会是无效 CAS
@@ -971,6 +1016,33 @@ function M.unload(dbname, dbcoll, key, unique_id)
         if not cache then
             return false
         end
+        local state = cache.state or M.STATE.NORMAL
+        if state == M.STATE.DISCARDED then
+            -- 已确定作废：库里是权威，内存这份不再要了
+            save_wheel_obj():remove(cache)
+            cache_collection[unique_id] = nil
+            return true
+        end
+        if state == M.STATE.CRITICAL_QUARANTINED then
+            -- 隔离且没有未决意图：库里从没写过 PREPARE，内存里的脏数据只属于那次
+            -- 失败的操作，丢掉重读是安全的（与 load 同口径）。有意图时必须等恢复
+            -- 任务判定——那次写入可能已经落库、只是 ACK 丢了
+            if cache.critical and cache.critical[critical_fields.INTENT] then
+                log.warn(
+                    "unload refused, quarantined cache still holds a pending intent",
+                    "dbname",
+                    dbname,
+                    "dbcoll",
+                    dbcoll,
+                    "unique_id",
+                    unique_id
+                )
+                return false
+            end
+            save_wheel_obj():remove(cache)
+            cache_collection[unique_id] = nil
+            return true
+        end
         local ok = save_doc(cache, get_collection_obj(dbname, dbcoll))
         if not ok or orm.is_dirty(cache.doc) then
             log.error(
@@ -1019,6 +1091,30 @@ function M.quarantine(dbname, dbcoll, unique_id, handle)
             return false
         end
         return save_wheel_obj():remove(cache)
+    end)
+end
+
+-- 隔离条目已经通过"取消意图"确认没有业务效果，但内存里的普通字段可能已被
+-- apply 污染，不能回到 NORMAL 继续服务（那会让下一次普通回存把污染写进库）。
+-- 标 DISCARDED 让 unload 直接丢弃，下一次请求从库重读就是干净状态。
+function M.mark_discarded(dbname, dbcoll, unique_id, handle)
+    check_collection(dbname, dbcoll)
+    return with_row_lock(dbname, dbcoll, unique_id, function()
+        local entry = get_entry(dbname, dbcoll, unique_id)
+        if not entry then
+            return false, "not cached"
+        end
+        if handle and entry.handle ~= handle then
+            return false, "owner changed"
+        end
+        local state = entry.state or M.STATE.NORMAL
+        if state ~= M.STATE.CRITICAL_QUARANTINED then
+            return false, state
+        end
+        entry.state = M.STATE.DISCARDED
+        -- 摘回存轮：作废的条目不该再参与普通回存
+        save_wheel_obj():remove(entry)
+        return true
     end)
 end
 

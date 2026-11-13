@@ -652,7 +652,44 @@ function M.pump(ctx, deliver, opts)
                     -- 状态未决：不再继续处理后面的事件，避免在不确定的文档上叠加写入
                     return stats
                 else
-                    -- BLOCKED（租约/归属/多数派不可用）或重试用尽：保持顺序，本轮停止
+                    -- BLOCKED（租约/归属/多数派不可用）是环境问题，不计数，本轮停止
+                    if state == "REJECTED" then
+                        -- 重试用尽多半是内存版本落后：_advance 的重试读的是同一份缓存，
+                        -- 永远看不到别人推进的结果。先多数派读对齐，再看事件是否还在
+                        -- PENDING：已被推进就不计数（别人做完了）；仍是 PENDING 才记一次
+                        -- 尝试，到阈值标 FAILED。不记的话事件永远 PENDING、每 5 秒重投
+                        -- 一条可靠消息，毒事件阈值对它完全失效
+                        local refreshed = dbmgr.refresh_critical(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, {
+                            handle = ctx.handle,
+                        })
+                        if refreshed then
+                            local fresh = dbmgr.cached_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id)
+                            local current = fresh and fresh[M.FIELD] and fresh[M.FIELD][event.event_id]
+                            if type(current) == "table" and current.status == M.STATUS.PENDING then
+                                local attempts = (current.deliver_attempts or 0) + 1
+                                if attempts >= (opts.max_deliver_attempts or M.MAX_DELIVER_ATTEMPTS) then
+                                    local quarantined = M._quarantine_event(
+                                        ctx,
+                                        event,
+                                        fresh,
+                                        now,
+                                        attempts,
+                                        "status CAS kept missing",
+                                        max_retry
+                                    )
+                                    if quarantined then
+                                        critical_table = quarantined
+                                        stats.quarantined = stats.quarantined + 1
+                                    end
+                                else
+                                    local noted = M._note_deliver_attempt(ctx, event, fresh, now, attempts, max_retry)
+                                    if noted then
+                                        critical_table = noted
+                                    end
+                                end
+                            end
+                        end
+                    end
                     break
                 end
             end
@@ -982,6 +1019,8 @@ local RECEIVER_MT = {}
 RECEIVER_MT.__index = RECEIVER_MT
 
 -- opts.namespace 默认 "outbox"；opts.op_types 限定该接收方能处理哪些操作
+-- opts.ledger 冷账本集合：**必须给**。热账本 7 天后归档，没有冷账本就无法证明
+-- 同一个 service_op_id 执行过，重投就是二次入账
 function M.new_receiver(opts)
     opts = opts or {}
     -- 来源命名空间固定为 outbox：调用方不能自报一个受信任来源名，否则
@@ -998,7 +1037,12 @@ function M.new_receiver(opts)
     if not issuer then
         return nil, err
     end
-    return setmetatable({ issuer = issuer, hash_fn = opts.hash_fn, namespace = namespace }, RECEIVER_MT)
+    return setmetatable({
+        issuer = issuer,
+        hash_fn = opts.hash_fn,
+        namespace = namespace,
+        ledger = opts.ledger,
+    }, RECEIVER_MT)
 end
 
 -- 返回 handler 应当原样返回的值：
@@ -1012,6 +1056,12 @@ function RECEIVER_MT:handle(entity, envelope, handlers, opts)
     if not ok then
         log.error("reject outbox envelope", "err", verr, "id", tostring(entity and entity.id))
         return nil, verr
+    end
+    -- 冷账本缺失是部署错误，不是"这条事件有问题"。放行等于承认"热账本没有 =
+    -- 从没执行过"，热条目 7 天归档后同一条事件重投就会二次入账。宁可卡住等修配置
+    if not self.ledger then
+        log.error("outbox receiver has no ledger", "event", tostring(envelope.event_id))
+        return delivery.retryable("receiver ledger is not configured")
     end
     if envelope.target_type ~= entity.type_name or id_key(envelope.target_id) ~= id_key(entity.id) then
         -- 错投：不是本实体的事件，绝不能在本实体上执行
@@ -1073,6 +1123,9 @@ function RECEIVER_MT:handle(entity, envelope, handlers, opts)
             hash_fn = hash_fn,
             source_namespace = self.namespace,
             source_id = source_id,
+            -- 热账本归档后，去重只能靠冷账本。不传就等于"热账本没有 = 从没执行过"，
+            -- 7 天后同一条事件重投会把业务效果再执行一遍
+            ledger = self.ledger,
             now = now,
         })
     local status = result.status

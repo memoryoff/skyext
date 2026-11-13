@@ -47,6 +47,13 @@ local function fake_dbmgr(store)
     end
     function M.refresh_critical()
         store.refreshed = (store.refreshed or 0) + 1
+        -- 多数派读会把内存版本对齐到库里的真实值（store.db_version 模拟"库里更高"）
+        if store.db_version then
+            while store.doc._version < store.db_version do
+                local current = store.doc._version
+                assert(orm.advance_persisted_version(store.doc, current, current + 1))
+            end
+        end
         return true, store.doc._version
     end
     function M.critical_update(_, _, _, _, expected, update, opts)
@@ -58,9 +65,11 @@ local function fake_dbmgr(store)
         if store.reject then
             return "REJECTED", store.reject_detail or "cas mismatch"
         end
-        if store.doc._version ~= expected then
+        local db_version = store.db_version or store.doc._version
+        if db_version ~= expected then
             return "REJECTED", "version mismatch"
         end
+        store.db_version = expected + 1
         assert(orm.advance_persisted_version(store.doc, expected, expected + 1))
         return "CONFIRMED", { version = expected + 1, n = 1, nModified = 1 }
     end
@@ -313,6 +322,23 @@ t.describe("outbox 投递", function()
         t.expect(#(h.store.cas or {})).to.equal(1)
     end)
 
+    -- CAS 重试用尽也要记一次尝试：不记的话事件永远 PENDING、每 5 秒重投一条
+    -- 可靠消息（约 1.7 万条/天），毒事件阈值对它完全失效
+    t.it("counts a delivery attempt when the status CAS keeps missing", function()
+        local h = harness()
+        h.seed({ assert(h.event()) })
+        -- 内存版本落后库：_advance 的重试读的是同一份缓存，必然耗尽
+        h.store.db_version = 3
+        local stats = assert(h.outbox.pump(h.ctx, function()
+            return true
+        end, { now = 100 }))
+        t.expect(stats.failed).to.equal(1)
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].status).to.equal("PENDING")
+        -- 多数派读对齐版本之后记下尝试次数，下一轮才有机会走到阈值
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].deliver_attempts).to.equal(1)
+        t.expect((h.store.refreshed or 0) >= 1).to.equal(true)
+    end)
+
     t.it("treats a raising deliver function as an unconfirmed delivery", function()
         local h = harness()
         h.seed({ assert(h.event()) })
@@ -473,7 +499,10 @@ local function receiver_harness()
     h.holder = holder
     h.param_hash = assert(real_critical.param_hash_of("mail.send", { item = 1 }, fake_hash()))
 
-    local receiver, err = h.outbox.new_receiver({ hash_fn = fake_hash(), op_types = { "mail.send" } })
+    -- 冷账本是"至多一次"的另一半：receiver 缺它会 fail-closed，这里给一个空集合
+    local ledger = {}
+    h.ledger = ledger
+    local receiver, err = h.outbox.new_receiver({ hash_fn = fake_hash(), op_types = { "mail.send" }, ledger = ledger })
     assert(receiver, err)
     h.receiver = receiver
     h.entity = {
@@ -494,6 +523,24 @@ local function receiver_harness()
 end
 
 t.describe("outbox 接收方", function()
+    -- 冷账本必须一路传到提交内核：热条目 7 天归档后，去重只能靠它。
+    -- 不传的话 `query` 会退化成"热账本没有 = 从没执行过"，重投就是二次入账
+    t.it("passes the cold ledger through to the commit kernel", function()
+        local h = receiver_harness()
+        h.receiver:handle(h.entity, h.envelope(), {})
+        t.expect(h.holder.calls[1].opts.ledger).to.equal(h.ledger)
+    end)
+
+    -- 没配冷账本是部署错误：拒绝处理（retryable），不能放行
+    t.it("refuses to execute without a cold ledger", function()
+        local h = receiver_harness()
+        local bare = assert(h.outbox.new_receiver({ hash_fn = fake_hash(), op_types = { "mail.send" } }))
+        local result = bare:handle(h.entity, h.envelope(), {})
+        t.expect(require("skyext.entity.delivery").is_retryable(result)).to.equal(true)
+        t.expect(#h.holder.calls).to.equal(0)
+        t.expect(#h.acks).to.equal(0)
+    end)
+
     t.it("issues a capability and runs the internal commit kernel", function()
         local h = receiver_harness()
         local result = h.receiver:handle(h.entity, h.envelope(), {})

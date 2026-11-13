@@ -133,8 +133,19 @@ function M.record(orders_coll, opts)
     if not currency then
         return nil, err
     end
-    if opts.rid == nil then
-        return nil, "rid is required"
+    -- rid 必须是正整数。实体路由（placement.calc_node）对非整数直接 error，
+    -- 而 JSON 渠道把商户参数按字符串回传极常见（"7" 而不是 7）。放过去的结果是：
+    -- 订单落单成功、发奖永远抛错、渠道每次重推都 500、对账 query_op 同样抛错 →
+    -- 永远 UNKNOWN，既不 NOT_STARTED 也不 block。钱收了，奖永远不发
+    local rid = opts.rid
+    if type(rid) == "string" then
+        rid = tonumber(rid)
+    end
+    if math.type(rid) ~= "integer" then
+        rid = math.tointeger(rid)
+    end
+    if math.type(rid) ~= "integer" or rid <= 0 then
+        return nil, "rid must be a positive integer"
     end
     local service_op_id
     service_op_id, err = M.service_op_id(provider, order_id, opts.action, opts.hash_fn)
@@ -149,7 +160,7 @@ function M.record(orders_coll, opts)
             ["$setOnInsert"] = {
                 provider = provider,
                 order_id = order_id,
-                rid = opts.rid,
+                rid = rid,
                 amount = opts.amount,
                 currency = currency,
                 action = opts.action or "grant",
@@ -170,7 +181,7 @@ function M.record(orders_coll, opts)
         -- 是同一笔就按已有订单处理，否则才算冲突
         local existing = orders_coll:find_one({ provider = provider, order_id = order_id })
         if type(existing) == "table" then
-            if existing.amount ~= opts.amount or existing.currency ~= currency or existing.rid ~= opts.rid then
+            if existing.amount ~= opts.amount or existing.currency ~= currency or existing.rid ~= rid then
                 return nil, "order conflict"
             end
             return existing, false
@@ -194,7 +205,7 @@ function M.record(orders_coll, opts)
         created = leo.updatedExisting == false
     end
     -- 重复回调必须与首次回调完全一致：金额/币种/账号任一不同都是串单或伪造
-    if order.amount ~= opts.amount or order.currency ~= currency or order.rid ~= opts.rid then
+    if order.amount ~= opts.amount or order.currency ~= currency or order.rid ~= rid then
         log.error(
             "charge order conflict",
             "provider",

@@ -1202,6 +1202,80 @@ t.describe("dbmgr 关键状态机", function()
         t.expect(h.db.state_of("demo", "role", 7)).to.equal(h.db.STATE.CRITICAL_QUARANTINED)
     end)
 
+    -- 隔离是异常态，必须有确定的出口。没有未决意图时内存里的脏数据只属于那次
+    -- 失败的操作，卸载丢弃是安全的——否则 unloading 永久置位，角色再也加载不了
+    t.it("lets unload discard a quarantined cache that holds no intent", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.doc.name = "polluted"
+        h.db.quarantine_critical("demo", "role", 7, nil, "commit unknown")
+
+        t.expect(h.db.unload("demo", "role", "rid", 7)).to.equal(true)
+        -- 缓存被丢弃，下一次 load 从库里重读干净文档
+        local doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        t.expect(doc.name).to.equal("original")
+    end)
+
+    -- 有意图时必须等恢复任务：那次 PREPARE 可能已经落库，只是 ACK 丢了
+    t.it("refuses to unload a quarantined cache that still carries an intent", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.db.quarantine_critical("demo", "role", 7, nil, "commit unknown")
+        assert(
+            h.db.set_critical(
+                "demo",
+                "role",
+                7,
+                { ["_critical_intent_v1"] = { op_id = "op_a", state = "PREPARED" } },
+                nil
+            )
+        )
+
+        t.expect(h.db.unload("demo", "role", "rid", 7)).to.equal(false)
+        t.expect(h.db.state_of("demo", "role", 7)).to.equal(h.db.STATE.CRITICAL_QUARANTINED)
+    end)
+
+    -- 隔离态唯一允许的写是"取消未决意图"：只碰 ops.<op_id> 与 intent，不碰业务字段。
+    -- 没有这条通道，恢复任务永远推不动隔离条目
+    t.it("allows only the intent-abort shape to write through a quarantined cache", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.db.quarantine_critical("demo", "role", 7, nil, "commit unknown")
+
+        local op_path = "_critical_ops_v1.op_a"
+        local abort_update = {
+            ["$set"] = { [op_path] = { status = "ABORTED" } },
+            ["$unset"] = { _critical_intent_v1 = true },
+        }
+        -- 业务字段写入必须拒绝，哪怕带了开关
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { gold = 999 } }, {
+            allow_quarantined_intent_abort = true,
+        })).to
+            .equal("REJECTED")
+        -- 不带开关时，连意图取消也不许
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, abort_update)).to.equal("REJECTED")
+        -- 正确形状放行
+        local state = h.db.critical_update("demo", "role", "rid", 7, 0, abort_update, {
+            allow_quarantined_intent_abort = true,
+        })
+        t.expect(state).to.equal("CONFIRMED")
+    end)
+
+    -- 取消意图后不能回 NORMAL（内存可能带着 apply 的痕迹），标 DISCARDED 等卸载丢弃
+    t.it("marks a quarantined entry discarded and unloads it without a write", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.doc.name = "polluted"
+        h.db.quarantine_critical("demo", "role", 7, nil, "commit unknown")
+
+        t.expect(h.db.mark_discarded("demo", "role", 7, nil)).to.equal(true)
+        t.expect(h.db.state_of("demo", "role", 7)).to.equal(h.db.STATE.DISCARDED)
+        local before = #h.critical_updates
+        t.expect(h.db.unload("demo", "role", "rid", 7)).to.equal(true)
+        -- 丢弃不等于回写：一次 Mongo 写都不该发出
+        t.expect(#h.critical_updates).to.equal(before)
+    end)
+
     t.it("does not let a dirty-cache recovery write a quarantined document back", function()
         local old_handle = { fence = 1, valid = true }
         local new_handle = { fence = 2, valid = true }

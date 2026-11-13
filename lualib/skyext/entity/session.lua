@@ -637,6 +637,12 @@ end
 -- 返回 true, ...        : f 已经执行（或命中缓存），后面是回包
 -- 返回 false, reason, code : 请求被拒绝，f 没有执行
 function M.with_request(key, f, req_id, request_name, request_digest)
+    -- req_id 直接来自客户端包头，必须限在 u32：会话快照用 `<I4` 编码它，
+    -- 超界的值会让 string.pack 抛错（不是返回 nil,err），迁移每次失败、
+    -- 角色被永久钉在本节点。这里是唯一能拦住它的地方
+    if req_id ~= nil and (math.type(req_id) ~= "integer" or req_id < 0 or req_id > 0xFFFFFFFF) then
+        return false, "invalid request id"
+    end
     local conn = g_conns[key]
     if not conn then
         return false, "client not bound"

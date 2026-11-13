@@ -118,11 +118,13 @@ t.describe("role 充值发奖 handler", function()
         local h = harness()
         local entity, bag = entity_with_bag()
         local handlers = h.handler.charge_handlers(entity, { order_id = "o-1" })
-        t.expect(handlers.validate(entity, { amount = 100, currency = "CNY" })).to.equal(true)
+        -- amount 是整数最小单位（分）：600 分 = 6 元 = 600 金币。
+        -- 用 600 而不是 100，是为了让"把分当元"的 100 倍错误一定被抓住
+        t.expect(handlers.validate(entity, { amount = 600, currency = "CNY" })).to.equal(true)
         -- validate 必须纯读：跑完 validate 背包还是空的
         t.expect(#bag.items).to.equal(0)
-        t.expect(handlers.apply(entity, { amount = 100, currency = "CNY" })).to.equal(true)
-        t.expect(bag.items[1]).to.equal({ res_type = 1, res_id = 1, count = 10000 })
+        t.expect(handlers.apply(entity, { amount = 600, currency = "CNY" })).to.equal(true)
+        t.expect(bag.items[1]).to.equal({ res_type = 1, res_id = 1, count = 600 })
     end)
 
     t.it("rejects an unsupported currency or a non-positive amount before touching memory", function()

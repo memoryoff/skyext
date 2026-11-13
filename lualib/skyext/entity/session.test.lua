@@ -257,6 +257,23 @@ t.describe("session bind", function()
 end)
 
 t.describe("session request gating", function()
+    -- req_id 直接来自客户端包头：超出 u32 会让会话快照的 `<I4` 编码抛错，
+    -- 迁移每次失败、角色被永久钉在本节点。必须在入口拦住
+    t.it("rejects a request id outside the u32 range before running the handler", function()
+        local h = harness()
+        local _, key = bind(h, 9)
+        local ran = false
+        local ok, reason = h.session.with_request(key, function()
+            ran = true
+        end, 0x100000000)
+        t.expect(ok).to.equal(false)
+        t.expect(reason).to.equal("invalid request id")
+        t.expect(ran).to.equal(false)
+
+        t.expect(h.session.with_request(key, function() end, -1)).to.equal(false)
+        t.expect(h.session.with_request(key, function() end, 1.5)).to.equal(false)
+    end)
+
     t.it("runs the handler inside the entity gate and keeps all of its return values", function()
         local h = harness()
         local _, key = bind(h, 9)

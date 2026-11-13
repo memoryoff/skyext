@@ -40,10 +40,24 @@ local function outbox_receiver()
     end
     local outbox = require "skyext.outbox"
     local crypto = require "crypto"
+    -- 冷账本：热账本 7 天后归档，没有它就无法证明同一个 service_op_id 执行过，
+    -- 重投就会二次入账。取不到时 receiver 会在投递阶段 fail-closed，不会静默放行
+    local ledger
+    local ok_ledger, got = pcall(function()
+        local types = require "skyext.entity.types"
+        local tc = types.get("role")
+        if tc and type(tc.critical_ledger) == "table" then
+            return require("skyext.mongo_conn").get_collection(tc.critical_ledger.db, tc.critical_ledger.coll)
+        end
+    end)
+    if ok_ledger then
+        ledger = got
+    end
     -- op_types 必须显式给出：空白名单等于放行任意操作类型
     g_outbox_receiver = assert(outbox.new_receiver({
         hash_fn = crypto.hmac_sha256,
         op_types = { "mail.send" },
+        ledger = ledger,
     }))
     return g_outbox_receiver
 end
@@ -98,7 +112,10 @@ end
 -- 两条硬约束（critical 的 handler 契约）：
 --   * validate 纯读、不 yield；
 --   * apply 只改内存，不 RPC、不推送、不发邮件——本角色 CAS 失败时没有任何东西可回滚。
-local CHARGE_RATE = { CNY = 100 } -- 示例汇率：1 元 = 100 金币
+-- 示例汇率：**amount 是整数最小单位（分），不是元**。
+-- `pay_webhook` 明确要求 amount 为正整数最小单位，所以这里按"1 分 = 1 金币"换算，
+-- 也就是 1 元 = 100 金币。写成 CNY = 100 会把分当元，每笔多发 100 倍
+local CHARGE_RATE = { CNY = 1 }
 local CHARGE_RES = { res_type = 1, res_id = 1 } -- 金币在 res 表里的坐标
 
 -- validate 与 apply 必须用同一份换算：两边各写一遍迟早会在浮点/取整上分叉，
@@ -115,7 +132,12 @@ local function charge_count(params)
     if not rate then
         return nil, "unsupported currency: " .. tostring(params.currency)
     end
-    return amount * rate
+    local count = amount * rate
+    -- 乘法溢出会绕回负数，而负数是 truthy：不拦就会以负 count 调 add_item（实际是扣减）
+    if math.type(count) ~= "integer" or count <= 0 then
+        return nil, "amount overflow"
+    end
+    return count
 end
 
 function M.charge_handlers(entity, _order)

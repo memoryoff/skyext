@@ -488,6 +488,28 @@ t.describe("sproto_api outbound calls", function()
         t.expect(h.api.has_pending(3)).to.equal(false)
     end)
 
+    -- session 编号是客户端自己选的：只按编号唤醒的话，任意连接（含未登录）
+    -- 发一个 session=N 就能注入/伪造别人的响应
+    t.it("drops a response that comes from a different connection", function()
+        local h = harness()
+        h.api.set_sender(function() end)
+        skynet.fork(function()
+            h.api.call(h.fd, "role_ping", {}, 5, 0.05)
+        end)
+        skynet.sleep(0)
+        t.expect(h.api.has_pending(5)).to.equal(true)
+
+        -- 另一个连接冒充 session 5：不能唤醒等待者
+        h.api.raw_dispatch(999, "RESPONSE", 5, { name = "forged" }, nil)
+        skynet.sleep(0)
+        t.expect(h.api.has_pending(5)).to.equal(true)
+
+        -- 本连接的响应才被接受
+        h.api.raw_dispatch(h.fd, "RESPONSE", 5, { name = "pong" }, nil)
+        skynet.sleep(0)
+        t.expect(h.api.has_pending(5)).to.equal(false)
+    end)
+
     t.it("ignores a call without a session id", function()
         local h = harness()
         local sent = false

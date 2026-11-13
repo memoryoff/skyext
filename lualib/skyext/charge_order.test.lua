@@ -127,6 +127,28 @@ t.describe("charge_order 落单", function()
         t.expect(comp:sub(1, 4)).to.equal("srv_")
     end)
 
+    -- JSON 渠道把商户参数按字符串回传极常见（"7" 而不是 7）。不归一就落库，
+    -- 实体路由（calc_node）会在发奖时抛错，订单永远卡在 GRANTING
+    t.it("normalizes a string or float rid before it reaches entity routing", function()
+        local h = harness()
+        local order = assert(h.record({ rid = "7" }))
+        t.expect(math.type(order.rid)).to.equal("integer")
+        t.expect(order.rid).to.equal(7)
+
+        local h2 = harness()
+        local order2 = assert(h2.record({ rid = 7.0 }))
+        t.expect(math.type(order2.rid)).to.equal("integer")
+        t.expect(order2.rid).to.equal(7)
+    end)
+
+    t.it("rejects a rid that is not a positive integer", function()
+        local h = harness()
+        t.expect(h.record({ rid = "abc" })).to.be_nil()
+        t.expect(h.record({ rid = 0 })).to.be_nil()
+        t.expect(h.record({ rid = -3 })).to.be_nil()
+        t.expect(h.record({ rid = {} })).to.be_nil()
+    end)
+
     -- 重复回调金额/币种/账号不一致：是串单或伪造，不能"以最新一次为准"
     t.it("refuses a repeated callback with different amount, currency or account", function()
         local h = harness()

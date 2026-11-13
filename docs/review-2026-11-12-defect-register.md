@@ -26,6 +26,9 @@
 | 已修复并验证（第五 ~ 九批） | 22 | F-01 ~ F-10、R-01 ~ R-12 |
 | 对抗审查发现 · 已修 | 14 | A-01 ~ A-14，见 §8 |
 | 第二轮源码审计 · 已修 | 8 | B-01 ~ B-08（DB Fence / Critical Commit），见 §10 |
+| 第三轮对抗审查 · 已修 | 11 | C-01 ~ C-11，见 §11 |
+| 第四轮全量对抗审查 · 已修 | 10 | D-01 ~ D-07、D-09、D-14、D-15，见 §12 |
+| 第四轮全量对抗审查 · 待修 | 25 | D-08、D-10 ~ D-13、D-16 ~ D-37，见 §12 |
 | 代码层待修 | 0 | — |
 | 需真实环境验证 | 7 | V-01 / V-06 已实测通过；V-02 ~ V-05 需要多节点与故障注入；V-07 已提供可复跑脚本 |
 | 设计权衡（记录不改） | 4 | 见 §5 |
@@ -571,3 +574,114 @@
 补强从"架构"扩到"资金业务"的边界问题单独记录在
 [`framework_boundary_v1.md`](framework_boundary_v1.md)：那里给了三层判据、逐模块归类、
 以及"领域包必须可删除"的候选门禁。后续每条缺陷都建议标一层（引擎 / 领域包 / 游戏层）。
+
+---
+
+## 12. 第四轮对抗审查（全量架构，2026-11-13）
+
+> **范围**：基点 `0175f97`（upstream/main）到 `4bd0c70`，43 个提交、153 文件、+35194 行、
+> 27116 行非测试代码。前三轮已修 55 项，本轮只登记**新发现**。
+> **方法**：按域拆六个子代理并行（提交内核/账本、Outbox/Saga、支付对账、迁移网关、
+> 会话协议、SDK/示例/CI），要求"能跑就跑、去证伪"；P0 与关键 P1 由主代理逐条回源码复核，
+> 标注 ✅ 的为已复核。
+> **验收口径不变**：只有「改完代码 + 新增用例 + 全量门禁通过」才把状态改成「已修」。
+
+### 12.1 总览
+
+| 级别 | 数量 | 说明 |
+| --- | --- | --- |
+| P0 | 5 | 资产安全或角色永久卡死 |
+| P1 | 10 | 漏发奖、可用性、契约不一致 |
+| P2 | 20 | 状态错乱、可观测性、门禁缺口 |
+
+**已修（本轮第一批，D-01 ~ D-07、D-09、D-14、D-15）**：
+
+| 编号 | 修复要点 |
+| --- | --- |
+| D-01 | `dbmgr` 给隔离态开一条"只清意图"的写通道（`allow_quarantined_intent_abort` + 形状校验）；`unload` 对 DISCARDED / 无意图隔离直接丢弃；新增 `mark_discarded`；`abort_intent` 成功后标作废，恢复任务卸载实体后从库重读 |
+| D-02 | `critical.query` / `abort_intent` 增加 `majority_read`：恢复任务按持久化事实判定，不再被"内存没有意图"骗成 `NOT_STARTED` |
+| D-03 | `outbox.new_receiver` 接受 `ledger`，`handle` 透传给 `execute_internal`；缺失时 `retryable` fail-closed；示例 handler 从 `critical_ledger` 配置取集合 |
+| D-04 | `charge_order.record` 对 `rid` 做 `tonumber` + `math.tointeger` 归一，非正整数拒绝；落库与冲突比较都用归一后的值 |
+| D-05 | 示例汇率改为 `CNY = 1`（1 分 = 1 金币），注释写明 amount 是最小单位；测试改用 600 分断言，100 倍错误一定被抓 |
+| D-06 | `pump` 的 CAS 重试用尽分支：先 `refresh_critical` 对齐，仍 PENDING 才记一次尝试，到阈值标 FAILED |
+| D-07 | `validate_outbox_events` 增加批内 `event_id` 唯一性校验 |
+| D-09 | `scan_archive` 支持 `skip`，`run_once` 用 `deps.archive_cursor` 轮转，卡住的文档不会占满候选页 |
+| D-14 | `sproto_api` 的 RESPONSE 分支校验 `pending.fd == fd`，外来连接不能注入他人响应 |
+| D-15 | `session.with_request` 入口拒绝非 u32 的 `req_id`，避免快照 `string.pack` 抛错导致角色永久不可迁移 |
+
+**未修（下一批）**：D-08（容量降级口径）、D-10（对账毒单退避）、D-11（CAPACITY_EXCEEDED 处置）、
+D-12/D-13（迁移 FALLBACK 解屏障与 `migrating` 复位）、D-16（启动依赖检查）、D-17（TS SDK 类型），
+以及 §12.4 的 P2。
+
+**结构性结论**：框架把"正常路径"写得很严密，但"异常路径的出口"普遍缺失。
+隔离、恢复任务、对账、迁移降级四处都是"进入条件清楚、退出条件没写"。
+P0-1 与 P0-2 是同一个病的两个实例。
+
+### 12.2 P0（资产安全 / 永久卡死）
+
+| 编号 | 问题 | 位置 | 证据 |
+| --- | --- | --- | --- |
+| D-01 | **隔离态是单行道**：`save_doc` 对非 NORMAL 一律拒绝 → `unload` 永远失败 → `_abort_unload` 不清 `entity.unloading`（全文件无复位）→ `_ensure_loaded` 恒返回 `"entity unloading"` → 恢复任务的 `critical_update` 又被 `state_invalid` 拒绝。一次瞬时多数派超时 = 本局普通进度不落库 + 角色卡死，唯一出口是 etcd 租约过期后的 `_recover_dirty` | `dbmgr.lua:281-288`（save）、`:621`（quarantine）、`:966-991`（unload）；`entitymgr.lua:1002`（置位）、`:624-625`（拒绝）、`:849-852`（_abort_unload） | ✅ 代码路径逐行确认；`discard` 仅 `_recover_dirty.give_up` 一个调用点 |
+| D-02 | **PREPARE UNKNOWN 留下清不掉的意图，恢复任务写死后永不复开**：UNKNOWN 分支不 `set_critical` → 内存无意图 → `query` 报 `NOT_STARTED` → reconciler 判 `NOT_COMMITTED` → 任务写 `COMPLETED_*`；`reconcile` 用 `$setOnInsert` 不重置，`claim_job` 不接受 COMPLETED → 库里 PREPARED 意图永久残留，角色重载后所有关键操作回 `IN_PROGRESS` | `critical.lua:741-748`、`:1133-1191`、`:1247-1284`、`:1296-1340`；`critical_reconciler.lua:94-126` | ✅ 三处代码路径确认（UNKNOWN 不写 set_critical、$setOnInsert、claim 白名单） |
+| D-03 | **Outbox 接收方不去重冷账本**：`new_receiver` 没有 ledger 参数，`handle` 调 `execute_internal` 不传 `opts.ledger` → 热账本 7 天归档后重投，`query` 查不到 → 二次执行同一业务效果。`charge_order.lua:302` 有同样处理，outbox 这条链漏了 | `outbox.lua:985-1002`、`:1071-1077` | ✅ 对比 `critical.lua:482`（`req.ledger` 分支）与 `charge_order.lua:302` |
+| D-04 | **支付订单 `rid` 不校验类型**：`record` 只判 `rid == nil`；JSON 渠道把 rid 按字符串回传极常见，落单后 `placement.calc_node` 对非整数直接 `error` → 回调 500 → 渠道永远重推 → 对账 `query_op` 同样抛错 → 永远 UNKNOWN，既不 NOT_STARTED 也不 block | `charge_order.lua:136-138`；`placement.lua:94-96` | ✅ 两处代码确认；`amount` 有 `math.type` 校验，`rid` 没有 |
+| D-05 | **示例充值汇率把"分"当"元"**：`CHARGE_RATE.CNY = 100` 注释"1 元 = 100 金币"，但 `pay_webhook` 要求 `amount` 是整数最小单位（分）。6 元订单 `amount=600` → 60000 金币，应为 600。测试把 `amount=100 → 10000` 固化了，掩盖了单位错误 | `example/lualib/entity_handler/role.lua:101`；`pay_webhook.lua:130-132`；`role.test.lua:125` | ✅ 三处对齐确认；照抄示例接真实渠道每笔多发 100 倍 |
+
+### 12.3 P1（漏发奖 / 可用性 / 契约）
+
+| 编号 | 问题 | 位置 |
+| --- | --- | --- |
+| D-06 | **Outbox CAS 失败不计投递次数**：`_advance` 返回 BLOCKED/REJECTED 时只 `break`，`_note_deliver_attempt` 只在投递器明确失败时调用 → 毒事件阈值对"CAS 卡住"无效，事件永远 PENDING、每 5 秒重投一条（约 1.7 万条/天），且 `_advance` 重试读的是同一份内存缓存，必然耗尽 | `outbox.lua:636`、`:738-762` |
+| D-07 | **同一批 `event_id` 重复静默丢分片**：`validate_outbox_events` 不查批内唯一性 → `$set` 同路径写两次只留最后一份，但 `pending_count += #new_events` 按 2 计 → 第二个分片的业务效果永久丢失，且计数比真实事件多，`scan` 每轮命中该角色永不收敛 | `critical.lua:212-244`、`:821-832` |
+| D-08 | **热账本 512 无降级路径**：`op_count >= MAX_OPS` 直接 `CAPACITY_EXCEEDED`，归档只搬超过 7 天的；`BUSINESS_REJECTED` 与 COMMITTED 同占额度 → 客户端持续发起被业务拒绝的操作即可把自己锁死；`charge_grant` 走同一内核，付费订单会一直拿到 CAPACITY_EXCEEDED | `critical.lua:55`、`:576-583`、`:839-877` |
+| D-09 | **归档扫描无轮转**：`scan_archive` 只有 limit 无 skip/游标，卡住的文档不会离开候选集；≥32 个卡住文档后后续角色永远排不进这一页 | `critical_maintenance.lua:51-74` |
+| D-10 | **对账扫描被毒单饿死**：注释称"不排序避免卡住的单占住队头"，但无显式 sort 时 Mongo 走 `{status, updated_at}` 索引就是 updated_at 升序；PENDING 分支不写任何字段，毒单永远留在最老位置 | `charge_reconcile.lua:45-66` |
+| D-11 | **`CAPACITY_EXCEEDED` 被 ACK**：webhook 回 200 + ACK，渠道不再重推，订单留 GRANTING；对账重投仍是 CAPACITY_EXCEEDED，永远 RETRY、不 block、不告警；唯一出路 `critical_maintenance` 在示例配置默认关闭 | `pay_webhook.lua:232-246` |
+| D-12 | **迁移 FALLBACK 只解实体冻结、不解网关屏障**：`unquiesce` 成功即 `unfrozen=true` → 不踢人，但 `unquiesce` 只清 `entity.migrating`，从不调 `resume_owner` → 网关 `frozen_epoch` 仍在，双向静默黑洞直到客户端心跳判死 | `migration_adapter.lua:236-280`；`entitymgr.lua:1180-1207` |
+| D-13 | **迁移取消后 `entity.migrating` 不复位**：fallback 踢客户端后实体仍带 `migrating=true`，客户端重连 `bind` 成功但每条上行在 `CMD.client_msg` 被丢 → "在线但操作无响应" | `migration.lua:158-160`；`session.lua:283-311`；`entity_agent.lua:644` |
+| D-14 | **`sproto_api` 响应不校验来源连接**：`g_sessions` 只按客户端可选的 session 编号做键，RESPONSE 分支丢弃 `fd` 直接唤醒 → 任意连接发 `session=N` 即可注入/伪造他人 pending 响应 | `sproto_api.lua:315-321`、`:346-360` |
+| D-15 | **`req_id >= 2^32` 让快照编码抛错**：`with_request` 只判下界不判上界，`session_snapshot.encode` 用 `string.pack("<I4", req_id)` 无符号溢出抛错（不是返回 nil,err）→ 迁移每次失败，角色被钉在本节点 | `session.lua:174-192`；`session_snapshot.lua:119` |
+| D-16 | **`launcher.self_check` 只打日志不阻断**：`pay_callback` 无 `depends_on`，单开它不检查 `critical_maintenance` → 热账本永不归档 → 约 512 笔充值后新发奖全被拒，渠道已 ACK、玩家不到账 | `launcher.lua:18-27`、`:57-70`、`:135` |
+| D-17 | **TS SDK 与服务端契约不一致**：`OperationGrantV1.rid` 为 `number | string` 不含 `bigint`（17 位 rid 必超 2^53），`mac: string` 而文档写"二进制" → 长 rid 的 Grant 三条路都不通 | `sdk/ts/src/critical.ts:12,18`；`critical_grant_v1.md:38` |
+
+### 12.4 P2（状态错乱 / 可观测性 / 门禁）
+
+| 编号 | 问题 |
+| --- | --- |
+| D-18 | `abort_intent` 写已结算 op 却不维护 `_critical_ops_oldest_at` → 纯 abort 的账本只增不减，撞 512 后无法自愈 |
+| D-19 | `VERIFIED_RECEIVED + COMMITTED` 永远无法结案：`mark_reconciled` 的 CAS 只认 GRANTED |
+| D-20 | 重复回调冲突校验漏 `action`：退款/拒付回调被当"重复发奖"静默 ACK，漏补偿 |
+| D-21 | `block_reconcile` 无解封路径，发奖成功后也不清标记 → 已发货订单永久停在 GRANTED |
+| D-22 | `ack_before_grant` 生产接线没有 `schedule_grant`（只在测试注入）→ 先 ACK 后只能等对账，发货延迟约 90s |
+| D-23 | 接收侧"永久无效"直接 ACK：资产已扣、无 FAILED 记录、不可重放；`outbox.event` 只校验 `param_hash` 长度不校验 hex |
+| D-24 | `replay` 下行不带 `owner_epoch`，`push_allowed` 对 nil 一律放行 → 屏障与代际过滤在重放路径失效 |
+| D-25 | `unresumable` 会话仍被迁移并报 READY → 迁移"成功"但客户端存在永久缺口 |
+| D-26 | `capability.ALLOWED_NAMESPACES` 是导出的可变普通表 → 任何模块一行赋值即可自签 cap |
+| D-27 | `channel.get_or_create` 静默忽略同名频道的第二份配置 → 鉴权策略被首个创建者锁定；`authorize` 未做类型校验 |
+| D-28 | `critical.query` 不校验 op_id 格式 → 大写 hex/少一位被当"从未执行" |
+| D-29 | 示例 `charge_count` 乘法溢出后负值仍通过 validate |
+| D-30 | `check_metrics_labels` 只扫 ≤400 字符的字面量标签表，变量/长表直接跳过 → 门禁假绿 |
+| D-31 | `verify_replica_stepdown.sh` 用 `sleep 0.5` 后 stepDown，不证明切主瞬间仍有并发写 |
+| D-32 | `entity_types.agent_count = 0` 无下界校验 → 节点"就绪"但无 agent，`% 0` 抛错 |
+| D-33 | `critical_ledger` 未配置时 maintenance 静默回退默认集合、entity_agent 返回 UNKNOWN，三处口径不一致 |
+| D-34 | 引擎硬依赖领域包 `skyext.charge_order`（`entity_agent.lua:230-237`）→ `framework_boundary_v1` 的"可删除"只在测试路径成立 |
+| D-35 | `fallback` 清空 `g_inflight` 抵消 abort 的"失败可重试"；且 `fallback` 不在 `REQUIRED_DEPS` |
+| D-36 | 迁移 `resume` 中网关 RPC 抛错时 `owner_epoch` 已推进且不回滚 → 下行被网关当迟到包丢弃 |
+| D-37 | `skyext_outbox_pending` gauge 是"最后一个被 pump 的角色"，不能当积压告警 |
+
+### 12.5 架构级观察
+
+1. **异常路径只有入口、没有出口**。隔离（D-01）、恢复任务（D-02）、对账（D-10）、
+   迁移降级（D-12/D-13）四处同构。建议后续把"每个异常态必须有确定的退出通道"
+   作为设计检查项，而不是逐条补。
+2. **测试验证的是函数，不是调用链**。Outbox 124 个用例全绿，但生产链路
+   `outbox_pump → pump_entity` 不传 `now`（上轮 C-01）、不传 `ledger`（本轮 D-03）。
+   建议加契约测试：直接加载真实 `entity_agent` 的 `FRAMEWORK` 表，断言入口参数形状。
+3. **"可删除的领域包"是文档承诺而非可执行事实**（D-34）。
+
+### 12.6 与 §11.3 推测的关系
+
+§11.3 第 5 条推测（"outbox 接收方 handle 不传 ledger，7 天后可能二次执行业务"）
+本轮被证实为 **D-03（P0）**。§11.3 第 3 条推测（"`req_id` 超出 u32 会让 export 失败"）
+被证实为 **D-15（P1）**。§11.3 第 4 条（`unresumable` 被 attach 忽略）为 **D-25（P2）**。
+推测项应当在下一轮审查前先做一次可达性验证，而不是等到下一轮才升级。

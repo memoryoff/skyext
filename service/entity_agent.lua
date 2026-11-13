@@ -365,11 +365,14 @@ FRAMEWORK.critical_resolve_intent = function(entity, op_id)
         return { status = "UNKNOWN", reason = "critical_ledger is not configured" }
     end
 
-    -- 取消未决意图：一次 CAS 写 ABORTED 终态并清 PREPARED，不产生业务效果
+    -- 取消未决意图：一次 CAS 写 ABORTED 终态并清 PREPARED，不产生业务效果。
+    -- majority_read：内存里没有意图不等于库里没有（PREPARE 落库但 ACK 丢失时
+    -- commit_core 的 UNKNOWN 分支不会 set_critical），必须按持久化事实判定
     local function abort_pending()
-        local state, detail = critical.abort_intent(entity, { now = os.time() })
+        local state, detail = critical.abort_intent(entity, { now = os.time(), majority_read = true })
         if state == "CONFIRMED" then
-            return { status = "NOT_COMMITTED" }
+            -- 内存里的普通字段可能已被 apply 污染：让调用方卸载实体，下次从库重读
+            return { status = "NOT_COMMITTED", discard = true }
         end
         if state == "REJECTED" and detail == "no pending intent" then
             return { status = "NOT_COMMITTED" }
@@ -377,7 +380,7 @@ FRAMEWORK.critical_resolve_intent = function(entity, op_id)
         return { status = "UNKNOWN", reason = tostring(detail) }
     end
 
-    local proof = critical.query(entity, op_id, { now = os.time(), ledger = ledger })
+    local proof = critical.query(entity, op_id, { now = os.time(), ledger = ledger, majority_read = true })
     if proof.status == "COMMITTED" or proof.status == "BUSINESS_REJECTED" then
         return { status = "COMMITTED" }
     end
