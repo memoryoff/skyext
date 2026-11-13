@@ -42,6 +42,24 @@ local m_unknown = metrics.counter(
     { "provider" }
 )
 
+-- 订单写入。订单是**资金凭证**：切主回滚会让"渠道已 ACK、订单行消失"变成永久丢单，
+-- 所以必须多数派 + journal。驱动的 `findAndModify` 不注入写关注（走服务端默认 w:1），
+-- 集合支持 `critical_find_and_modify` 时优先用它。
+--
+-- 三态里只有 CONFIRMED 算写成功；UNKNOWN 返回失败让调用方重试（落单是幂等的，
+-- 渠道重推会命中已有订单）。返回形状与 `find_and_modify` 对齐：成功回原始回复。
+local function write_order(orders_coll, doc)
+    if type(orders_coll.critical_find_and_modify) == "function" then
+        local state, ret = orders_coll:critical_find_and_modify(doc)
+        if state == "CONFIRMED" then
+            return ret
+        end
+        -- UNKNOWN 可能是"已经写了但 ACK 丢了"，调用方必须按未确认处理，不能当成没写
+        return nil, tostring(state), ret
+    end
+    return orders_coll:find_and_modify(doc)
+end
+
 local function hex(bytes)
     return (bytes:gsub(".", function(c)
         return string.format("%02x", c:byte())
@@ -125,7 +143,7 @@ function M.record(orders_coll, opts)
     end
 
     local now = opts.now or os.time()
-    local ret, ferr = orders_coll:find_and_modify({
+    local ret, ferr = write_order(orders_coll, {
         query = { provider = provider, order_id = order_id },
         update = {
             ["$setOnInsert"] = {
@@ -139,6 +157,9 @@ function M.record(orders_coll, opts)
                 service_op_id = service_op_id,
                 status = M.STATUS.VERIFIED_RECEIVED,
                 created_at = now,
+                -- 对账扫描按 updated_at 过滤（缺字段永远不匹配 $lte）。落单成功、
+                -- 但进程在 transition 到 GRANTING 之前崩溃时，这张单只能靠对账捞回来
+                updated_at = now,
             },
         },
         upsert = true,
@@ -197,7 +218,7 @@ function M.transition(orders_coll, provider, order_id, from, to, extra, now)
     for k, v in pairs(extra or {}) do
         set[k] = v
     end
-    local ret, err = orders_coll:find_and_modify({
+    local ret, err = write_order(orders_coll, {
         query = { provider = provider, order_id = order_id, status = from },
         update = { ["$set"] = set },
         new = true,
@@ -218,7 +239,7 @@ function M.ack(orders_coll, provider, order_id, result, now)
     if result ~= M.ACK.ACCEPTED and result ~= M.ACK.REJECTED then
         return nil, "invalid ack result"
     end
-    local ret, err = orders_coll:find_and_modify({
+    local ret, err = write_order(orders_coll, {
         query = { provider = provider, order_id = order_id },
         update = { ["$set"] = { webhook_ack_at = now or os.time(), ack_result = result } },
         new = true,
@@ -355,7 +376,7 @@ function M.note_error(orders_coll, order, err, now)
     if type(order) ~= "table" then
         return nil, "order is required"
     end
-    local ret, ferr = orders_coll:find_and_modify({
+    local ret, ferr = write_order(orders_coll, {
         query = { provider = order.provider, order_id = order.order_id },
         update = { ["$set"] = { last_error = tostring(err), last_error_at = now or os.time() } },
         new = true,
@@ -372,7 +393,7 @@ function M.block_reconcile(orders_coll, order, reason, now)
     if type(order) ~= "table" then
         return nil, "order is required"
     end
-    local ret, ferr = orders_coll:find_and_modify({
+    local ret, ferr = write_order(orders_coll, {
         query = { provider = order.provider, order_id = order.order_id },
         update = {
             ["$set"] = {
@@ -400,7 +421,7 @@ function M.mark_reconciled(orders_coll, order, proof, now)
     if type(proof) ~= "table" then
         return nil, "proof is required"
     end
-    local ret, err = orders_coll:find_and_modify({
+    local ret, err = write_order(orders_coll, {
         query = {
             provider = order.provider,
             order_id = order.order_id,

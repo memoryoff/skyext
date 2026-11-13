@@ -515,3 +515,52 @@
   "所有权不变量不依赖调用方自觉"。
 - 普通回存（`save_doc`）本身带 `_version` + `_fence` 条件，所以 B-03 修复前的实际后果是
   "过期缓存继续被业务读取、普通回存持续 CAS 失败刷日志"，不是直接把错误数据写进库。
+
+---
+
+## 11. 未推送提交的对抗审查（四个子代理并行）
+
+> 范围：`9c34398..HEAD`（10 个提交，66 文件）。方法：按域拆四个子代理（DB Fence/提交内核、
+> Outbox/投递、迁移/网关、支付/CI），要求"能跑就跑、去证伪"；关键结论由主代理逐条回源码复核，
+> 其中 outbox 缺省 `now`、`$rename` 类问题另用临时用例实跑确认。
+
+### 11.1 本轮已修（C-01 ~ C-11）
+
+| 编号 | 级别 | 问题 | 修复 |
+| --- | --- | --- | --- |
+| C-01 | P0 | `outbox.pump` 的 `now` 只有 `opts.now` 一个来源，而生产链路 `outbox_pump → pump_entity` 只传 `limit`。`transition` 里 `now + retention` 直接抛错 → 事件永远停在 PENDING、每轮重复投一条可靠消息、毒事件阈值永不触发 | `opts.now or os.time()`；新增"不传 now 也能推进到 ENQUEUED"的用例 |
+| C-02 | P0 | `charge_order` 所有写入走驱动的 `findAndModify`，不注入 `writeConcern`（默认 w:1）。切主回滚会让"渠道已 ACK、订单行消失"变成永久丢单 | 新增 `write_order()`：集合支持 `critical_find_and_modify` 时走 majority+j，三态里只有 CONFIRMED 算成功，UNKNOWN 返回失败让渠道重推 |
+| C-03 | P0 | 冷账本只写 `$setOnInsert`：同一 op 先以 ABORTED 归档、之后重放成 COMMITTED 再归档时状态写不进去，`query` 永远报"未执行" → 调用方重放 → 二次入账 | 身份字段（rid/op_id）留 `$setOnInsert`，状态类字段改 `$set` |
+| C-04 | P1 | 恢复任务永远取消不了自己那条未决意图：`query` 回 `IN_PROGRESS`，resolver 判 UNKNOWN，任务永远 RETRY_WAIT，同角色其它关键操作一直被"another critical operation is in flight"挡住 | `query` 增加 `intent_op_id`；resolver 在"意图就是本 op"且实体已持新 fence 时主动 `abort_intent` |
+| C-05 | P1 | `BUSINESS_REJECTED` 不维护 `_critical_ops_oldest_at`：这些角色永远不被归档扫描命中，攒到 `MAX_OPS` 后所有关键操作被容量拒绝且无法自愈 | 归档水位改为两种终态都写（库与内存副本同口径） |
+| C-06 | P1 | `refresh_critical` 把 `extract` 的错误字符串当 critical 表缓存：下一次 PREPARE 写意图时对字符串索引抛错，缓存永久停在 PREPARING | 改为判 `extract` 的第一个返回值，失败回 `extract failed: ...` |
+| C-07 | P1 | 迁移 FALLBACK 从不解网关屏障：export 成功、release 失败时 `_released` 仍是 nil，`unquiesce` 又被 "snapshot already exported" 拒绝，客户端上下行被静默丢弃 | 改为"只要网关可能还冻着就必须踢"：`_released` 或（`_quiesced` 且解冻失败） |
+| C-08 | P1 | 卡在 `VERIFIED_RECEIVED` 的订单永远不被对账：`record` 不写 `updated_at`，扫描也不含该状态。落单后、transition 前崩溃 → 钱收了奖不发 | `record` 写 `updated_at`；对账增加 `VERIFIED_RECEIVED` 档（沿用宽限期） |
+| C-09 | P2 | `abort` 把每一次成功的 kick 都记成失败：两个网关的 `CMD.kick` 成功时返回 nil | `gate_tcp` / `gate_ws` 的 `kick` 返回 `true`（幂等：连接已不在也算成功） |
+| C-10 | P2 | `query` 冷账本分支原样回 `ABORTED`，与热分支（映射成 `NOT_STARTED`）不一致，对账会永久 PENDING | 冷分支套用同一份状态映射 |
+| C-11 | P2 | `saga` 的 `COMPENSATING → COMPENSATED` 漏传 `owner`，与其它四个转移不一致 | 补 `owner = opts.owner` |
+
+### 11.2 未修（记入待办，不在本轮做）
+
+| 项 | 级别 | 为什么先不做 |
+| --- | --- | --- |
+| `validate_outbox_events` 不校验 payload 的字节/深度/键安全，`load` 侧却 fail-closed | P1 | 需要先定"事件 payload 的上限"这个产品口径（多大算合法），再决定拒绝还是截断；直接套 `critical_fields` 的 512 KiB 预算会让大附件事件无法投递 |
+| `cleanup` 无受害者时残留清理标记 | P1 | 需要与 `critical.commit_core` 的容量腾挪放在同一次 CAS 里改，改动面比看起来大；当前只是每轮空扫，不影响资产 |
+| `metadata_only` 的 CAS 未命中不标 `stale` | P2 | 与 C-03 同源（版本分叉后归档空转），但修它要动 `outbox._advance` 的重试语义，留给下一轮 |
+| `_advance` 的"读后像重试"读的是内存缓存而非多数派读 | P2 | 同上；真实版本分叉时才触发，且业务侧靠 `service_op_id` 去重不会重复入账 |
+| `session.attach` 不校验实体是否已被重新绑定 | P2 | 需要定"迟到 attach 该失败还是该覆盖"的契约，涉及迁移代际语义 |
+| `gate_ws` 的 RESERVED 槽位没有握手超时 | P2 | 需要在 `websocket.accept` 外层加超时并补状态机用例，属独立改动 |
+| `pay_webhook.ack` 写失败仍回 200（注释与行为相反） | P2 | 是否回 500 取决于渠道重推成本，属产品决策 |
+| `check_metrics_labels` 遮罩漏长字符串、首参非字面量时跳过 | P2 | CI 门禁增强，需要独立用例；当前仓库没有这两种写法，是潜在缺口 |
+| `check_metrics_labels` 只在三个目录全空时才失败 | P2 | 同上 |
+| `verify_replica_stepdown.sh` 两条恒真断言（`_version == hits`、`documents == 1`） | P2 | 要重写并发注入方式才能证伪"迟到写"，属验证脚本重构 |
+| `bench_critical_capacity.sh` 未加 majority 写关注、失败路径仍打印数值、40 样本取 p99 | P2 | 需要重跑一轮才能更新文档里的数值，本轮不引入未经实测的新数字 |
+| `critical_ledger` 未配置时：维护服务归档到默认集合，发奖路径却静默跳过 | P2 | 三处要统一成同一个默认值或统一拒绝，属配置契约调整 |
+
+### 11.3 推测项（有机制、无端到端证据，未计入缺陷）
+
+- `resume_owner` 与 `install_conn` 之间的窗口里到达的上行可能被 `client not bound` 踢线（取决于调度顺序，单进程无法稳定复现）。
+- `barrier_id` 的 seq 是进程内计数，两个源节点同秒对同一实体迁移会撞名（代价是一轮 FALLBACK）。
+- 客户端可控的 `req_id` 超出 `u32` 会让 `string.pack` 抛错，导致该实体每次 export 都失败。
+- `unresumable` 快照被 `session.attach` 忽略，迁移会"成功"接上一个存在永久缺口的会话。
+- outbox 接收方 `handle` 不传 `ledger`：同一事件若在 7 天后被人工重投，热账本已归档、冷账本又不查，可能二次执行业务。

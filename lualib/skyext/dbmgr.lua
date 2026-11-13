@@ -928,9 +928,12 @@ function M.refresh_critical(dbname, dbcoll, key, unique_id, opts)
     if not raw then
         return nil, reason, err
     end
-    local _, critical = critical_fields.extract(raw)
-    if not critical then
-        return nil, "extract failed"
+    -- 第二个返回值在失败时是**错误字符串**，不是 critical 表。只判 truthy 会把
+    -- "unknown critical field: xxx" 存进 entry.critical，下一次 PREPARE 写意图时
+    -- 对字符串索引直接抛错，缓存永久停在 PREPARING
+    local clean, critical = critical_fields.extract(raw)
+    if not clean then
+        return nil, "extract failed: " .. tostring(critical)
     end
     return with_row_lock(dbname, dbcoll, unique_id, function()
         local entry = get_entry(dbname, dbcoll, unique_id)

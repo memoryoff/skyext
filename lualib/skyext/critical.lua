@@ -836,12 +836,6 @@ local function commit_core(ctx, req, handlers)
                 write["$unset"][M.OUTBOX_FIELD .. "." .. event_id] = true
             end
         end
-        -- 归档扫描的索引字段：只增不减的最小值。归档自己会重算，
-        -- 这里只需要保证"还有一条老操作没归档"时它不会被漏掉
-        local oldest = critical[M.OPS_OLDEST_FIELD]
-        if math.type(oldest) ~= "integer" or (math.type(req.now) == "integer" and req.now < oldest) then
-            write["$set"][M.OPS_OLDEST_FIELD] = req.now
-        end
     else
         -- 业务拒绝：ORM 必须原样不动。改了就不能继续——这份内存再也说不清
         -- 到底哪些改动属于被拒绝的操作，只能隔离重载
@@ -874,6 +868,13 @@ local function commit_core(ctx, req, handlers)
         at = req.now,
     }
     write["$set"][M.OPS_FIELD .. "." .. req.op_id] = op_doc
+    -- 归档扫描的索引字段：只增不减的最小值，归档自己会重算。
+    -- **必须两种终态都维护**：BUSINESS_REJECTED 同样占一条热账本，只给 COMMITTED 写
+    -- 水位会让这些角色永远不被归档扫描命中，攒到 MAX_OPS 之后连新操作都提交不了
+    local oldest = critical[M.OPS_OLDEST_FIELD]
+    if math.type(oldest) ~= "integer" or (math.type(req.now) == "integer" and req.now < oldest) then
+        write["$set"][M.OPS_OLDEST_FIELD] = req.now
+    end
 
     local state, detail = dbmgr.critical_update(
         ctx.dbname,
@@ -910,11 +911,10 @@ local function commit_core(ctx, req, handlers)
     critical[M.INTENT_FIELD] = nil
     critical[M.OPS_FIELD] = critical[M.OPS_FIELD] or {}
     critical[M.OPS_FIELD][req.op_id] = op_doc
-    if applied == true then
-        local oldest = critical[M.OPS_OLDEST_FIELD]
-        if math.type(oldest) ~= "integer" or (math.type(req.now) == "integer" and req.now < oldest) then
-            critical[M.OPS_OLDEST_FIELD] = req.now
-        end
+    -- 与库里同口径：业务拒绝也要推进水位，否则内存副本会比库"更早忘记"还有老操作
+    local oldest = critical[M.OPS_OLDEST_FIELD]
+    if math.type(oldest) ~= "integer" or (math.type(req.now) == "integer" and req.now < oldest) then
+        critical[M.OPS_OLDEST_FIELD] = req.now
     end
     if applied == true and new_events and #new_events > 0 then
         critical[M.OUTBOX_FIELD] = critical[M.OUTBOX_FIELD] or {}
@@ -1159,7 +1159,10 @@ function M.query(entity, op_id, opts)
             return { status = M.STATUS.UNKNOWN, reason = "ledger read failed: " .. tostring(aerr) }
         end
         if type(archived) == "table" then
-            return { status = archived.status, response = archived.response, archived = true }
+            -- 与热路径同口径：取消不等于已消费。冷分支原样回 ABORTED 会让
+            -- 对账（只认 NOT_STARTED 才重投）把订单永久停在 GRANTING
+            local status = archived.status == "ABORTED" and M.STATUS.NOT_STARTED or archived.status
+            return { status = status, response = archived.response, archived = true }
         end
     end
     if op then
@@ -1173,7 +1176,13 @@ function M.query(entity, op_id, opts)
         return { status = M.STATUS.IN_PROGRESS }
     end
     if critical[M.INTENT_FIELD] then
-        return { status = M.STATUS.IN_PROGRESS }
+        -- 带上意图归属：恢复任务要判断"挂着的是不是自己这条 op"，
+        -- 只有自己那条才能在持新 fence 的前提下主动取消
+        local intent = critical[M.INTENT_FIELD]
+        return {
+            status = M.STATUS.IN_PROGRESS,
+            intent_op_id = type(intent) == "table" and intent.op_id or nil,
+        }
     end
     if opts.grant_expires_at and now_of(opts) >= opts.grant_expires_at then
         return { status = M.STATUS.EXPIRED_NOT_EXECUTED }
@@ -1411,9 +1420,15 @@ function M.archive_ops(ctx_or_entity, deps, opts)
         local called, state = pcall(ledger.critical_find_and_modify, ledger, {
             query = { rid = ctx.rid, op_id = v.op_id },
             update = {
+                -- 身份字段只在插入时写；状态类字段必须可更新：
+                -- 同一个 op_id 可能先以 ABORTED 归档，之后被重放成 COMMITTED 再归档一次。
+                -- 只写 $setOnInsert 会让冷账本永久停在第一次的状态，query 从此报"未执行"，
+                -- 调用方据此重放 → 二次入账
                 ["$setOnInsert"] = {
                     rid = ctx.rid,
                     op_id = v.op_id,
+                },
+                ["$set"] = {
                     status = v.op.status,
                     op_type = v.op.op_type,
                     param_hash = v.op.param_hash,

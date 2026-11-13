@@ -207,9 +207,15 @@ function M.run_once(deps, opts)
         end
     end
 
-    -- GRANTED 已经发过奖，核对完就能结案，不需要宽限期
-    for _, status in ipairs({ charge_order.STATUS.GRANTED, charge_order.STATUS.GRANTING }) do
-        local grace = status == charge_order.STATUS.GRANTING and (opts.grace or M.DEFAULT_GRACE) or 0
+    -- GRANTED 已经发过奖，核对完就能结案，不需要宽限期。
+    -- VERIFIED_RECEIVED 也要扫：落单成功、transition 到 GRANTING 之前崩溃的单子
+    -- 否则永远没人看，钱收了奖不发
+    for _, status in ipairs({
+        charge_order.STATUS.GRANTED,
+        charge_order.STATUS.GRANTING,
+        charge_order.STATUS.VERIFIED_RECEIVED,
+    }) do
+        local grace = status == charge_order.STATUS.GRANTED and 0 or (opts.grace or M.DEFAULT_GRACE)
         local orders, err = M.scan_orders(deps.orders_coll, {
             status = status,
             grace = grace,

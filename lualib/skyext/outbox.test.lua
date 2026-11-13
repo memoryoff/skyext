@@ -283,6 +283,21 @@ t.describe("outbox 投递", function()
         t.expect(cas.update["$set"]["_critical_outbox_pending_count"]).to.equal(0)
     end)
 
+    -- 生产链路（FRAMEWORK.outbox_pump -> pump_entity -> pump）只传 limit，没有 now。
+    -- 缺省不取墙钟时 transition 里的 now + retention 会抛错，事件永远停在 PENDING、
+    -- 每轮重复投一条可靠消息，毒事件阈值也永远不触发
+    t.it("falls back to the wall clock when no now is injected", function()
+        local h = harness()
+        h.seed({ assert(h.event()) })
+        local stats = assert(h.outbox.pump(h.ctx, function()
+            return true
+        end, { source = { type = "role", id = 7 } }))
+        t.expect(stats.enqueued).to.equal(1)
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].status).to.equal("ENQUEUED")
+        -- 清理标记必须是个整数到期时刻，不能是 nil
+        t.expect(math.type(h.store.critical._critical_outbox_cleanup_at)).to.equal("integer")
+    end)
+
     -- 投递未确认时保持 PENDING，允许底层 msg_id 重复，业务靠 event_id 去重
     t.it("keeps the event pending when the delivery is not confirmed", function()
         local h = harness()

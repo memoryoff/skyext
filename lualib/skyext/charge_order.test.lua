@@ -322,3 +322,31 @@ t.describe("charge_order 索引门禁", function()
         t.expect(err).to.match("raised")
     end)
 end)
+
+-- 订单是资金凭证：切主回滚会让"渠道已 ACK、订单行消失"变成永久丢单。
+-- 集合支持多数派通道时必须走它，并且 UNKNOWN 不能当成功。
+t.describe("charge_order 多数派写入", function()
+    t.it("uses the majority channel when the collection offers it", function()
+        local h = harness()
+        local used = 0
+        h.orders.critical_find_and_modify = function(self, opts)
+            used = used + 1
+            return "CONFIRMED", self:find_and_modify(opts)
+        end
+        local order = assert(h.record())
+        t.expect(used).to.equal(1)
+        t.expect(order.status).to.equal(h.charge.STATUS.VERIFIED_RECEIVED)
+    end)
+
+    t.it("fails the write when the majority channel cannot confirm it", function()
+        local h = harness()
+        h.orders.critical_find_and_modify = function()
+            return "UNKNOWN", "write concern timeout"
+        end
+        local order, err = h.record()
+        t.expect(order).to.be_nil()
+        t.expect(err).to.equal("UNKNOWN")
+        -- 没有落单成功就不能往下走：否则发奖会建立在一张可能不存在的订单上
+        t.expect(next(h.orders.store)).to.be_nil()
+    end)
+end)

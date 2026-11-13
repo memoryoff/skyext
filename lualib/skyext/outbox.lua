@@ -558,7 +558,10 @@ function M.pump(ctx, deliver, opts)
         retryable = 0,
     }
     local source = opts.source or {}
-    local now = opts.now
+    -- 生产链路（entity_agent.outbox_pump -> pump_entity -> 这里）只传 limit，
+    -- 没有 now。缺省必须自己取墙钟：transition/bump_cleanup_at 会做 now + retention，
+    -- nil 会直接抛错，事件永远停在 PENDING、每轮重复投一条可靠消息。
+    local now = opts.now or os.time()
 
     local critical_table = dbmgr.cached_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id)
     if not critical_table then

@@ -1502,4 +1502,20 @@ t.describe("dbmgr 元数据 CAS 与版本对齐", function()
         t.expect(ok).to.be_nil()
         t.expect(reason).to.equal("read failed")
     end)
+
+    -- extract 失败时第二个返回值是**错误字符串**。只判 truthy 会把它存进
+    -- entry.critical，下一次 PREPARE 写意图时对字符串索引直接抛错，
+    -- 缓存永久停在 PREPARING（load 只会回 "critical write in progress"）
+    t.it("never caches an extract error as the critical table", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.store._critical_evil_v9 = { x = 1 }
+
+        local ok, reason = h.db.refresh_critical("demo", "role", "rid", 7)
+        t.expect(ok).to.be_nil()
+        t.expect(reason).to.match("extract failed")
+        local cached = h.db.cached_critical("demo", "role", 7)
+        t.expect(type(cached)).to.equal("table")
+        t.expect(cached._critical_evil_v9).to.be_nil()
+    end)
 end)

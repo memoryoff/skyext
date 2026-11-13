@@ -409,6 +409,9 @@ t.describe("critical 客户端入口", function()
         t.expect(h.store.critical._critical_intent_v1).to.be_nil()
         local op = h.store.critical._critical_ops_v1["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0001"]
         t.expect(op.status).to.equal(h.critical.STATUS.BUSINESS_REJECTED)
+        -- 业务拒绝同样占一条热账本：水位不维护的话维护扫描永远不命中，
+        -- 攒到 MAX_OPS 之后所有关键操作都会被容量拒绝，且没有任何自动恢复路径
+        t.expect(h.store.critical._critical_ops_oldest_at).to.equal(h.now)
         -- 拒绝不改资产
         t.expect(h.doc.gold).to.equal(100)
 
@@ -714,6 +717,24 @@ t.describe("critical 查询与恢复", function()
         h.client(1)
         local q = h.critical.query(h.entity, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0001")
         t.expect(q.status).to.equal(h.critical.STATUS.COMMITTED)
+    end)
+
+    -- 恢复任务要知道"挂着的意图是不是自己这条 op"：只有自己那条才能在持新 fence
+    -- 的前提下主动取消。不带归属时 query 永远回 IN_PROGRESS，任务永远 RETRY_WAIT，
+    -- 同角色其它关键操作也一直被挡
+    t.it("reports which op holds the pending intent", function()
+        local h = harness()
+        local own = "srv_" .. string.rep("a", 64)
+        local other = "srv_" .. string.rep("b", 64)
+        h.store.critical = { _critical_intent_v1 = { op_id = own, state = "PREPARED" } }
+
+        local q = h.critical.query(h.entity, own)
+        t.expect(q.status).to.equal(h.critical.STATUS.IN_PROGRESS)
+        t.expect(q.intent_op_id).to.equal(own)
+
+        local q2 = h.critical.query(h.entity, other)
+        t.expect(q2.status).to.equal(h.critical.STATUS.IN_PROGRESS)
+        t.expect(q2.intent_op_id).to.equal(own)
     end)
 
     t.it("reports EXPIRED_NOT_EXECUTED only when there is no record", function()
@@ -1575,6 +1596,34 @@ t.describe("critical 归档", function()
         t.expect(stats.archived).to.equal(1)
         t.expect(h.store.critical._critical_ops_v1[OP_A]).to.be_nil()
         t.expect(h.store.critical._critical_ops_v1[OP_B]).to_not.be_nil()
+    end)
+
+    -- 同一个 op_id 可能先以 ABORTED 归档、之后被重放成 COMMITTED 再归档一次。
+    -- 只写 $setOnInsert 会让冷账本永久停在第一次的状态，query 从此报"未执行"，
+    -- 调用方据此重放 → 二次入账
+    t.it("writes mutable fields with $set so a re-archive can correct the status", function()
+        local h = harness()
+        with_ops(h, { [OP_A] = { status = "ABORTED", op_type = "shop.buy", at = 100 } }, 100)
+        local ledger = fake_ledger()
+        assert(h.critical.archive_ops(h.entity, { ledger = ledger }, { now = 1000, retention = 500 }))
+        local update = ledger.upserts[1].update
+        t.expect(update["$setOnInsert"].op_id).to.equal(OP_A)
+        t.expect(update["$setOnInsert"].status).to.be_nil()
+        t.expect(update["$set"].status).to.equal("ABORTED")
+    end)
+
+    -- 冷分支与热分支必须同口径：热路径把 ABORTED 归一成 NOT_STARTED，
+    -- 冷路径原样回 ABORTED 会让对账（只认 NOT_STARTED 才重投）把订单永久停在 GRANTING
+    t.it("maps an archived ABORTED op to NOT_STARTED like the hot path", function()
+        local h = harness()
+        h.store.critical = {}
+        local ledger = {
+            critical_find = function()
+                return { status = "ABORTED", response = { errcode = 4003 } }
+            end,
+        }
+        local q = h.critical.query(h.entity, OP_A, { ledger = ledger })
+        t.expect(q.status).to.equal("NOT_STARTED")
     end)
 
     t.it("does nothing when nothing is old enough", function()

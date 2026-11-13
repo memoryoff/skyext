@@ -230,21 +230,32 @@ function M.activate(entity)
     return true
 end
 
--- 降级：还没释放锁的实体撤销冻结，留在本节点继续服务；
--- 已经释放的实体只能让客户端重登——而且要**主动踢**。源端已经没有 owner 了，
--- 网关还会把上行转给一个不存在的服务；不踢的话客户端会对着空气重试到空闲超时。
+-- 降级：还没导出快照的实体撤销冻结，留在本节点继续服务；
+-- 已经导出/已经释放的实体只能让客户端重登——而且要**主动踢**。源端已经没有
+-- 可服务的实体了，网关还会把上行转过来；不踢的话客户端对着空气重试到空闲超时。
 function M.fallback(entity, reason)
     -- 降级路径自己负责解冻/踢人，不再留给取消兜底重复处理
     g_inflight[entity.id] = nil
+
+    -- 解冻是否真的成功。失败有两种：已导出（unquiesce 明确拒绝）、RPC 抛错，
+    -- 两种情况网关的 frozen_epoch 都还在
+    local unfrozen = false
     if entity._quiesced and not entity._released then
         local ok, revoked, err = pcall(call_agent, self_node(), entity.id, "migration_unquiesce", entity.id, reason)
         if not ok then
             log.error("migration unquiesce raised", "id", tostring(entity.id), "err", tostring(revoked))
         elseif not revoked then
             log.error("migration unquiesce refused", "id", tostring(entity.id), "err", tostring(err))
+        else
+            unfrozen = true
         end
-    elseif entity._released and entity.conn_id then
-        -- 网关的 kick 不返回结果：调用没抛错就算发出去了，不能拿返回值判断连接是否还在
+    end
+
+    -- 只要网关可能还冻着这条连接，就必须踢：会话销毁即等于解屏障。
+    -- 原先只看 `_released`，而 export 成功、release 失败时 `_released` 仍是 nil，
+    -- 于是既不 unquiesce（被拒）也不 kick，客户端两个方向都被静默丢弃
+    local need_kick = entity._released == true or (entity._quiesced == true and not unfrozen)
+    if need_kick and entity.conn_id then
         local called, raised = pcall(call_gate, entity.conn_id, "kick", entity.conn_id)
         if not called then
             log.error(
@@ -263,7 +274,9 @@ function M.fallback(entity, reason)
         "reason",
         tostring(reason),
         "released",
-        entity._released == true
+        entity._released == true,
+        "unfrozen",
+        unfrozen
     )
 end
 

@@ -316,6 +316,26 @@ t.describe("migration_adapter 降级", function()
         t.expect(kick.target).to.equal("gate1!.gate_tcp")
         t.expect(kick.args[1]).to.equal("conn-7")
     end)
+
+    -- export 成功、release 失败：`_released` 仍是 nil，而源端实体已经导出了快照，
+    -- unquiesce 会被明确拒绝。此时网关屏障还在，只看 `_released` 就既不unfreeze
+    -- 也不 kick，客户端上下行被静默丢弃（只能等客户端自己超时重连）
+    t.it("kicks the client when an exported entity cannot be unfrozen", function()
+        local h = harness()
+        local e = entity()
+        assert(h.adapter.quiesce(e))
+        local snapshot = assert(h.adapter.export(e))
+        h.release_ok = false
+        t.expect(h.adapter.transfer(e, snapshot)).to.be_nil()
+
+        h.unquiesce_ok = false
+        h.unquiesce_err = "snapshot already exported"
+        h.adapter.fallback(e, "release failed")
+
+        local kick = h.last_call("kick")
+        t.expect(kick).to_not.be_nil()
+        t.expect(kick.args[1]).to.equal("conn-7")
+    end)
 end)
 
 -- 用真实的编排状态机跑一遍，确认适配器的返回值形状与 migration.run 的约定对得上

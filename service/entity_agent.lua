@@ -364,23 +364,39 @@ FRAMEWORK.critical_resolve_intent = function(entity, op_id)
         -- 没有冷账本就不能排除"热条目已归档"，更不能判定未提交
         return { status = "UNKNOWN", reason = "critical_ledger is not configured" }
     end
+
+    -- 取消未决意图：一次 CAS 写 ABORTED 终态并清 PREPARED，不产生业务效果
+    local function abort_pending()
+        local state, detail = critical.abort_intent(entity, { now = os.time() })
+        if state == "CONFIRMED" then
+            return { status = "NOT_COMMITTED" }
+        end
+        if state == "REJECTED" and detail == "no pending intent" then
+            return { status = "NOT_COMMITTED" }
+        end
+        return { status = "UNKNOWN", reason = tostring(detail) }
+    end
+
     local proof = critical.query(entity, op_id, { now = os.time(), ledger = ledger })
     if proof.status == "COMMITTED" or proof.status == "BUSINESS_REJECTED" then
         return { status = "COMMITTED" }
     end
-    if proof.status == "UNKNOWN" or proof.status == "IN_PROGRESS" then
+    if proof.status == "IN_PROGRESS" then
+        if proof.intent_op_id ~= op_id then
+            -- 挂着的是别的操作：本任务证明不了它，保持 UNKNOWN 等它自己推进
+            return { status = "UNKNOWN", reason = "another intent is pending" }
+        end
+        -- 挂着的就是本任务要解析的这条：COMMIT 会同时写 op 记录并清意图，
+        -- 意图还在就说明没有提交过；而实体已持新 fence，旧 owner 的迟到 CAS 会被挡。
+        -- 不在这里取消，query 就永远回 IN_PROGRESS，任务永远停在 RETRY_WAIT，
+        -- 同角色其它关键操作也会一直被"another critical operation is in flight"挡住
+        return abort_pending()
+    end
+    if proof.status == "UNKNOWN" then
         return { status = "UNKNOWN" }
     end
-    -- 到这里的只有 NOT_STARTED / EXPIRED_NOT_EXECUTED（ABORTED 由 query 映射成 NOT_STARTED）。
-    -- 取消未决意图：一次 CAS 写 ABORTED 终态并清 PREPARED，不产生业务效果
-    local state, detail = critical.abort_intent(entity, { now = os.time() })
-    if state == "CONFIRMED" then
-        return { status = "NOT_COMMITTED" }
-    end
-    if state == "REJECTED" and detail == "no pending intent" then
-        return { status = "NOT_COMMITTED" }
-    end
-    return { status = "UNKNOWN", reason = tostring(detail) }
+    -- 到这里的只有 NOT_STARTED / EXPIRED_NOT_EXECUTED（ABORTED 由 query 映射成 NOT_STARTED）
+    return abort_pending()
 end
 
 FRAMEWORK.session_export = function(entity, barrier_id, target_owner_epoch)

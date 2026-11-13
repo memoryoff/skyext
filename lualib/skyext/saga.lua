@@ -416,6 +416,8 @@ function M.run(coll, saga_id, deps, opts)
         local next_doc, terr = M.transition(coll, saga_id, state, M.STATE.COMPENSATED, nil, {
             version = doc.version,
             now = opts.now,
+            -- 与其它四个转移同一条不变量：失租的协调者不能靠"状态没变"抢到迁移
+            owner = opts.owner,
         })
         if not next_doc then
             return state, terr

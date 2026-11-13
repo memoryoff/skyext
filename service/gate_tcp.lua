@@ -234,6 +234,9 @@ function CMD.kick(conn_id)
     if session then
         gateserver.closeclient(session.fd)
     end
+    -- 幂等：连接已经不在也算踢成功。调用方（迁移 abort）用返回值统计结果，
+    -- 返回 nil 会把每一次成功的踢人都记成失败
+    return true
 end
 
 function CMD.count()

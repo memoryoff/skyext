@@ -323,3 +323,30 @@ t.describe("charge_reconcile 索引门禁", function()
         t.expect(seen.name).to.equal("status_updated_at")
     end)
 end)
+
+t.describe("charge_reconcile 卡在 VERIFIED_RECEIVED 的单", function()
+    -- 落单成功、进程在 transition 到 GRANTING 之前崩掉：这张单没有任何后续状态，
+    -- 只按 GRANTED/GRANTING 扫就永远看不到它 —— 钱收了、奖不发、也没人知道
+    t.it("scans and re-grants an order stuck in VERIFIED_RECEIVED", function()
+        local orders = fake_orders()
+        local order = make_order(orders, { now = 1 })
+        t.expect(order.status).to.equal(charge_order.STATUS.VERIFIED_RECEIVED)
+        -- 落单必须写 updated_at，否则 updated_at <= now - grace 永远不匹配
+        t.expect(order.updated_at).to.equal(1)
+
+        local deps = deps_for(orders, { status = "NOT_STARTED" })
+        local stats = assert(charge_reconcile.run_once(deps, { now = 1000, grace = 30 }))
+        t.expect(stats.scanned).to.equal(1)
+        t.expect(deps.grants).to.equal(1)
+    end)
+
+    -- 宽限期仍然生效：刚落单、回调还在飞的单子不能被对账抢走
+    t.it("leaves a fresh VERIFIED_RECEIVED order alone", function()
+        local orders = fake_orders()
+        make_order(orders, { now = 1000 })
+        local deps = deps_for(orders, { status = "NOT_STARTED" })
+        local stats = assert(charge_reconcile.run_once(deps, { now = 1000, grace = 30 }))
+        t.expect(stats.scanned).to.equal(0)
+        t.expect(deps.grants).to.equal(0)
+    end)
+end)
