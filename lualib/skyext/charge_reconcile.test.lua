@@ -369,6 +369,40 @@ t.describe("charge_reconcile 对账", function()
         t.expect(orders.store.docs[1].last_error).to.equal("mail module is not loaded")
     end)
 
+    -- 阻断没写进多数派就不能记成"已转人工"：报表会失真，下一轮还会被扫到。
+    -- 首轮 proof 分支与重投分支必须同一口径
+    t.it("does not report a rejection as handled when the block cannot be persisted", function()
+        local orders = fake_orders()
+        local order = make_order(orders)
+        assert(charge_order.transition(orders, "wechat", "o-1", "VERIFIED_RECEIVED", "GRANTING", nil, 2))
+
+        function orders:critical_find_and_modify(opts)
+            local set = opts.update and opts.update["$set"]
+            if set and set.reconcile_blocked_at ~= nil then
+                return "UNKNOWN", "write concern timeout"
+            end
+            local ret = self:find_and_modify(opts)
+            if type(ret) == "table" and ret.ok == 1 then
+                return "CONFIRMED", ret
+            end
+            return "REJECTED", ret
+        end
+
+        local grants = 0
+        local deps = deps_for(orders, { status = "BUSINESS_REJECTED" })
+        deps.grant = function()
+            grants = grants + 1
+            return { status = "COMMITTED" }
+        end
+
+        local outcome = charge_reconcile.reconcile_order(orders, order, deps, { now = 10 })
+        t.expect(outcome).to.equal("PENDING")
+        t.expect(orders.store.docs[1].reconcile_blocked_at).to.be_nil()
+        t.expect(orders.store.docs[1].status).to.equal("GRANTING")
+        -- 业务已经拒绝，任何路径都不能重投发奖
+        t.expect(grants).to.equal(0)
+    end)
+
     t.it("stops regranting the rejected order on later rounds", function()
         local orders = fake_orders()
         make_order(orders)

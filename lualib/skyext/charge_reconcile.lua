@@ -171,6 +171,14 @@ function M.reconcile_order(orders_coll, order, deps, opts)
 
     if proof.status == "BUSINESS_REJECTED" then
         -- 收了钱但业务拒绝发货：这是补偿单，不是"已结案"
+        local blocked, berr = charge_order.block_reconcile(orders_coll, order, "business_rejected", now)
+        if not blocked then
+            -- 阻断没落库就不能记成"已转人工"：报表会失真，下一轮还会被扫到。
+            -- 与重投分支同一口径——先确认阻断，再宣告结果
+            log.error("charge rejection could not be blocked", "order", tostring(order.order_id), "err", tostring(berr))
+            m_outcome:inc(1, { outcome = M.OUTCOME.PENDING })
+            return M.OUTCOME.PENDING, berr
+        end
         log.error(
             "charge grant was rejected by business rules, manual compensation required",
             "order",
@@ -178,7 +186,6 @@ function M.reconcile_order(orders_coll, order, deps, opts)
             "rid",
             tostring(order.rid)
         )
-        charge_order.block_reconcile(orders_coll, order, "business_rejected", now)
         m_outcome:inc(1, { outcome = M.OUTCOME.BUSINESS_REJECTED })
         return M.OUTCOME.BUSINESS_REJECTED, proof
     end
