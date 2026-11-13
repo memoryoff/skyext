@@ -147,6 +147,17 @@ local function entity(extra)
     return e
 end
 
+-- 数某个命令被调用了几次：用于断言 fallback 与 abort 各自踢了多少次
+local function count_calls(h, cmd)
+    local n = 0
+    for _, call in ipairs(h.calls) do
+        if call.cmd == cmd then
+            n = n + 1
+        end
+    end
+    return n
+end
+
 t.describe("migration_adapter 枚举", function()
     t.it("only offers entities that can be handed over without a reconnect", function()
         local h = harness({
@@ -336,6 +347,73 @@ t.describe("migration_adapter 降级", function()
         t.expect(kick).to_not.be_nil()
         t.expect(kick.args[1]).to.equal("conn-7")
     end)
+
+    -- D-12 回归：quiesce + freeze 都成功（网关 frozen_epoch 已建立、_barrier 已打），
+    -- export 失败后 unquiesce 虽成功，但 entitymgr 的 unquiesce 从不让网关 resume_owner，
+    -- 屏障仍挂着、上下行被双向丢弃。旧逻辑只看 _released / not unfrozen，两条都不成立
+    -- 于是不踢；这里断言 fallback 必须主动踢客户端解屏障。
+    t.it("kicks when the gate barrier was built even if unquiesce succeeds", function()
+        local h = harness()
+        local e = entity()
+        assert(h.adapter.quiesce(e))
+        assert(h.adapter.freeze(e, "b1"))
+        h.export_ok = false
+        t.expect(h.adapter.export(e, "b1")).to.be_nil()
+        -- unquiesce 默认成功：恰恰是"解不掉网关屏障"的那个陷阱
+        h.adapter.fallback(e, "export failed")
+
+        t.expect(h.last_call("migration_unquiesce")).to_not.be_nil()
+        local kick = h.last_call("kick")
+        t.expect(kick).to_not.be_nil()
+        t.expect(kick.args[1]).to.equal("conn-7")
+    end)
+
+    -- 没走到 freeze（_barrier 从未建立），网关没有屏障；unquiesce 成功后实体
+    -- 留在本节点继续服务，不该踢客户端。
+    t.it("does not kick when no gate barrier was ever built", function()
+        local h = harness()
+        local e = entity()
+        assert(h.adapter.quiesce(e))
+        -- 模拟 freeze 之前就失败：不调用 freeze，_barrier 保持 nil
+        h.adapter.fallback(e, "barrier step failed")
+
+        t.expect(h.last_call("migration_unquiesce")).to_not.be_nil()
+        t.expect(h.last_call("kick")).to.be_nil()
+    end)
+
+    -- kick 返回假时登记必须保留，随后 M.abort() 兜底再踢一次
+    t.it("keeps the inflight entry when fallback kick returns false", function()
+        local opts = { kick_ok = false }
+        local h = harness(opts)
+        local e = entity()
+        assert(h.adapter.quiesce(e))
+        assert(h.adapter.freeze(e, "b1"))
+        h.adapter.fallback(e, "export failed")
+        t.expect(count_calls(h, "kick")).to.equal(1)
+
+        opts.kick_ok = true
+        local stats = h.adapter.abort("shutdown deadline")
+        t.expect(stats.kicked).to.equal(1)
+        t.expect(stats.pending).to.equal(0)
+        t.expect(count_calls(h, "kick")).to.equal(2)
+    end)
+
+    -- kick 抛错时同样保留登记，M.abort() 仍会重试踢人
+    t.it("keeps the inflight entry when fallback kick raises", function()
+        local opts = { kick_raises = true }
+        local h = harness(opts)
+        local e = entity()
+        assert(h.adapter.quiesce(e))
+        assert(h.adapter.freeze(e, "b1"))
+        h.adapter.fallback(e, "export failed")
+        t.expect(count_calls(h, "kick")).to.equal(1)
+
+        opts.kick_raises = false
+        local stats = h.adapter.abort("shutdown deadline")
+        t.expect(stats.kicked).to.equal(1)
+        t.expect(stats.pending).to.equal(0)
+        t.expect(count_calls(h, "kick")).to.equal(2)
+    end)
 end)
 
 -- 用真实的编排状态机跑一遍，确认适配器的返回值形状与 migration.run 的约定对得上
@@ -412,13 +490,19 @@ t.describe("migration_adapter 取消兜底", function()
         t.expect(h.last_call("kick")).to.be_nil()
     end)
 
-    t.it("does not kick twice after a fallback already handled the entity", function()
+    -- D-12：屏障一旦建立（freeze 成功、_barrier 存在），fallback 必须主动踢一次，
+    -- 让网关会话连同 frozen_epoch 一起销毁；旧实现既不踢又首行清掉 g_inflight，
+    -- abort 兜底也够不着，客户端上下行被永久丢弃。踢成功后登记被摘掉，所以这里
+    -- 断言的是"总共只踢一次、abort 不重复踢"，而不是旧语义的"完全不踢"。
+    t.it("kicks once in fallback to clear the barrier, then abort does not repeat it", function()
         local h = harness()
         local e = entity()
         assert(h.adapter.freeze(e, "b1"))
         h.adapter.fallback(e, "no snapshot")
+        t.expect(count_calls(h, "kick")).to.equal(1)
         local stats = h.adapter.abort("shutdown deadline")
         t.expect(stats.kicked).to.equal(0)
+        t.expect(count_calls(h, "kick")).to.equal(1)
     end)
 
     t.it("refuses new phase RPCs after abort but still allows the abort kick", function()

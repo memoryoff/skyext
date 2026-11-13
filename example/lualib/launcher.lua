@@ -26,7 +26,7 @@ M.OPTIONAL_SERVICES = {
     },
 }
 
--- 结构化启动自检：哪些开了、哪些没开、开了但缺什么。只读，不改配置。
+-- 结构化启动自检：哪些开了、哪些没开、开了但缺什么、跨服务依赖有没有断。只读，不改配置。
 function M.self_check()
     local report = { enabled = {}, disabled = {}, problems = {} }
     for _, spec in ipairs(M.OPTIONAL_SERVICES) do
@@ -51,10 +51,45 @@ function M.self_check()
             report.disabled[#report.disabled + 1] = spec.config_key
         end
     end
+
+    -- 跨服务依赖（D-16）：支付回调与 outbox 都靠 critical_maintenance 归档冷账本、
+    -- 补建恢复任务。它没开时热账本会撞上 MAX_OPS，新关键操作被拒、UNKNOWN 不恢复。
+    local maintenance = config.get_table("critical_maintenance")
+    local maintenance_on = type(maintenance) == "table" and maintenance.enabled == true
+    if not maintenance_on then
+        for _, key in ipairs({ "pay_callback", "outbox_worker" }) do
+            local conf = config.get_table(key)
+            if type(conf) == "table" and conf.enabled == true then
+                report.problems[#report.problems + 1] =
+                    string.format("%s is enabled but critical_maintenance is not enabled", key)
+            end
+        end
+    end
+
+    -- 维护服务启用时，对应实体类型必须真的配了冷账本/恢复任务集合。缺了它
+    -- service/critical_maintenance.lua 会 fail-fast，自检里先把话说清楚：
+    -- 绝不允许回退到默认集合名、启动成功却空转。
+    if maintenance_on then
+        local type_name = maintenance.type_name or "role"
+        local entity_types = config.get_table("entity_types")
+        local tc = type(entity_types) == "table" and entity_types[type_name] or nil
+        for _, key in ipairs({ "critical_ledger", "critical_jobs" }) do
+            local spec = type(tc) == "table" and tc[key] or nil
+            if type(spec) ~= "table" or type(spec.db) ~= "string" or type(spec.coll) ~= "string" then
+                report.problems[#report.problems + 1] = string.format(
+                    "critical_maintenance is enabled but entity type %s has no valid %s config (db/coll required)",
+                    tostring(type_name),
+                    key
+                )
+            end
+        end
+    end
     return report
 end
 
-local function log_self_check()
+-- 自检有 problem 就阻断启动：只打日志等于没拦，缺了关键账本配置的维护服务会
+-- "启动成功但空转"，等热账本撞上 MAX_OPS、新关键操作被拒才发现。
+local function assert_self_check()
     local report = M.self_check()
     log.info(
         "optional services self-check",
@@ -65,6 +100,9 @@ local function log_self_check()
     )
     for _, problem in ipairs(report.problems) do
         log.error("optional service config problem", "detail", problem)
+    end
+    if #report.problems > 0 then
+        error("optional services self-check failed: " .. table.concat(report.problems, "; "), 0)
     end
     return report
 end
@@ -131,8 +169,8 @@ function M.launcher_node()
     assert(all_ok, "auto create indexes failed")
     skynet.kill(mongo_index)
     log.info("auto create indexes success")
-    -- 索引门禁之后再自检：配置问题要跟着"节点已就绪"一起出现在启动日志里
-    log_self_check()
+    -- 索引门禁之后再自检：配置问题跟着"节点已就绪"进启动日志，并且直接拦下启动
+    assert_self_check()
 end
 
 -- 客户端接入：网关管连接，login 处理还没绑定的会话。

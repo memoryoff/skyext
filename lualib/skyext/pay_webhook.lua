@@ -229,12 +229,17 @@ function Webhook:handle(req)
         return { status = 200, body = { result = "accepted", status = charge_order.STATUS.GRANTED } }
     end
 
-    if
-        status == "UNKNOWN"
-        or status == "IN_PROGRESS"
-        or status == "CAPACITY_EXCEEDED"
-        or status == "INTERNAL_ERROR"
-    then
+    if status == "CAPACITY_EXCEEDED" then
+        -- 容量超限不是"结果未决"：当前发奖没有开始，订单留在 GRANTING 等
+        -- critical_maintenance 腾出账本空间。必须让渠道重推，不能 ACK 后把
+        -- 唯一的重试入口交给一个可能根本未启用的维护服务。
+        charge_order.note_error(self.orders_coll, order, tostring(decision.reason or status), now)
+        log.error("pay grant capacity exceeded, asking channel to retry", "order", tostring(order.order_id))
+        m_requests:inc(1, { result = "capacity_exceeded" })
+        return reject(503, "capacity_exceeded", { retryable = true })
+    end
+
+    if status == "UNKNOWN" or status == "IN_PROGRESS" or status == "INTERNAL_ERROR" then
         -- 结果未决/暂态：订单留在 GRANTING，ACK 之后由对账 worker 收尾。
         -- INTERNAL_ERROR 是 validate 自身抛错，PREPARE 之前零写入，
         -- critical.query 只会回 NOT_STARTED；它不是契约失败，回 500 让渠道

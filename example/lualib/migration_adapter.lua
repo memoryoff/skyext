@@ -233,12 +233,17 @@ end
 -- 降级：还没导出快照的实体撤销冻结，留在本节点继续服务；
 -- 已经导出/已经释放的实体只能让客户端重登——而且要**主动踢**。源端已经没有
 -- 可服务的实体了，网关还会把上行转过来；不踢的话客户端对着空气重试到空闲超时。
+--
+-- 更关键的是网关屏障：freeze 成功会登记 g_inflight 并打上 entity._barrier，而
+-- entitymgr 的 unquiesce 只清实体的 migrating 标记，**从不让网关 resume_owner**。
+-- 所以只要本轮没走到成功的 activate（新 owner 解屏障），unquiesce 再成功也解不掉
+-- 网关的 frozen_epoch，上/下行仍会被双向丢弃（gate_owner.push_allowed /
+-- upstream_allowed）。此时解屏障的唯一手段就是踢客户端，让网关会话连同
+-- frozen_epoch 一起销毁。不要改用 resume_owner：它需要严格更大的新 epoch，而实体
+-- 此刻仍留在旧 owner 的本节点上，会造出状态不一致。
 function M.fallback(entity, reason)
-    -- 降级路径自己负责解冻/踢人，不再留给取消兜底重复处理
-    g_inflight[entity.id] = nil
-
     -- 解冻是否真的成功。失败有两种：已导出（unquiesce 明确拒绝）、RPC 抛错，
-    -- 两种情况网关的 frozen_epoch 都还在
+    -- 两种情况网关的 frozen_epoch 都还在（C-07：unquiesce 被拒必踢）
     local unfrozen = false
     if entity._quiesced and not entity._released then
         local ok, revoked, err = pcall(call_agent, self_node(), entity.id, "migration_unquiesce", entity.id, reason)
@@ -251,32 +256,73 @@ function M.fallback(entity, reason)
         end
     end
 
-    -- 只要网关可能还冻着这条连接，就必须踢：会话销毁即等于解屏障。
-    -- 原先只看 `_released`，而 export 成功、release 失败时 `_released` 仍是 nil，
-    -- 于是既不 unquiesce（被拒）也不 kick，客户端两个方向都被静默丢弃
-    local need_kick = entity._released == true or (entity._quiesced == true and not unfrozen)
+    -- 网关屏障是否还挂着：freeze 成功会登记并打 _barrier，activate 成功（新 owner
+    -- 已 resume_owner）才会清掉 g_inflight。登记还在 == 本轮没走到成功的 activate，
+    -- 屏障没有解除过。原先首行无条件清 g_inflight，解不掉的屏障连 abort 兜底都够不着。
+    local barrier_pending = entity._barrier ~= nil and g_inflight[entity.id] ~= nil
+
+    -- 未确认语义：已释放必踢、unquiesce 失败/被拒必踢、屏障未解除必踢。
+    -- 没建立过屏障（例如 quiesce 阶段就失败）且 unquiesce 成功时，实体只是撤销冻结、
+    -- 留在本节点继续服务，不该踢。
+    -- 原先只看 _released 与 not unfrozen：export 失败、unquiesce 成功时两条都不成立，
+    -- 于是既不解冻网关也不踢，客户端两个方向被静默丢弃。
+    local released = entity._released == true
+    local unquiesce_refused = entity._quiesced == true and not unfrozen
+    local need_kick = released or unquiesce_refused or barrier_pending
+
+    -- 踢人原因单独记，运维一眼能分清"源端已释放"与"网关屏障没解除"两类
+    local kick_reason
+    if released then
+        kick_reason = "released"
+    elseif unquiesce_refused then
+        kick_reason = "unquiesce_refused"
+    elseif barrier_pending then
+        kick_reason = "barrier_pending"
+    else
+        kick_reason = "none"
+    end
+
+    local kicked = false
     if need_kick and entity.conn_id then
-        local called, raised = pcall(call_gate, entity.conn_id, "kick", entity.conn_id)
+        -- pcall 三个返回值：抛错、以及网关返回假（被拒）都算没踢成，登记要保留
+        local called, kick_ok, kick_err = pcall(call_gate, entity.conn_id, "kick", entity.conn_id)
         if not called then
             log.error(
                 "migration fallback could not kick the client",
                 "id",
                 tostring(entity.id),
                 "err",
-                tostring(raised)
+                tostring(kick_ok)
             )
+        elseif not kick_ok then
+            log.error("migration fallback kick was rejected", "id", tostring(entity.id), "err", tostring(kick_err))
+        else
+            kicked = true
         end
     end
+
+    -- 只有确认无需踢、或踢成功，屏障才算处理完，才能摘掉登记；
+    -- 踢失败/被拒时保留 g_inflight，让后续 M.abort() 的兜底还能重试踢人。
+    if not need_kick or kicked then
+        g_inflight[entity.id] = nil
+    end
+
     log.warn(
         "entity migration fell back to reconnect",
         "id",
         tostring(entity.id),
         "reason",
         tostring(reason),
+        "kick_reason",
+        kick_reason,
         "released",
-        entity._released == true,
+        released,
         "unfrozen",
-        unfrozen
+        unfrozen,
+        "need_kick",
+        need_kick,
+        "kicked",
+        kicked
     )
 end
 

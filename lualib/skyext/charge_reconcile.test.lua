@@ -19,9 +19,24 @@ end
 
 local function matches(doc, query)
     for k, v in pairs(query) do
-        if type(v) == "table" then
+        if k == "$or" then
+            local hit = false
+            for _, candidate in ipairs(v) do
+                if matches(doc, candidate) then
+                    hit = true
+                    break
+                end
+            end
+            if not hit then
+                return false
+            end
+        elseif type(v) == "table" then
             if v["$lte"] ~= nil then
                 if doc[k] == nil or doc[k] > v["$lte"] then
+                    return false
+                end
+            elseif v["$gt"] ~= nil then
+                if doc[k] == nil or doc[k] <= v["$gt"] then
                     return false
                 end
             elseif v["$in"] then
@@ -103,13 +118,24 @@ local function fake_orders()
             end
         end
         table.sort(out, function(a, b)
-            return (a.updated_at or 0) < (b.updated_at or 0)
+            for _, field in ipairs(opts and opts.sort or {}) do
+                local key, direction = next(field)
+                local av, bv = a[key], b[key]
+                if av ~= bv then
+                    if direction == -1 then
+                        return av > bv
+                    end
+                    return av < bv
+                end
+            end
+            return false
         end)
         local limit = (opts and opts.limit) or #out
-        while #out > limit do
-            out[#out] = nil
+        local page = {}
+        for i = 1, math.min(#out, limit) do
+            page[#page + 1] = out[i]
         end
-        return out
+        return page
     end
 
     function coll:find_one(query)
@@ -167,11 +193,25 @@ t.describe("charge_reconcile 扫描", function()
             seen = { query = query, opts = opts }
             return {}
         end
-        assert(charge_reconcile.scan_orders(orders, { status = "GRANTING", now = 1000, grace = 60, limit = 5 }))
+        assert(charge_reconcile.scan_orders(orders, {
+            status = "GRANTING",
+            now = 1000,
+            grace = 60,
+            limit = 5,
+            cursor = { updated_at = 900, provider = "wechat", order_id = "o-0" },
+        }))
         t.expect(seen.query.status).to.equal("GRANTING")
         -- 宽限期：别抢刚进 GRANTING、发奖还在飞的单子
         t.expect(seen.query.updated_at["$lte"]).to.equal(940)
         t.expect(seen.opts.limit).to.equal(5)
+        -- keyset 只扫上一页末尾之后的订单，避免 skip 在集合收缩时漂移
+        t.expect(seen.query["$or"][1].updated_at["$gt"]).to.equal(900)
+        t.expect(seen.query["$or"][2].provider["$gt"]).to.equal("wechat")
+        t.expect(seen.query["$or"][3].order_id["$gt"]).to.equal("o-0")
+        -- 稳定排序才能让 keyset 游标续扫
+        t.expect(seen.opts.sort[1].updated_at).to.equal(1)
+        t.expect(seen.opts.sort[2].provider).to.equal(1)
+        t.expect(seen.opts.sort[3].order_id).to.equal(1)
     end)
 
     t.it("reports a scan error", function()
@@ -202,14 +242,41 @@ t.describe("charge_reconcile 对账", function()
 
     t.it("reconciles a GRANTED order that never got its proof", function()
         local orders = fake_orders()
-        local order = make_order(orders)
+        make_order(orders)
         assert(charge_order.transition(orders, "wechat", "o-1", "VERIFIED_RECEIVED", "GRANTED", nil, 2))
 
+        local order = assert(orders:find_one({ provider = "wechat", order_id = "o-1" }))
         local deps = deps_for(orders, { status = "COMMITTED" })
         local outcome = charge_reconcile.reconcile_order(orders, order, deps, { now = 10 })
         t.expect(outcome).to.equal("RECONCILED")
         t.expect(orders.store.docs[1].status).to.equal("RECONCILED")
         t.expect(orders.store.docs[1].reconcile_proof.checked_at).to.equal(10)
+    end)
+
+    -- 落单后进程在 transition 到 GRANTING 前崩溃，但角色文档里其实已经 COMMITTED：
+    -- 这是持久化事实，可以从 VERIFIED_RECEIVED 安全补到 GRANTED 并结案。
+    t.it("closes a VERIFIED_RECEIVED order whose grant is already committed", function()
+        local orders = fake_orders()
+        local order = make_order(orders)
+        local deps = deps_for(orders, { status = "COMMITTED", version = 9 })
+        local outcome, proof = charge_reconcile.reconcile_order(orders, order, deps, { now = 10 })
+        t.expect(outcome).to.equal("RECONCILED")
+        t.expect(proof.version).to.equal(9)
+        t.expect(orders.store.docs[1].status).to.equal("RECONCILED")
+        -- 已有 COMMITTED 证明时只推进订单状态，不再调用一次发奖
+        t.expect(deps.grants).to.equal(0)
+    end)
+
+    -- 状态推进必须依赖 CAS；本地读到的旧状态不能覆盖别的路径已经推进的结果
+    t.it("does not claim success when the reconcile transition misses", function()
+        local orders = fake_orders()
+        local order = make_order(orders)
+        assert(charge_order.transition(orders, "wechat", "o-1", "VERIFIED_RECEIVED", "GRANTED", nil, 2))
+        local stale = copy(order)
+        local deps = deps_for(orders, { status = "COMMITTED" })
+        local outcome = charge_reconcile.reconcile_order(orders, stale, deps, { now = 10 })
+        t.expect(outcome).to.equal("PENDING")
+        t.expect(orders.store.docs[1].status).to.equal("GRANTED")
     end)
 
     -- 发奖从未开始：重投一次，仍然是同一个 service_op_id
@@ -296,6 +363,36 @@ t.describe("charge_reconcile 单轮", function()
         t.expect(ok).to.be_nil()
         t.expect(err).to.match("mongo down")
     end)
+
+    -- 每页都被毒单填满时，游标必须向后翻；否则同一批最早的单永远占满结果集
+    t.it("rotates the scan cursor past a full page of stuck orders", function()
+        local orders = fake_orders()
+        for i = 1, 3 do
+            assert(charge_order.record(orders, {
+                provider = "wechat",
+                order_id = "poison-" .. i,
+                rid = 7,
+                amount = 100,
+                currency = "CNY",
+                hash_fn = HASH,
+                now = 1,
+            }))
+            assert(charge_order.transition(orders, "wechat", "poison-" .. i, "VERIFIED_RECEIVED", "GRANTING", nil, 1))
+        end
+
+        local deps = deps_for(orders, { status = "IN_PROGRESS" })
+        deps.scan_cursors = {}
+        local first = assert(charge_reconcile.run_once(deps, { now = 1000, grace = 0, limit = 2 }))
+        t.expect(first.scanned).to.equal(2)
+        -- 三张单 updated_at 相同，游标必须用 provider/order_id 决胜
+        t.expect(deps.scan_cursors.GRANTING.updated_at).to.equal(1)
+        t.expect(deps.scan_cursors.GRANTING.provider).to.equal("wechat")
+        t.expect(deps.scan_cursors.GRANTING.order_id).to.equal("poison-2")
+
+        local second = assert(charge_reconcile.run_once(deps, { now = 1000, grace = 0, limit = 2 }))
+        t.expect(second.scanned).to.equal(1)
+        t.expect(deps.scan_cursors.GRANTING).to.be_nil()
+    end)
 end)
 
 t.describe("charge_reconcile 索引门禁", function()
@@ -320,7 +417,11 @@ t.describe("charge_reconcile 索引门禁", function()
             end,
         }
         t.expect(charge_reconcile.ensure_indexes({ orders = coll })).to.equal(true)
-        t.expect(seen.name).to.equal("status_updated_at")
+        t.expect(seen.name).to.equal("status_updated_at_order")
+        t.expect(seen[1].status).to.equal(1)
+        t.expect(seen[2].updated_at).to.equal(1)
+        t.expect(seen[3].provider).to.equal(1)
+        t.expect(seen[4].order_id).to.equal(1)
     end)
 end)
 

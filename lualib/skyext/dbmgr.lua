@@ -276,6 +276,63 @@ local function claim_with_fence(coll_obj, key, unique_id, initial, fence, create
     return nil, "fence claim failed", last_err
 end
 
+-- 普通回存走 w=1：safe_update 的回包丢失时，从返回值上分不出"库里已写、内存没跟上"
+-- 和"确实没写"。不区分的话内存会一直拿旧 _version 做 CAS，每轮都 n=0，
+-- 脏数据永远落不了库，卸载也跟着卡住。失败后读一次库的真实版本来收敛：
+--   CONFIRMED  版本正好 +1 且 fence 仍是本持有者 → 写已生效，ack 对齐内存版本
+--   REJECTED   版本没动 → 确实没写，保留 dirty 供下一轮按同一版本重试
+--   SUPERSEDED 版本被别的写入推进 → 缓存作废等重新加载，不能拿旧版本无限重试
+-- 读不回来就当 UNKNOWN：下一轮 CAS 命中说明上次没写，没命中则再读一次即可对齐，
+-- 任何情况下都不会用旧版本覆盖已提交的数据。
+local function resolve_unconfirmed_save(entry, coll_obj, key, unique_id, doc, revision, old_version, handle)
+    -- 复用认领路径的读：有 majority 读通道就优先用它，看不到会被回滚的旧值
+    local called, raw = read_claim_doc(coll_obj, { [key] = unique_id })
+    if not called or type(raw) ~= "table" then
+        log.warn("save result unknown, keeping dirty cache for a later retry", "key", key, "unique_id", unique_id)
+        return false
+    end
+    local db_version = raw._version
+    if math.type(db_version) ~= "integer" then
+        log.warn("save result unknown, no valid version in document", "key", key, "unique_id", unique_id)
+        return false
+    end
+    local same_fence = not handle or raw._fence == handle.fence
+    if db_version == old_version + 1 and same_fence then
+        -- 同一持有者下 save_doc 有行锁串行，版本只可能由这次 CAS 推进
+        orm.ack_mongo(doc, revision, old_version + 1)
+        log.warn(
+            "save reply was lost but the write is confirmed, aligning cached version",
+            "key",
+            key,
+            "unique_id",
+            unique_id,
+            "version",
+            old_version + 1
+        )
+        return true
+    end
+    if db_version > old_version or not same_fence then
+        -- 库里已经有更新的版本，内存这份是过期的：标作废让 load/unload 清掉重读，
+        -- 而不是继续用旧版本反复 CAS（那会永远 n=0）。回存轮会跳过非 NORMAL 状态，
+        -- 条目由 unload / load 时摘掉，这里不碰 save_wheel（它定义在后面）
+        entry.state = M.STATE.DISCARDED
+        log.error(
+            "cached version was superseded in the database, discarding cache for reload",
+            "key",
+            key,
+            "unique_id",
+            unique_id,
+            "cached_version",
+            old_version,
+            "db_version",
+            db_version
+        )
+        return false
+    end
+    -- 版本没动：明确没写进去，dirty 原样留着，下一轮重试是安全的
+    return false
+end
+
 -- 普通回存。handle 可以覆盖（recover 用新租约写旧缓存），但状态永远取 entry 的：
 -- 隔离/准备中的条目不能因为换了个 handle 就恢复写入
 local function save_doc(entry, coll_obj, handle)
@@ -309,8 +366,9 @@ local function save_doc(entry, coll_obj, handle)
     update["$set"]._version = old_version + 1
     local called, ok, err, ret = pcall(coll_obj.safe_update, coll_obj, query, update, false)
     if not called or not ok or type(ret) ~= "table" or ret.n ~= 1 or ret.nModified ~= 1 or ret.upserted then
-        log.error("save failed", "query", query, "update", update, "reply", ret, "error", called and err or ok)
-        return false
+        -- 不要把整份 update 打进日志（里面有玩家存档）；结论交给下面的读回判定
+        log.warn("save result unconfirmed", "query", query, "reply", ret, "error", called and err or ok)
+        return resolve_unconfirmed_save(entry, coll_obj, key, unique_id, doc, revision, old_version, handle)
     end
 
     if not lease_valid(handle) then

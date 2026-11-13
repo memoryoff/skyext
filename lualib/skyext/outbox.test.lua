@@ -651,13 +651,16 @@ t.describe("outbox 接收方", function()
         t.expect(#h.acks).to.equal(0)
     end)
 
+    -- 永久无效不能 ACK：源端资产已扣，ACK 会让业务永不执行且不留补偿记录。
+    -- 改为抛错，由 _deliver_one 计 attempts 后转入已有的可靠消息死信
     t.it("rejects an envelope addressed to another entity", function()
         local h = receiver_harness()
         local env = h.envelope()
         env.target_id = 8
-        local value, err = h.receiver:handle(h.entity, env, {})
-        t.expect(value).to.be_nil()
-        t.expect(err).to.equal("envelope target mismatch")
+        t.expect(function()
+            h.receiver:handle(h.entity, env, {})
+        end).to
+            .throw("envelope target mismatch")
         t.expect(#h.holder.calls).to.equal(0)
     end)
 
@@ -666,25 +669,41 @@ t.describe("outbox 接收方", function()
         local h = receiver_harness()
         local env = h.envelope()
         env.param_hash = string.rep("c", 64)
-        local value, err = h.receiver:handle(h.entity, env, {})
-        t.expect(value).to.be_nil()
-        t.expect(err).to.equal("param hash mismatch")
+        t.expect(function()
+            h.receiver:handle(h.entity, env, {})
+        end).to
+            .throw("param hash mismatch")
         t.expect(#h.holder.calls).to.equal(0)
     end)
 
-    t.it("refuses to run without a hash function", function()
+    t.it("carries the event identity in the permanent-invalid reason for compensation", function()
+        local h = receiver_harness()
+        local env = h.envelope()
+        env.param_hash = string.rep("c", 64)
+        local ok, err = pcall(h.receiver.handle, h.receiver, h.entity, env, {})
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.contain("event=" .. env.event_id)
+        t.expect(err).to.contain("source=role:9")
+        t.expect(err).to.contain("target=role:7")
+        t.expect(err).to.contain("param_hash=" .. env.param_hash)
+    end)
+
+    -- 缺 hash_fn 是部署错误，修好配置后同一事件重投就能成功，不该当毒消息
+    t.it("keeps the message retryable when the hash function is missing", function()
+        local delivery = require "skyext.entity.delivery"
         local h = receiver_harness()
         h.receiver.hash_fn = nil
-        local value, err = h.receiver:handle(h.entity, h.envelope(), {})
-        t.expect(value).to.be_nil()
-        t.expect(err).to.equal("hash_fn is required")
+        local value = h.receiver:handle(h.entity, h.envelope(), {})
+        t.expect(delivery.is_retryable(value)).to.equal(true)
+        t.expect(#h.holder.calls).to.equal(0)
     end)
 
     t.it("rejects a malformed envelope before touching the entity", function()
         local h = receiver_harness()
-        local value, err = h.receiver:handle(h.entity, { version = 2 }, {})
-        t.expect(value).to.be_nil()
-        t.expect(err).to.equal("unsupported envelope version")
+        t.expect(function()
+            h.receiver:handle(h.entity, { version = 2 }, {})
+        end).to
+            .throw("invalid envelope")
         t.expect(#h.holder.calls).to.equal(0)
     end)
 

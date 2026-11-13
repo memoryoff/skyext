@@ -326,4 +326,44 @@ t.describe("config.init", function()
             t.expect(h.sets.p).to.equal(os.getenv("PATH"))
         end)
     end)
+
+    -- common.app.test.lua 用 __index = _G 直接 loadfile，绕开了真实的配置执行环境：
+    -- 之前 merge_table 依赖 type/pairs，单测全绿而每个节点都起不来。这里必须走
+    -- config.init 的完整 include 链，才能拦住"配置文件用了没注入的全局函数"
+    t.it("真实节点配置能经 config.init 完整加载，合并默认值全部生效", function()
+        local root = fs.absolute(os.getenv("SKYTEST_ROOT") or lfs.currentdir())
+        local h = harness({ app_config_path = fs.join(root, "example/etc/nodes/role1.app.lua") })
+        h.config.init()
+        t.expect(h.sets.app_config_loaded).to.equal("true")
+        -- 顶层合并、嵌套合并、节点覆盖都在这条链上
+        local migration = h.config.get_table("migration")
+        t.expect(migration.adapter).to.equal("migration_adapter")
+        t.expect(migration.concurrency).to.equal(4)
+        local pay = h.config.get_table("pay_callback")
+        t.expect(pay.orders.coll).to.equal("charge_order")
+        local entity_types = h.config.get_table("entity_types")
+        t.expect(entity_types.role.critical_ledger.coll).to.equal("op_ledger")
+        -- 节点自己的值不能被 common 的默认值盖掉
+        t.expect(h.config.get("cluster_node_name")).to.equal("rolenode1")
+    end)
+
+    t.it("配置环境提供受限的基础函数", function()
+        with_config({
+            ["app.lua"] = 'local parts = {}\nfor i = 1, 3 do parts[#parts + 1] = tostring(i) end\njoined = table.concat(parts, ",")\n',
+        }, function(dir)
+            local h = harness({ app_config_path = fs.join(dir, "app.lua") })
+            h.config.init()
+            t.expect(h.sets.joined).to.equal("1,2,3")
+        end)
+    end)
+
+    t.it("配置环境不暴露可写的标准库表", function()
+        with_config({ ["app.lua"] = 'table.concat = function() return "hacked" end\n' }, function(dir)
+            local h = harness({ app_config_path = fs.join(dir, "app.lua") })
+            t.expect(function()
+                h.config.init()
+            end).to
+                .throw("must not modify")
+        end)
+    end)
 end)

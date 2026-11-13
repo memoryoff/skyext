@@ -274,6 +274,20 @@ t.describe("pay_webhook 落单与发奖", function()
         t.expect(h.orders.store.docs[1].ack_result).to.equal("ACCEPTED")
     end)
 
+    -- 容量超限时发奖还没开始，ACK 会让渠道停止重推，只剩可能未启用的维护服务
+    -- 这一条出口。必须回 503 明确 retryable，并保留订单给下一轮重试。
+    t.it("asks the channel to retry when the critical ledger is full", function()
+        local h = harness()
+        h.decision = { status = "CAPACITY_EXCEEDED", reason = "ledger full" }
+        local out = h.webhook:handle(fake_req("/pay/wechat/callback", h.body))
+        t.expect(out.status).to.equal(503)
+        t.expect(out.body.code).to.equal("capacity_exceeded")
+        t.expect(out.body.retryable).to.equal(true)
+        t.expect(h.orders.store.docs[1].status).to.equal("GRANTING")
+        t.expect(h.orders.store.docs[1].ack_result).to.be_nil()
+        t.expect(h.orders.store.docs[1].last_error).to.equal("ledger full")
+    end)
+
     t.it("acks a business rejection and keeps it visible for compensation", function()
         local h = harness()
         h.decision = { status = "BUSINESS_REJECTED", reason = "role banned" }

@@ -112,7 +112,36 @@ local function load_config(config_name)
         assert(load(code, [[@]] .. filename, [[t]], result))()
         current_path = last_path
     end
-    setmetatable(result, { __index = { include = include } })
+    -- 配置在隔离环境里执行：__index 只暴露这份白名单，读不到进程里的全局变量，
+    -- 也拿不到 skynet / io / loadfile 这些能碰到进程状态的东西。
+    -- 标准库给只读视图：读 `table.concat` 没问题，写 `table.concat = nil` 会污染
+    -- 整个进程，必须挡掉。
+    local function readonly_view(stdlib)
+        return setmetatable({}, {
+            __index = stdlib,
+            __newindex = function(_, key)
+                error("config must not modify the Lua standard library: " .. tostring(key), 2)
+            end,
+        })
+    end
+    setmetatable(result, {
+        __index = {
+            include = include,
+            type = type,
+            pairs = pairs,
+            ipairs = ipairs,
+            next = next,
+            tostring = tostring,
+            tonumber = tonumber,
+            assert = assert,
+            error = error,
+            select = select,
+            string = readonly_view(string),
+            table = readonly_view(table),
+            math = readonly_view(math),
+            os = readonly_view({ getenv = os.getenv, time = os.time, date = os.date }),
+        },
+    })
     include(config_name)
     setmetatable(result, nil)
     return result

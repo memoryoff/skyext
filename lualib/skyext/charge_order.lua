@@ -6,6 +6,7 @@
 --
 -- 关键约束：
 --   * `(provider, order_id)` 唯一索引：重复回调只能创建一条订单；
+--     不同 action 复用同一订单号时无法共存，`record` 必须显式拒绝而不是静默返回旧单；
 --   * `service_op_id` 在订单**第一次持久化时**确定并保存，重试不得重新计算——
 --     密钥轮换后重新算会得到不同的键，去重立刻失效；
 --   * HTTP ACK 状态（`webhook_ack_at` / `ack_result`）与业务状态分开保存：
@@ -166,8 +167,9 @@ function M.record(orders_coll, opts)
     if math.type(rid) ~= "integer" or rid <= 0 then
         return nil, "rid must be a positive integer"
     end
+    local action = opts.action or "grant"
     local service_op_id
-    service_op_id, err = M.service_op_id(provider, order_id, opts.action, opts.hash_fn)
+    service_op_id, err = M.service_op_id(provider, order_id, action, opts.hash_fn)
     if not service_op_id then
         return nil, err
     end
@@ -182,7 +184,7 @@ function M.record(orders_coll, opts)
                 rid = rid,
                 amount = opts.amount,
                 currency = currency,
-                action = opts.action or "grant",
+                action = action,
                 -- 第一次持久化时确定，之后只读不重算
                 service_op_id = service_op_id,
                 status = M.STATUS.VERIFIED_RECEIVED,
@@ -204,7 +206,21 @@ function M.record(orders_coll, opts)
                 existing.amount ~= opts.amount
                 or existing.currency ~= currency
                 or normalize_rid(existing.rid) ~= rid
+                or (existing.action or "grant") ~= action
             then
+                if (existing.action or "grant") ~= action then
+                    log.error(
+                        "charge order action conflict",
+                        "provider",
+                        provider,
+                        "order_id",
+                        order_id,
+                        "expected_action",
+                        tostring(existing.action or "grant"),
+                        "got_action",
+                        action
+                    )
+                end
                 return nil, "order conflict"
             end
             return existing, false
@@ -228,7 +244,12 @@ function M.record(orders_coll, opts)
         created = leo.updatedExisting == false
     end
     -- 重复回调必须与首次回调完全一致：金额/币种/账号任一不同都是串单或伪造
-    if order.amount ~= opts.amount or order.currency ~= currency or normalize_rid(order.rid) ~= rid then
+    if
+        order.amount ~= opts.amount
+        or order.currency ~= currency
+        or normalize_rid(order.rid) ~= rid
+        or (order.action or "grant") ~= action
+    then
         log.error(
             "charge order conflict",
             "provider",
@@ -238,7 +259,11 @@ function M.record(orders_coll, opts)
             "expected_amount",
             order.amount,
             "got_amount",
-            opts.amount
+            opts.amount,
+            "expected_action",
+            tostring(order.action or "grant"),
+            "got_action",
+            action
         )
         return nil, "order conflict"
     end

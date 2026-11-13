@@ -256,6 +256,14 @@ local function harness(handle, stored, defer)
             return true, nil, { n = 0, nModified = 0 }
         end
         apply_update(h.store, update, false)
+        -- 模拟"主库已经写入、回包在网络里丢了"：更新先落地，之后才抛错/丢结果。
+        -- 普通 w=1 回存从返回值上分不出它和"确实没写"，这正是要收敛的场景
+        if h.lost_reply == "exception" then
+            error("reply lost after commit")
+        end
+        if h.lost_reply then
+            return false, "reply lost", nil
+        end
         return true, nil, { n = 1, nModified = 1 }
     end
 
@@ -363,6 +371,73 @@ t.describe("dbmgr persistence", function()
         t.expect(orm.is_dirty(h.doc)).to.equal(false)
         t.expect(h.store.name).to.equal("updated")
         t.expect(h.store._version).to.equal(1)
+    end)
+
+    -- 修复前：库里 _version 已经 +1，内存还停在旧版本且 dirty=true，
+    -- 之后每一轮 CAS 都 n=0，回存和卸载一起卡死
+    t.it("aligns the cached version when a committed save loses its reply", function()
+        local h = harness()
+        h.doc.name = "updated"
+        h.lost_reply = true
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(true)
+        t.expect(h.store.name).to.equal("updated")
+        t.expect(h.store._version).to.equal(1)
+        t.expect(h.doc._version).to.equal(1)
+        t.expect(orm.is_dirty(h.doc)).to.equal(false)
+        -- 没有新脏字段时不再重复写库
+        h.lost_reply = false
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(true)
+        t.expect(#h.updates).to.equal(1)
+        -- 后续改动能接着用新版本正常落库
+        h.doc.name = "again"
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(true)
+        t.expect(h.doc._version).to.equal(2)
+        t.expect(h.store.name).to.equal("again")
+    end)
+
+    t.it("does not wedge unload when the DB commits but the ack is lost", function()
+        local h = harness()
+        h.doc.name = "updated"
+        h.lost_reply = "exception"
+        t.expect(h.db.unload("demo", "role", "rid", 7)).to.equal(true)
+        t.expect(h.doc._version).to.equal(1)
+        t.expect(orm.is_dirty(h.doc)).to.equal(false)
+        t.expect(h.store.name).to.equal("updated")
+    end)
+
+    t.it("keeps the cache dirty but recoverable when the write result cannot be read back", function()
+        local h = harness()
+        h.doc.name = "updated"
+        h.lost_reply = true
+        h.find_fail = true
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(false)
+        t.expect(h.doc._version).to.equal(0)
+        t.expect(orm.is_dirty(h.doc)).to.equal(true)
+        -- 读恢复后，下一轮 CAS 命中旧版本会 n=0，再读一次即对齐，不会覆盖已提交的数据
+        h.find_fail = false
+        h.lost_reply = false
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(true)
+        t.expect(h.doc._version).to.equal(1)
+        t.expect(h.store.name).to.equal("updated")
+        t.expect(#h.updates).to.equal(2)
+    end)
+
+    t.it("discards a cache whose version was superseded instead of retrying the old CAS forever", function()
+        local h = harness()
+        h.doc.name = "updated"
+        h.fail = true
+        -- 别的新持有者已经把文档推进了两个版本
+        h.store._version = 3
+        h.store._fence = 99
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(false)
+        -- 作废后任何写入都被拒，不会再拿 _version=0 去撞 CAS
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(false)
+        t.expect(#h.updates).to.equal(1)
+        -- 缓存作废后 load 会丢掉这份过期副本，重新从库里读
+        local fresh = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        t.expect(fresh == h.doc).to.equal(false)
+        t.expect(fresh._version).to.equal(3)
+        t.expect(fresh.name).to.equal("original")
     end)
 
     t.it("does not evict cache or cancel retry timer on uncertain or unmatched writes", function()

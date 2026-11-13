@@ -18,7 +18,7 @@ local M = {}
 
 M.DEFAULT_GRACE = 60
 M.DEFAULT_SCAN = 32
-M.INDEX_NAME = "status_updated_at"
+M.INDEX_NAME = "status_updated_at_order"
 
 M.OUTCOME = {
     RECONCILED = "RECONCILED",
@@ -42,12 +42,31 @@ function M.scan_orders(orders_coll, opts)
     local status = opts.status or charge_order.STATUS.GRANTING
     local now = opts.now or os.time()
     local grace = opts.grace or M.DEFAULT_GRACE
-    local called, docs, err = pcall(orders_coll.find_many, orders_coll, {
+    local limit = opts.limit or M.DEFAULT_SCAN
+    local query = {
         status = status,
         updated_at = { ["$lte"] = now - grace },
         -- 已转人工的单子不再自动扫：否则它会永远占住结果集，把新单饿死
         reconcile_blocked_at = { ["$exists"] = false },
-    }, {
+    }
+    if type(opts.cursor) == "table" then
+        -- keyset 而不是 skip：扫描期间订单会离开当前状态集合，skip 的页边界
+        -- 会随集合收缩漂移。按稳定复合键从上一页末尾往后扫，毒单不会占住队头。
+        local cursor = opts.cursor
+        query["$or"] = {
+            { updated_at = { ["$gt"] = cursor.updated_at } },
+            {
+                updated_at = cursor.updated_at,
+                provider = { ["$gt"] = cursor.provider },
+            },
+            {
+                updated_at = cursor.updated_at,
+                provider = cursor.provider,
+                order_id = { ["$gt"] = cursor.order_id },
+            },
+        }
+    end
+    local called, docs, err = pcall(orders_coll.find_many, orders_coll, query, {
         projection = {
             provider = 1,
             order_id = 1,
@@ -60,9 +79,10 @@ function M.scan_orders(orders_coll, opts)
             updated_at = 1,
             _id = 0,
         },
-        -- 不排序：按 updated_at 升序会让一张卡住的单永远排在队头，
-        -- 每轮都占掉一个扫描名额，新单永远轮不到
-        limit = opts.limit or M.DEFAULT_SCAN,
+        -- Mongo 不显式排序时通常仍按索引顺序返回；毒单会一直占着页首。
+        -- 显式稳定排序是 keyset 游标能够续扫下一页的前提。
+        sort = { { updated_at = 1 }, { provider = 1 }, { order_id = 1 } },
+        limit = limit,
     })
     if not called then
         return nil, "scan failed: " .. tostring(docs)
@@ -98,12 +118,12 @@ function M.reconcile_order(orders_coll, order, deps, opts)
             version = proof.version,
             checked_at = now,
         }
-        if order.status == charge_order.STATUS.GRANTING then
+        if order.status == charge_order.STATUS.GRANTING or order.status == charge_order.STATUS.VERIFIED_RECEIVED then
             local moved, merr = charge_order.transition(
                 orders_coll,
                 order.provider,
                 order.order_id,
-                charge_order.STATUS.GRANTING,
+                order.status,
                 charge_order.STATUS.GRANTED,
                 { granted_at = now, reconcile_proof = reconcile_proof },
                 now
@@ -114,8 +134,25 @@ function M.reconcile_order(orders_coll, order, deps, opts)
                 m_outcome:inc(1, { outcome = M.OUTCOME.PENDING })
                 return M.OUTCOME.PENDING, merr
             end
+
+            -- VERIFIED_RECEIVED 说明落单后还没来得及 transition 到 GRANTING；
+            -- COMMITTED 已经是持久化事实，可以安全补到 GRANTED 并立即结案。
+            -- GRANTING 保留原来的两阶段推进，下一轮扫到 GRANTED 时再补对账证明。
+            if order.status == charge_order.STATUS.VERIFIED_RECEIVED then
+                local reconciled, rerr = charge_order.mark_reconciled(orders_coll, order, reconcile_proof, now)
+                if not reconciled then
+                    m_outcome:inc(1, { outcome = M.OUTCOME.PENDING })
+                    return M.OUTCOME.PENDING, rerr
+                end
+                m_outcome:inc(1, { outcome = M.OUTCOME.RECONCILED })
+                return M.OUTCOME.RECONCILED, reconcile_proof
+            end
             m_outcome:inc(1, { outcome = M.OUTCOME.GRANTED })
             return M.OUTCOME.GRANTED, reconcile_proof
+        end
+        if order.status ~= charge_order.STATUS.GRANTED then
+            m_outcome:inc(1, { outcome = M.OUTCOME.PENDING })
+            return M.OUTCOME.PENDING, "unexpected order state"
         end
         local reconciled, rerr = charge_order.mark_reconciled(orders_coll, order, reconcile_proof, now)
         if not reconciled then
@@ -183,6 +220,7 @@ end
 --   orders_coll   订单集合
 --   query_op(rid, op_id) -> proof
 --   grant(order)  可选：重新投递发奖
+--   scan_cursors  可选：按状态保存 keyset 游标，由本函数维护
 --   now / grace / limit
 function M.run_once(deps, opts)
     opts = opts or {}
@@ -190,6 +228,11 @@ function M.run_once(deps, opts)
         return nil, "deps.query_op is required"
     end
     local stats = { scanned = 0, reconciled = 0, granted = 0, retried = 0, pending = 0, rejected = 0, unknown = 0 }
+    local cursors = opts.cursors or deps.scan_cursors
+    if cursors == nil then
+        cursors = {}
+    end
+    local scan_limit = opts.limit or M.DEFAULT_SCAN
 
     local function bump(outcome)
         if outcome == M.OUTCOME.RECONCILED then
@@ -216,15 +259,27 @@ function M.run_once(deps, opts)
         charge_order.STATUS.VERIFIED_RECEIVED,
     }) do
         local grace = status == charge_order.STATUS.GRANTED and 0 or (opts.grace or M.DEFAULT_GRACE)
+        local cursor = cursors[status]
         local orders, err = M.scan_orders(deps.orders_coll, {
             status = status,
             grace = grace,
             now = opts.now,
-            limit = opts.limit or M.DEFAULT_SCAN,
+            cursor = cursor,
+            limit = scan_limit,
         })
         if not orders then
             log.error("charge reconcile scan failed", "status", status, "err", tostring(err))
             return nil, err
+        end
+        if #orders >= scan_limit then
+            local last = orders[#orders]
+            cursors[status] = {
+                updated_at = last.updated_at,
+                provider = last.provider,
+                order_id = last.order_id,
+            }
+        else
+            cursors[status] = nil
         end
         stats.scanned = stats.scanned + #orders
         for _, order in ipairs(orders) do
@@ -239,7 +294,13 @@ function M.index_specs(colls)
     return {
         {
             colls.orders,
-            { { status = 1 }, { updated_at = 1 }, name = M.INDEX_NAME },
+            {
+                { status = 1 },
+                { updated_at = 1 },
+                { provider = 1 },
+                { order_id = 1 },
+                name = M.INDEX_NAME,
+            },
         },
     }
 end

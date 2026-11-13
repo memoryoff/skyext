@@ -222,3 +222,50 @@ CREATED --业务拒绝--> FAILED
   `{pending_count:1, rid:1}` 复合索引 + keyset 分页。
 - 回执走可靠消息，意味着接收方每条事件多一次 `entity_msg` 写入。压测时要把它算进
   接收方的写放大，而不是只算业务提交本身。
+
+## 11. 部署约束与 FAILED 证据保全
+
+### 11.1 两个库必须指向同一个 MongoDB 副本集
+
+可靠消息队列 `entity_msg` 固定写在 **`entity` 库**（`lualib/skyext/entity/reliable_msg.lua`
+的 `DB_NAME`），而角色 Outbox 是 **`role` 库**里角色文档的内嵌字段
+`_critical_outbox_v1`（`entity_types.role.db_name`）。两处由 `mongo_config` 的两段独立
+配置指定，示例里都指向 `127.0.0.1:27017`。
+
+`outbox.pump` 的顺序是「先 `safe_insert` 队列消息（w=1），再用多数派 CAS 把源端事件
+推进到 ENQUEUED」。这两次写**没有跨集群事务**。若生产把 `entity` 与 `role` 指向不同副本集，
+队列侧切主回滚了 insert、而源端 ENQUEUED 已在另一个副本集提交，就会出现「源端认为已入队、
+队列里却没有这条消息」：ENQUEUED 不会重投，7 天后按终态清掉，业务效果永久丢失。
+
+因此：
+
+- **生产部署必须让这两段配置指向同一个副本集**（可以是同实例上的不同库，但绝不能是两套
+  独立的复制集）；改配置前先确认两者 `host`/`port`/`replicaSet` 一致。
+- 如果确实需要拆成两个副本集，必须先把可靠消息插入改成多数派写并补读后对齐；当前实现
+  没有这条路径，属于**部署禁用项**，不要靠"两边都配了 majority"来推断原子性。
+- 这条约束不在启动自检里（引擎无法从连接配置可靠判断两个库是否同副本集），由部署检查表
+  负责，验收项对应 `p17_pending_verification_runbook.md` 的 V-01。
+
+### 11.2 FAILED 事件是最后的业务证据
+
+`FAILED` 表示「源端资产已扣、可靠消息从未落库」。它没有 `msg_id`，不在可靠消息死信里，
+角色文档里那条事件就是唯一记录，删掉之后既不能重投也没有补偿依据。因此：
+
+- 最小保留期为 **7 天**（`critical_fields.OUTBOX_FAILED_MIN_RETENTION`，与其他终态一致），
+  容量腾挪不能沿用 `delivered_retention = 0` 的口径提前抹掉；过了窗口仍允许腾，否则一批
+  陈年 FAILED 会把角色永久锁死在 `MAX_OUTBOX` 上限。
+- 无论是定期清理还是容量腾挪，删除 FAILED 时都会打一条 `log.error`（带 `event_id` 与
+  `failed_reason`）并累加 `reason = "failed_lost"` 指标。
+- **上线前必须给 `failed_lost` / 归档滞后 / UNKNOWN 积压 / 热账本 512 容量使用率配告警，
+  并保留人工补偿流程**。日志和指标是发现问题的手段，不是补偿本身。
+- 不另建一套 Outbox 专用 DLQ 集合：可靠消息已经有 `entity_msg(status=2)` 死信与
+  `dlq_list/dlq_replay/dlq_discard` GM 命令，旁边再造一份不轮转、没有处理入口的记录
+  只会更难维护（见 `docs/non-goals.md`）。
+
+### 11.3 永久无效事件不再 ACK
+
+接收方对信封错误、目标不匹配、`param_hash` 不一致等永久无效事件改为**抛错**，由
+`entitymgr._deliver_one` 计 `attempts` 后转入现有可靠消息死信，而不是 `return nil, err`
+让消息被直接 ACK。抛错原因里带 `event_id`、`source`、`target`、`param_hash` 与失败原因，
+供运营按 `dlq_list` 定位补偿。缺 `hash_fn` / 冷账本属于部署错误，仍返回
+`delivery.retryable` 保留 pending，修好配置后重投即可，不按毒消息处理。

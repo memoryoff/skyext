@@ -143,15 +143,31 @@ function CMD.start(conf)
     end
 
     local tc = types.get(g_opts.type_name)
+    -- 冷账本与恢复任务集合必须显式配置。缺配置时 entity_agent 是 fail-closed
+    -- （归档/建任务返回 nil、查证返回 UNKNOWN），维护服务若回退到默认集合名就会
+    -- "启动成功但空转"：热账本撞上 MAX_OPS 后新关键操作被拒、UNKNOWN 永不恢复。
+    -- 这里 fail-fast，让 launcher 把节点启动拦下来，绝不静默降级。
+    local ledger_spec = tc.critical_ledger
+    local jobs_spec = tc.critical_jobs
+    local invalid
+    if type(ledger_spec) ~= "table" or type(ledger_spec.db) ~= "string" or type(ledger_spec.coll) ~= "string" then
+        invalid = "critical_ledger"
+    elseif type(jobs_spec) ~= "table" or type(jobs_spec.db) ~= "string" or type(jobs_spec.coll) ~= "string" then
+        invalid = "critical_jobs"
+    end
+    if invalid then
+        local msg = string.format(
+            "entity type %s has no valid %s config (db/coll required)",
+            tostring(g_opts.type_name),
+            invalid
+        )
+        log.error("critical maintenance not started", "err", msg)
+        return false, msg
+    end
+
     local role = mongo_conn.get_collection(tc.db_name, tc.db_coll)
-    local ledger = mongo_conn.get_collection(
-        (tc.critical_ledger or {}).db or tc.db_name,
-        (tc.critical_ledger or {}).coll or "op_ledger"
-    )
-    local jobs = mongo_conn.get_collection(
-        (tc.critical_jobs or {}).db or tc.db_name,
-        (tc.critical_jobs or {}).coll or "critical_reconcile_jobs"
-    )
+    local ledger = mongo_conn.get_collection(ledger_spec.db, ledger_spec.coll)
+    local jobs = mongo_conn.get_collection(jobs_spec.db, jobs_spec.coll)
     local indexed, ierr = critical.ensure_indexes({ role = role, ledger = ledger, jobs = jobs })
     if not indexed then
         log.error("critical maintenance not started, index gate failed", "err", tostring(ierr))

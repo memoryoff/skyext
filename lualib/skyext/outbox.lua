@@ -836,8 +836,9 @@ function M.evictable(critical_table, now, opts)
                 evict = age >= enqueued_retention
             elseif event.status == M.STATUS.FAILED then
                 -- 投递彻底失败：可靠消息从未落库，这条记录是"资产已扣但业务未生效"
-                -- 的唯一证据。定期清理仍按正常保留期删（留够排查窗口），
-                -- 容量压力下的删除下限由 critical.OUTBOX_FAILED_MIN_RETENTION 管
+                -- 的唯一证据。定期清理按与终态相同的 7 天保留期删，删除时单独打
+                -- error + failed_lost 指标；容量压力下的下限由
+                -- critical.OUTBOX_FAILED_MIN_RETENTION 管（同为 7 天）
                 evict = age >= delivered_retention
             end
             if evict then
@@ -1003,7 +1004,23 @@ function M.cleanup(ctx, opts)
     next_table[M.CLEANUP_FIELD] = next_due
     dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, next_table, ctx.handle)
     for _, victim in ipairs(victims) do
-        m_evicted:inc(1, { reason = victim.status == M.STATUS.DELIVERED and "delivered" or "enqueued_expired" })
+        if victim.status == M.STATUS.FAILED then
+            -- FAILED 是"资产已扣、可靠消息从未落库"的唯一记录。容量腾挪路径已经
+            -- 为它单独打 error + failed_lost 指标，定期清理不能静默抹掉、更不能
+            -- 把它算进 enqueued_expired 里假装只是一条过期消息
+            m_evicted:inc(1, { reason = "failed_lost" })
+            log.error(
+                "cleaning up a FAILED outbox event; this is the last record of a deducted asset",
+                "event",
+                tostring(victim.event_id),
+                "age",
+                tostring(victim.age)
+            )
+        else
+            m_evicted:inc(1, {
+                reason = victim.status == M.STATUS.DELIVERED and "delivered" or "enqueued_expired",
+            })
+        end
     end
     log.info("outbox events cleaned up", "count", #victims)
     return #victims
@@ -1056,17 +1073,44 @@ function M.new_receiver(opts)
     }, RECEIVER_MT)
 end
 
+-- 永久无效事件绝不能 ACK：源端资产已在同一次 CAS 扣除，接收端什么都不会执行，
+-- ACK 之后既没有业务效果、也没有可补偿的记录。抛错让 `_deliver_one` 计 attempts，
+-- 最终转入**已有的**可靠消息死信（entity_msg status=2），由 GM dlq_list/replay/
+-- discard 人工处理。死信原因里带上定位与补偿所需的全部身份字段。
+local function permanently_invalid(envelope, reason, detail)
+    envelope = type(envelope) == "table" and envelope or {}
+    error(
+        "outbox event permanently invalid: "
+            .. tostring(reason)
+            .. " event="
+            .. tostring(envelope.event_id)
+            .. " source="
+            .. tostring(envelope.source_type)
+            .. ":"
+            .. tostring(envelope.source_id)
+            .. " target="
+            .. tostring(envelope.target_type)
+            .. ":"
+            .. tostring(envelope.target_id)
+            .. " param_hash="
+            .. tostring(envelope.param_hash)
+            .. (detail ~= nil and (" detail=" .. tostring(detail)) or ""),
+        0
+    )
+end
+
 -- 返回 handler 应当原样返回的值：
---   * 永久无效（信封/目标/参数摘要不符）：返回 nil 并记错误——ACK 掉，不要进 DLQ 循环
---   * UNKNOWN / 环境暂态：返回 delivery.retryable，让 `_deliver_one` 保留 pending
---   * 其他：返回 critical 的 decision（旧合同下"没抛异常就是成功"）
+--   * 永久无效（信封/目标/参数摘要不符）：抛错进现有死信，见 permanently_invalid
+--   * 部署/环境暂态（冷账本、hash_fn 缺失）：delivery.retryable，修好配置后重投即可
+--   * UNKNOWN / 环境暂态：delivery.retryable，让 `_deliver_one` 保留 pending
+--   * 其他：返回 critical 的 decision
 function RECEIVER_MT:handle(entity, envelope, handlers, opts)
     opts = opts or {}
     local delivery = require "skyext.entity.delivery"
     local ok, verr = M.validate_envelope(envelope)
     if not ok then
         log.error("reject outbox envelope", "err", verr, "id", tostring(entity and entity.id))
-        return nil, verr
+        permanently_invalid(envelope, "invalid envelope", verr)
     end
     -- 冷账本缺失是部署错误，不是"这条事件有问题"。放行等于承认"热账本没有 =
     -- 从没执行过"，热条目 7 天归档后同一条事件重投就会二次入账。宁可卡住等修配置
@@ -1087,31 +1131,36 @@ function RECEIVER_MT:handle(entity, envelope, handlers, opts)
             "got_id",
             tostring(entity.id)
         )
-        return nil, "envelope target mismatch"
+        permanently_invalid(
+            envelope,
+            "envelope target mismatch",
+            "got=" .. tostring(entity.type_name) .. ":" .. tostring(entity.id)
+        )
     end
 
     local now = opts.now or os.time()
     local hash_fn = opts.hash_fn or self.hash_fn
     if type(hash_fn) ~= "function" then
-        -- 摘要函数没注入就无法校验"同一事件换了参数"，属于部署错误
+        -- 摘要函数没注入就无法校验"同一事件换了参数"，属于部署错误：
+        -- 修好配置后同一事件重投就能成功，不能当毒消息进死信
         log.error("outbox receiver has no hash_fn")
-        return nil, "hash_fn is required"
+        return delivery.retryable("outbox receiver has no hash_fn")
     end
     local param_hash, herr = critical.param_hash_of(envelope.op_type, envelope.payload or {}, hash_fn)
     if not param_hash then
         log.error("outbox payload hash failed", "err", tostring(herr))
-        return nil, "payload hash failed"
+        permanently_invalid(envelope, "payload hash failed", herr)
     end
     if param_hash ~= envelope.param_hash then
         -- 发送方记录与本次载荷不一致：伪造或版本错配，重试永远不会成功
         log.error("outbox param hash mismatch", "event", tostring(envelope.event_id))
-        return nil, "param hash mismatch"
+        permanently_invalid(envelope, "param hash mismatch", "computed=" .. tostring(param_hash))
     end
 
     local service_op_id, operr = M.service_op_id(envelope)
     if not service_op_id then
         log.error("outbox service op id failed", "err", tostring(operr))
-        return nil, operr
+        permanently_invalid(envelope, "service op id failed", operr)
     end
     local source_id = tostring(envelope.source_type) .. ":" .. tostring(envelope.source_id)
     local capability = require "skyext.capability"

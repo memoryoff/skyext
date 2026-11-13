@@ -47,9 +47,11 @@ M.FIELDS = {
 -- DELIVERED 变成了 0 秒即删。
 M.OUTBOX_DELIVERED_RETENTION = 7 * 24 * 3600
 M.OUTBOX_ENQUEUED_RETENTION = 7 * 24 * 3600
--- FAILED（投递彻底失败）的最小保留期：容量腾挪时不能沿用 delivered 口径，
--- 否则"资产已扣、可靠消息从未落库"的唯一记录会被静默抹掉
-M.OUTBOX_FAILED_MIN_RETENTION = 3600
+-- FAILED（投递彻底失败）的最小保留期：与终态保留期一致。
+-- 它是"资产已扣、可靠消息从未落库"的唯一记录，容量压力下既不能沿用
+-- delivered_retention=0 的口径，也不该只留 1 小时就抹掉——7 天是人工发现
+-- 并补偿所需的窗口。过了窗口仍允许腾，否则一批陈年 FAILED 会把角色锁死。
+M.OUTBOX_FAILED_MIN_RETENTION = 7 * 24 * 3600
 
 local WHITELIST = {}
 for _, name in ipairs(M.FIELDS) do

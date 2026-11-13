@@ -1,6 +1,7 @@
 -- Outbox 接收端接线：可靠消息的 msg_id 只能当队列身份，业务去重必须走 event_id。
--- handler 的返回值语义要和 entitymgr._deliver_one 的旧合同对齐：
---   普通返回值（含 nil）→ ACK；抛错 → 计入 attempts；retryable 标记 → 保留 pending。
+-- handler 的返回值语义要和 entitymgr._deliver_one 的合同对齐：
+--   普通返回值 → ACK；抛错（含永久无效的 nil 结果）→ 计入 attempts 最终进死信；
+--   retryable 标记 → 保留 pending。
 local t = require "skytest"
 local fs = require "skyext.util.fs"
 local lfs = require "lfs"
@@ -94,11 +95,12 @@ t.describe("role outbox receiver", function()
             .throw("receiver exploded")
     end)
 
-    t.it("acks a permanently invalid envelope instead of looping it in the DLQ", function()
+    t.it("raises on a nil handler result so the event reaches the DLQ instead of being ACKed", function()
         local h = harness()
-        local result, err = h.handler.handlers.__apply_outbox_event({ id = 7 }, envelope(), "msg-1")
-        t.expect(result).to.be_nil()
-        t.expect(err).to.be_nil()
+        t.expect(function()
+            h.handler.handlers.__apply_outbox_event({ id = 7 }, envelope(), "msg-1")
+        end).to
+            .throw("outbox event rejected")
         t.expect(#h.errors).to.equal(1)
     end)
 end)

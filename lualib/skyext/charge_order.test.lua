@@ -184,6 +184,18 @@ t.describe("charge_order 落单", function()
         t.expect(h.record({ rid = 8 })).to.be_nil()
     end)
 
+    -- unique index 仍是 (provider, order_id)。不同 action 不能静默复用一个发奖单：
+    -- 那会把退款/拒付回调吞成重复发奖，渠道收到 200 后也不会再推。
+    t.it("refuses a repeated callback with a different action", function()
+        local h = harness()
+        local first = assert(h.record())
+        local existing, err = h.record({ action = "compensate" })
+        t.expect(existing).to.be_nil()
+        t.expect(err).to.equal("order conflict")
+        t.expect(h.orders.store["wechat:ORDER-1"].service_op_id).to.equal(first.service_op_id)
+        t.expect(h.orders.store["wechat:ORDER-1"].action).to.equal("grant")
+    end)
+
     t.it("rejects malformed callbacks before touching the collection", function()
         local h = harness()
         t.expect(h.record({ provider = "" })).to.be_nil()

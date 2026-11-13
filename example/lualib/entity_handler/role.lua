@@ -94,9 +94,11 @@ function M.handlers.__apply_outbox_event(entity, envelope, msg_id)
         error(result, 0)
     end
     if result == nil then
-        -- 永久无效（信封/目标/摘要不符）：ACK 掉，不要进 DLQ 循环
+        -- 防御：receiver 现在对永久无效一律抛错。任何 handler 返回 nil 都不能按
+        -- 旧合同 ACK——源端资产已扣，ACK 会让业务永不执行且不留可补偿记录。
+        -- 抛错后由 _deliver_one 计 attempts，最终进可靠消息死信供运营补偿。
         log.error("outbox event rejected", "rid", tostring(entity.id), "err", tostring(err))
-        return nil, err
+        error("outbox event rejected: " .. tostring(err), 0)
     end
     -- UNKNOWN / 环境暂态时 result 是 delivery.retryable 标记，原样透传，
     -- 由 _deliver_one 保留 pending、不计毒、稍后重投

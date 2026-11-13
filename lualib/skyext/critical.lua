@@ -274,8 +274,9 @@ M.validate_outbox_events = validate_outbox_events
 --   ENQUEUED   超过保留期说明接收方长期没上线；可靠消息已经把消息持久化，
 --              源端副本删掉不影响业务效果（去重键由 event_id 派生）
 --   FAILED     投递彻底失败（可靠消息从未落库）。**它是这条事件唯一的记录**：
---              源端资产已经扣了，删掉之后既不能重投也没有补偿依据。所以它比
---              DELIVERED 多一条"最小保留期"下限，容量压力下也不能立刻删
+--              源端资产已经扣了，删掉之后既不能重投也没有补偿依据。所以它有
+--              与终态一致的 7 天最小保留期（不能沿用容量路径的 delivered=0），
+--              到期被腾时还要单独打 error 与 failed_lost 指标
 --   PENDING    永不腾：它还没投出去
 -- 状态字面量来自 skyext.outbox.STATUS；这里不 require outbox，避免循环依赖
 function M.evictable_outbox_events(outbox_table, now, need, opts)

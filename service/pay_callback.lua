@@ -27,6 +27,7 @@ local CMD = {}
 local g_conf
 local g_orders
 local g_running = false
+local g_scan_cursors = {}
 
 local function settings()
     local conf = config.get_table("pay_callback") or {}
@@ -99,6 +100,7 @@ local function reconcile_loop()
             orders_coll = g_orders,
             query_op = query_op,
             grant = grant,
+            scan_cursors = g_scan_cursors,
         }, { grace = 60 })
         if not ok then
             log.error("charge reconcile raised", "err", tostring(stats))
@@ -162,6 +164,7 @@ function CMD.start(conf)
     server:register_router("skyext.pay_callback_router")
 
     g_running = true
+    g_scan_cursors = {}
     skynet.fork(reconcile_loop)
     log.info("pay callback started", "port", g_conf.port, "providers", provider_count)
     return true
@@ -174,7 +177,12 @@ end
 
 -- 手动跑一轮对账，返回统计
 function CMD.reconcile_once()
-    return charge_reconcile.run_once({ orders_coll = g_orders, query_op = query_op, grant = grant }, {})
+    return charge_reconcile.run_once({
+        orders_coll = g_orders,
+        query_op = query_op,
+        grant = grant,
+        scan_cursors = g_scan_cursors,
+    }, {})
 end
 
 skynet.start(function()
