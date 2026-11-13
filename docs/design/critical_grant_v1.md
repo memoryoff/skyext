@@ -1,6 +1,11 @@
 # critical_grant_v1（关键经济操作授权契约）
 
-> **状态：格式层与签名接口已实现（`lualib/skyext/grant.lua`）；密钥设施与 P08 接入待实现。**
+> **状态：格式层、签名接口与 `critical.execute_client` 接入均已实现
+> （`lualib/skyext/grant.lua` + `lualib/skyext/critical.lua`）。**
+> **仍未实现的是"谁签发"这一段**：`key_id -> 密钥` 的选择与轮换属于部署方设施，
+> 框架只提供 `hmac_fn(key_id, bytes)` 注入点；示例游戏目前没有协议、也没有 Grant 签发点，
+> 所以 `execute_client` 只有测试在驱动。客户端侧 `sdk/lua|ts` 的 `critical` 只做结构校验与
+> 请求组装，同样等待服务端接线。
 > 本文件定义客户端关键经济操作的**授权批次**，以及业务侧使用的稳定操作键。
 > 它是 L2 业务幂等的入口，不替代 L1 的 `req_id` 会话缓存。
 

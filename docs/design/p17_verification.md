@@ -1,6 +1,7 @@
 # P17 验证矩阵：故障注入与压测
 
-> **状态：清单与验收口径已固化；需要在集成环境执行的部分明确标注为"待跑"。**
+> **状态：清单与验收口径已固化。V-01（副本集 `stepDown`）与 V-06（容量压测）已实测；
+> V-02 ~ V-05 仍待跑，标"待跑"的部分不得写成"已验证"。**
 > 本文不是"已完成"的声明——每一行都写清楚它由哪个用例覆盖，或者为什么还没跑。
 
 ## 1. 故障注入（已由单测覆盖）
@@ -46,11 +47,13 @@
 | I32 | 停服时迁移被取消 | 阶段边界停下，已开始的走 FALLBACK，未开始的交给卸载 | `migration.test.lua`、`migration_coordinator.test.lua` |
 | I33 | Outbox 撞上 512 上限 | 先腾 DELIVERED/超期事件再决定是否拒绝；PENDING 永不腾 | `critical.test.lua` |
 
-**未覆盖的注入**（需要真实依赖，见 §3）：真实副本集 `stepDown`、Mongo 网络分区、
-etcd 租约抖动、网关进程 kill、跨节点 RPC 超时。
+**未覆盖的注入**（需要真实依赖，见 §3）：Mongo 网络分区、etcd 租约抖动、网关进程 kill、
+跨节点 RPC 超时。真实副本集 `stepDown` 已跑通（V-01，见缺陷台账 §4：三节点 rs0、
+primary 连续两次换人、`documents=1 version=hits`），不再列为未覆盖。
 
-**还没埋点的指标**：`skyext_critical_reconcile_jobs{state}`（恢复任务需要一个扫描口径，
-现在只有任务表本身可查）。压测前需要补，否则"MANUAL_REVIEW 堆积"只能靠日志看。
+**指标**：恢复任务扫描口径 `skyext_critical_reconcile_due_jobs{state}`
+（`lualib/skyext/critical_reconciler.lua`）与 PREPARED 停留时长
+`skyext_critical_prepared_seconds`（`service/critical_maintenance.lua`）均已埋点；
 `skyext_ws_handshake_inflight` 已在 `gate_ws` 里埋好。
 
 ## 2. 压测清单
@@ -121,17 +124,18 @@ etcd 租约抖动、网关进程 kill、跨节点 RPC 超时。
 512 条约对应 1-2 小时的热窗口，与 7d 归档保留期配合是合理的；真正需要盯的是
 Outbox 的驻留量（它直接决定单次提交的写放大）。
 
-## 3. 需要在集成环境执行的部分（待跑）
+## 3. 需要在集成环境执行的部分
 
 以下三条**没有**在 CI 里跑，因为它们需要真实的多节点/副本集环境。步骤固定下来，
-避免下次又从零摸索。
+避免下次又从零摸索。**当前状态：B1 已跑通（V-01，2026-11-12）；P00-C 与跨节点迁移回环
+仍待跑**（见缺陷台账 §4）。
 
 > **完整的可执行手册见 [`p17_pending_verification_runbook.md`](p17_pending_verification_runbook.md)**：
 > 环境准备（etcd 三节点 / Mongo 副本集 / `make build`）、必改配置、启动顺序、
 > V-02 ~ V-05 与 V-07 的注入方式 / 观察指标 / 通过标准 / 记录模板、失败定位顺序。
 > 本节只保留要点，细节以手册为准。
 
-### B1：真实副本集多数派实测
+### B1：真实副本集多数派实测（已跑通，保留步骤供复跑）
 
 1. 起三节点副本集（`rs.initiate`），确认 `w:majority, j:true` 生效。
 2. 用 `coll:critical_probe()` 确认多数派写可用（它真的写一条探针、多数派读回、再清理；
@@ -157,9 +161,9 @@ Outbox 的驻留量（它直接决定单次提交的写放大）。
 
 ## 4. 已知边界
 
-- 压测脚本不在仓库里：仓库只提供指标与注入点，压测工具（wrk/自研 bot）属于部署侧。
 - 故障注入是依赖替身，不是运行期开关：生产环境**没有**可以打开"注入故障"的入口，
   这是刻意设计。
-- 归档的**吞吐**没有压测数据：保留期 7 天、单角色单次 64 条是初值，需要按
-  `skyext_critical_archive_total` 与 `_critical_ops_v1` 体积实测校准。
+- 压测数据只在本地三进程副本集上采过一轮（`scripts/ci/bench_critical_capacity.sh`，
+  见 §2.1）：能判断数量级与索引门禁的 34 倍差异，但**不是生产硬件基准**。
+  `MAX_OPS = 512`、保留期 7 天、`archive_limit = 64` 仍要按目标硬件的 P95/P99 校准。
 - 迁移的 `activate` 需要游戏层接上网关 `bind_owner`，框架只提供原语与失败语义。
