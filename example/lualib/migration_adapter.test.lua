@@ -63,6 +63,26 @@ local function harness(opts)
         end,
     }
 
+    -- 有界 RPC 的测试桩：hang=true 时 fork 不执行、timeout 立即到期，
+    -- 等价于"调用已经发出但回包永远不来"；hang=false 时同步执行
+    if opts.bounded then
+        h.hang = opts.hang == true
+        fake_skynet.fork = function(fn)
+            if h.hang then
+                h.hung = fn
+            else
+                fn()
+            end
+        end
+        fake_skynet.timeout = function(_, cb)
+            if h.hang then
+                cb()
+            end
+        end
+        fake_skynet.wait = function() end
+        fake_skynet.wakeup = function() end
+    end
+
     local fake_cluster = {
         call = function(node, addr, cmd, ...)
             record("cluster", node .. "!" .. addr, cmd, ...)
@@ -693,5 +713,52 @@ t.describe("migration_adapter 取消兜底", function()
         -- 不带 barrier 的话，目标端只能用暂存快照去猜轮次
         t.expect(call.args[1]).to.equal(7)
         t.expect(call.args[2]).to.equal("round-42")
+    end)
+end)
+
+-- P1-02/P1-03/P1-04：阶段 RPC 必须有 deadline；迟到回包不能越轮次改状态；
+-- begin_round 不得丢掉上一轮还没清理掉的屏障登记。
+t.describe("migration_adapter 有界 RPC 与轮次隔离", function()
+    t.it("keeps a FREEZE_UNKNOWN entry and can still kick when freeze RPC times out", function()
+        local h = harness({ bounded = true })
+        h.hang = true
+        local e = entity()
+        local ok, err = h.adapter.freeze(e, "b1")
+        t.expect(ok).to.be_nil()
+        t.expect(tostring(err)).to.match("deadline")
+        -- 回包没来不等于屏障没建立：登记必须保留，abort 仍要踢这条连接
+        h.hang = false
+        local stats = h.adapter.abort("shutdown deadline")
+        t.expect(stats.kicked).to.equal(1)
+        t.expect(stats.pending).to.equal(0)
+    end)
+
+    t.it("keeps pending barriers across a new round instead of discarding them", function()
+        local opts = { bounded = true, kick_ok = false }
+        local h = harness(opts)
+        local e = entity()
+        assert(h.adapter.freeze(e, "b1"))
+        -- 新一轮开始时清理失败：登记必须保留，不能因为 begin_round 就丢掉
+        t.expect(h.adapter.begin_round()).to.equal(1)
+        opts.kick_ok = true
+        local stats = h.adapter.abort("deadline")
+        t.expect(stats.kicked).to.equal(1)
+        t.expect(stats.pending).to.equal(0)
+    end)
+
+    -- 新轮次被网关明确拒绝时，只能撤销新轮次那一条登记，不能误删上一轮的
+    t.it("a rejection for a new barrier does not remove an older registration", function()
+        local opts = { bounded = true, kick_ok = false }
+        local h = harness(opts)
+        local e = entity()
+        assert(h.adapter.freeze(e, "b1"))
+        assert(h.adapter.begin_round())
+        h.freeze_info = false -- 新轮次的 Freeze 被明确拒绝
+        local ok = h.adapter.freeze(e, "b2")
+        t.expect(ok).to.be_nil()
+        opts.kick_ok = true
+        local stats = h.adapter.abort("deadline")
+        t.expect(stats.kicked).to.equal(1)
+        t.expect(stats.pending).to.equal(0)
     end)
 end)

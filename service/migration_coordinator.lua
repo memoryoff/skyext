@@ -40,6 +40,8 @@ local g_started = false
 local g_cancelled = false
 -- 最后一次取消的兜底清理结果，供 CMD.stats 观测
 local g_abort_stats
+-- 运行锁：同一时刻只允许一轮迁移
+local g_run_active = false
 
 -- 正常阶段和失败出口一个都不能少：缺任何一项都会得到"宣称迁移成功、会话没送到"
 -- 或"迁移失败但客户端仍停在冻结态"的假象
@@ -139,19 +141,19 @@ end
 
 -- 停服钩子会以 CMD 命令的形式调用这里（node_shutdown 的 migrate 阶段）。
 -- 没 start 过就明确失败：空实体列表会让停服流程"成功"地什么都不做。
-function CMD.run(opts)
-    if not g_started or not g_adapter then
-        log.error("migration coordinator is not started")
-        return false, "migration coordinator is not started"
-    end
+local function run_round(opts)
     g_cancelled = false
     g_abort_stats = nil
-    -- 上一轮可能被取消过：适配器内部的 inflight/aborted 状态必须在这里复位，
-    -- 否则新一轮的所有阶段 RPC 都会被当成"已取消"直接拒绝
+    -- 上一轮可能被取消过：适配器内部的 aborted 状态必须在这里复位，
+    -- 否则新一轮的所有阶段 RPC 都会被当成"已取消"直接拒绝。
+    -- begin_round 返回上一轮没清理掉的屏障数：它只重试清理、绝不清空登记。
     if type(g_adapter.begin_round) == "function" then
-        local ok, err = pcall(g_adapter.begin_round)
+        local ok, pending = pcall(g_adapter.begin_round)
         if not ok then
-            return false, "migration adapter begin_round failed: " .. tostring(err)
+            return false, "migration adapter begin_round failed: " .. tostring(pending)
+        end
+        if type(pending) == "number" and pending > 0 then
+            log.error("migration starts with unresolved barriers from the previous round", "pending", pending)
         end
     end
     local deps = {}
@@ -208,6 +210,26 @@ function CMD.run(opts)
         log.warn("migration round ended by cancellation", "ready", stats.ready, "cancelled", stats.cancelled)
     end
     return true, stats
+end
+
+-- 运行锁：两次 CMD.run 并发会把 g_cancelled 复位成 false，并让两轮
+-- begin_round 互相清状态。停服钩子只该跑一轮，重复调用必须显式拒绝
+function CMD.run(opts)
+    if not g_started or not g_adapter then
+        log.error("migration coordinator is not started")
+        return false, "migration coordinator is not started"
+    end
+    if g_run_active then
+        return false, "migration round is already running"
+    end
+    g_run_active = true
+    local called, ok, stats = pcall(run_round, opts)
+    g_run_active = false
+    if not called then
+        log.error("migration coordinator raised", "err", tostring(ok))
+        return false, ok
+    end
+    return ok, stats
 end
 
 -- 停服截止时间到达：让正在跑的迁移在阶段边界停下，并做网关屏障兜底。

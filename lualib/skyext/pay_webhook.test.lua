@@ -252,18 +252,38 @@ t.describe("pay_webhook 落单与发奖", function()
         t.expect(#order.service_op_id).to.equal(68)
     end)
 
-    t.it("clears an old reconciliation block when a retry finally grants", function()
+    -- P2-03：reconcile_blocked_at 是"人工终态"，不是"可自动重试"。
+    -- 渠道重复回调不得绕过人工阻断重新发奖，也不得清掉阻断标记
+    t.it("does not re-grant an order blocked for manual review", function()
         local h = harness()
         h.decision = { status = "UNKNOWN", reason = "write concern timeout" }
         assert(h.webhook:handle(fake_req("/pay/wechat/callback", h.body)))
         local order = h.orders.store.docs[1]
-        assert(charge_order.block_reconcile(h.orders, order, "manual review", 1700000001))
+        assert(charge_order.block_reconcile(h.orders, order, "business rejected", 1700000001))
 
         h.decision = { status = "COMMITTED" }
         local out = h.webhook:handle(fake_req("/pay/wechat/callback", h.body))
         t.expect(out.status).to.equal(200)
-        t.expect(h.orders.store.docs[1].status).to.equal("GRANTED")
-        t.expect(h.orders.store.docs[1].reconcile_blocked_at).to.be_nil()
+        t.expect(out.body.result).to.equal("manual_review")
+        -- 已有阻断时不得再调发奖通道
+        t.expect(#h.granted).to.equal(1)
+        t.expect(h.orders.store.docs[1].status).to.equal("GRANTING")
+        t.expect(h.orders.store.docs[1].reconcile_blocked_at).to.equal(1700000001)
+    end)
+
+    -- 人工阻断的订单在重复回调里也要保证 ACK 落库：否则渠道会无限重推
+    t.it("does not return 200 for a blocked order when the ACK write fails", function()
+        local h = harness()
+        h.decision = { status = "UNKNOWN", reason = "write concern timeout" }
+        assert(h.webhook:handle(fake_req("/pay/wechat/callback", h.body)))
+        assert(charge_order.block_reconcile(h.orders, h.orders.store.docs[1], "manual", 1700000001))
+        h.webhook.ack = function()
+            return false
+        end
+        local out = h.webhook:handle(fake_req("/pay/wechat/callback", h.body))
+        t.expect(out.status).to.equal(503)
+        t.expect(out.body.code).to.equal("ack_not_persisted")
+        t.expect(h.orders.store.docs[1].reconcile_blocked_at).to.equal(1700000001)
     end)
 
     -- UNKNOWN 不能回 500：订单已经落库，对账会收尾；让渠道重推只会制造重复回调

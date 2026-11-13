@@ -407,4 +407,23 @@ t.describe("config 类型化缓存互不污染", function()
         t.expect(h.config.get_number("payload")).to.be_nil()
         t.expect(h.config.get_table("payload")).to.equal({ 1, 2 })
     end)
+
+    -- boolean 与 number 共用一张类型缓存时：先 get_boolean("timeout") 会把 false
+    -- 写进缓存，之后 get_number("timeout") 直接返回 false 而不是 30
+    t.it("同一个键先取布尔再取数字仍得到数字", function()
+        local h = harness({ timeout = "30" })
+        t.expect(h.config.get_boolean("timeout")).to.equal(false)
+        local n = h.config.get_number("timeout")
+        t.expect(type(n)).to.equal("number")
+        t.expect(n).to.equal(30)
+    end)
+
+    -- 反过来：先 get_number 缓存 30，get_boolean 不能把 30 当成"真值"返回
+    t.it("同一个键先取数字再取布尔仍得到布尔", function()
+        local h = harness({ timeout = "30" })
+        t.expect(h.config.get_number("timeout")).to.equal(30)
+        local b = h.config.get_boolean("timeout")
+        t.expect(type(b)).to.equal("boolean")
+        t.expect(b).to.equal(false)
+    end)
 end)

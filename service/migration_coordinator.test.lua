@@ -61,6 +61,9 @@ local function harness(opts)
         ["skyext.migration"] = {
             run = function(deps, run_opts)
                 h.run_calls[#h.run_calls + 1] = { deps = deps, opts = run_opts }
+                if opts.on_run then
+                    opts.on_run(h, deps, run_opts)
+                end
                 if opts.run_result ~= nil then
                     return table.unpack(opts.run_result, 1, opts.run_result.n or #opts.run_result)
                 end
@@ -245,6 +248,24 @@ t.describe("migration_coordinator 运行", function()
         local ok, err = h.CMD.set_adapter("adapter")
         t.expect(ok).to.equal(false)
         t.expect(err).to.equal("adapter must be a table")
+    end)
+
+    -- 两个迁移轮次并发会互相复位 g_cancelled / begin_round 状态，必须显式拒绝
+    t.it("refuses a second run while a round is still running", function()
+        local second
+        local h = harness({
+            modules = { ["game.migration_adapter"] = stage_adapter() },
+            on_run = function(handle)
+                second = { handle.CMD.run({ nested = true }) }
+            end,
+        })
+        assert(h.CMD.start(enabled_conf({ adapter = "game.migration_adapter" })))
+        local ok, stats = h.CMD.run({})
+        t.expect(ok).to.equal(true)
+        t.expect(type(stats)).to.equal("table")
+        t.expect(second[1]).to.equal(false)
+        t.expect(second[2]).to.equal("migration round is already running")
+        t.expect(#h.run_calls).to.equal(1)
     end)
 end)
 

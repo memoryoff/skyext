@@ -79,6 +79,57 @@ local function hex(bytes)
     end))
 end
 
+-- 只有真正的唯一键冲突才允许走"回读已有订单"路径。
+-- 其它 REJECTED（权限、参数、命令级失败）是明确失败，用一个普通读把它
+-- 伪装成"重复回调"只会把存储故障变成一次成功 ACK。
+local function is_duplicate_key(detail)
+    if type(detail) ~= "table" then
+        return false
+    end
+    local function matches(err)
+        if type(err) ~= "table" then
+            return false
+        end
+        if err.code == 11000 then
+            return true
+        end
+        return type(err.errmsg) == "string" and err.errmsg:find("E11000", 1, true) ~= nil
+    end
+    if matches(detail) then
+        return true
+    end
+    local errors = detail.writeErrors
+    if type(errors) == "table" then
+        for _, err in ipairs(errors) do
+            if matches(err) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- 重复订单必须用多数派读确认。普通 find_one 会读到主节点上尚未被多数派确认的
+-- 写入：那条订单随后可能在切主时回滚，而渠道已经因为"读到重复单"拿到 200。
+-- 读不到、读失败、没有多数派读通道，一律返回 nil（调用方按 UNKNOWN 处理），
+-- 绝不能把"此刻主节点看得见"当成"订单已可靠存在"。
+local function read_existing_order(orders_coll, provider, order_id)
+    if type(orders_coll.critical_find) ~= "function" then
+        return nil, "no majority read channel"
+    end
+    local called, doc, err = pcall(orders_coll.critical_find, orders_coll, {
+        provider = provider,
+        order_id = order_id,
+    })
+    if not called then
+        return nil, tostring(doc)
+    end
+    if type(doc) ~= "table" then
+        return nil, err and tostring(err) or nil
+    end
+    return doc
+end
+
 local function check_text(value, name, max_len)
     if type(value) ~= "string" or #value == 0 or #value > (max_len or 128) then
         return nil, name .. " must be a non-empty string"
@@ -210,7 +261,10 @@ function M.record(orders_coll, opts)
         upsert = true,
         new = true,
     })
-    if type(ret) ~= "table" or ret.ok ~= 1 then
+    -- 判据必须是"多数派写确认"本身，而不是回复长什么样：
+    -- findAndModify 可能返回 ok=1 却带 writeErrors（唯一键冲突就走这个形状），
+    -- 只看 ret.ok 会把它当成功，接着用 ret.value 的空缺去做一次普通读
+    if state ~= "CONFIRMED" then
         if state == "UNKNOWN" then
             -- 写入可能已在主节点生效、只是多数派确认丢了。普通 find_one 此刻
             -- 可能看得到这条记录，但那是未确认状态：切主回滚后订单会消失而渠道
@@ -218,45 +272,66 @@ function M.record(orders_coll, opts)
             m_unconfirmed:inc(1, { provider = provider })
             return nil, "UNKNOWN"
         end
-        -- 并发重复回调可能撞唯一索引（E11000）。这不是存储故障：回读一次，
-        -- 是同一笔就按已有订单处理，否则才算冲突
-        local existing = orders_coll:find_one({ provider = provider, order_id = order_id })
-        if type(existing) == "table" then
-            if
-                existing.amount ~= opts.amount
-                or existing.currency ~= currency
-                or normalize_rid(existing.rid) ~= rid
-                or (existing.action or "grant") ~= action
-            then
-                if (existing.action or "grant") ~= action then
-                    log.error(
-                        "charge order action conflict",
-                        "provider",
-                        provider,
-                        "order_id",
-                        order_id,
-                        "expected_action",
-                        tostring(existing.action or "grant"),
-                        "got_action",
-                        action
-                    )
-                end
-                return nil, "order conflict"
+        if not is_duplicate_key(detail) then
+            -- 明确失败但不是重复键：回读既证明不了幂等，还会把故障当成功
+            local reason = "order upsert failed"
+            if type(detail) == "table" then
+                reason = detail.errmsg or reason
+            elseif detail ~= nil then
+                reason = tostring(detail)
             end
-            -- 历史订单可能是字符串 rid。返回值必须归一化，否则后续 router.call
-            -- 会在 placement.calc_node 的 integer 校验处直接抛错。
-            existing.rid = rid
-            return existing, false
+            return nil, reason
         end
-        return nil, detail or "order upsert failed"
+        -- 并发重复回调撞唯一索引（E11000）。回读必须是多数派读：主节点可见
+        -- 不等于多数派已确认，读不到就不能认定"重复订单已可靠存在"
+        local existing, read_err = read_existing_order(orders_coll, provider, order_id)
+        if not existing then
+            m_unconfirmed:inc(1, { provider = provider })
+            log.warn(
+                "charge order duplicate hit but is not majority-visible",
+                "provider",
+                provider,
+                "order_id",
+                order_id,
+                "err",
+                tostring(read_err or "not found")
+            )
+            return nil, "UNKNOWN"
+        end
+        if
+            existing.amount ~= opts.amount
+            or existing.currency ~= currency
+            or normalize_rid(existing.rid) ~= rid
+            or (existing.action or "grant") ~= action
+        then
+            if (existing.action or "grant") ~= action then
+                log.error(
+                    "charge order action conflict",
+                    "provider",
+                    provider,
+                    "order_id",
+                    order_id,
+                    "expected_action",
+                    tostring(existing.action or "grant"),
+                    "got_action",
+                    action
+                )
+            end
+            return nil, "order conflict"
+        end
+        -- 历史订单可能是字符串 rid。返回值必须归一化，否则后续 router.call
+        -- 会在 placement.calc_node 的 integer 校验处直接抛错。
+        existing.rid = rid
+        return existing, false
     end
     local order = ret.value
     if type(order) ~= "table" then
-        -- upsert 命中已有文档但没回后像：回读一次
-        order = orders_coll:find_one({ provider = provider, order_id = order_id })
+        -- upsert 命中已有文档但没回后像：同样只信多数派读
+        order = read_existing_order(orders_coll, provider, order_id)
     end
     if type(order) ~= "table" then
-        return nil, "order not readable"
+        m_unconfirmed:inc(1, { provider = provider })
+        return nil, "UNKNOWN"
     end
 
     -- 用驱动给的 updatedExisting 判断是否新建。没有这个字段时返回 nil 而不是猜：
@@ -368,10 +443,9 @@ function M.grant(entity, order, handlers, opts)
         return nil, "order is required"
     end
     if order.status ~= M.STATUS.VERIFIED_RECEIVED and order.status ~= M.STATUS.GRANTING then
-        -- 已经 GRANTED 的订单不能重复发奖；状态由对账推进
-        if order.status == M.STATUS.GRANTED and order.reconcile_blocked_at and opts.orders_coll then
-            M.unblock_reconcile(opts.orders_coll, order, opts.now)
-        end
+        -- 已经 GRANTED 的订单不能重复发奖；状态由对账推进。
+        -- 阻断标记是人工终态，任何自动路径（包括这里的重复调用）都不得替人解除；
+        -- 解除只能走显式的 unblock_reconcile（人工核对/补偿之后）。
         return { status = order.status, duplicate = true }
     end
 
@@ -396,7 +470,8 @@ function M.grant(entity, order, handlers, opts)
     if result.status == critical.STATUS.COMMITTED then
         if opts.orders_coll then
             -- from 必须取订单当前状态：grant 允许从 VERIFIED_RECEIVED 直接进来
-            -- （回调同步发奖），写死 GRANTING 会让 CAS 不命中、订单永远停在原状态
+            -- （回调同步发奖），写死 GRANTING 会让 CAS 不命中、订单永远停在原状态。
+            -- 不清 reconcile_blocked_at：那是人工终态，自动路径不能替人解除
             M.transition(
                 opts.orders_coll,
                 order.provider,
@@ -404,8 +479,7 @@ function M.grant(entity, order, handlers, opts)
                 order.status,
                 M.STATUS.GRANTED,
                 { granted_at = opts.now or os.time() },
-                opts.now,
-                { reconcile_blocked_at = true }
+                opts.now
             )
         end
     elseif result.status == critical.STATUS.UNKNOWN then
@@ -454,13 +528,17 @@ function M.ensure_indexes(orders_coll)
 end
 
 -- 启动门禁：没有多数派写入通道时，落单/状态推进/ACK 全部退化成服务端默认写关注。
--- 订单是资金凭证，这类降级不能在生产里静默生效——由 service/pay_callback 在启动时拦下。
+-- 重复订单的回读还需要多数派读通道（critical_find）：缺了它，重复回调只能按
+-- UNKNOWN 拒绝，支付链路会永远无法幂等。两者都必须在启动时确认存在。
 function M.check_write_channel(orders_coll)
     if type(orders_coll) ~= "table" then
         return nil, "orders collection is required"
     end
     if type(orders_coll.critical_find_and_modify) ~= "function" then
         return nil, "orders collection has no critical_find_and_modify (majority write) channel"
+    end
+    if type(orders_coll.critical_find) ~= "function" then
+        return nil, "orders collection has no critical_find (majority read) channel"
     end
     return true
 end

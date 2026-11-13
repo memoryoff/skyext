@@ -136,11 +136,24 @@ function CMD.start(conf)
     g_orders = mongo_conn.get_collection(g_conf.db, g_conf.coll)
 
     -- 写通道门禁：没有多数派写入，落单/推进/ACK 都是 w:1，切主回滚会让
-    -- "渠道已 ACK、订单行消失"变成永久丢单。缺通道必须在启动时拦下，不能降级运行
+    -- "渠道已 ACK、订单行消失"变成永久丢单。缺通道必须在启动时拦下，不能降级运行。
+    -- 这里只证明接口存在，真正的健康还要靠下一步的探针
     local writable, werr = charge_order.check_write_channel(g_orders)
     if not writable then
         log.error("pay callback not started, majority write gate failed", "err", tostring(werr))
         return false, werr
+    end
+
+    -- 真实多数派探针：接口存在不等于这条连接能完成 majority 写。
+    -- 探针做一次真实写入 + 多数派读回 + 清理，任一步未确认都不启动
+    local probed, probe_ok, probe_err = pcall(g_orders.critical_probe, g_orders)
+    if not probed then
+        log.error("pay callback not started, majority probe raised", "err", tostring(probe_ok))
+        return false, "majority probe raised: " .. tostring(probe_ok)
+    end
+    if probe_ok ~= true then
+        log.error("pay callback not started, majority probe failed", "err", tostring(probe_err))
+        return false, "majority probe failed: " .. tostring(probe_err or "unconfirmed")
     end
 
     -- 索引门禁：没有 (provider, order_id) 唯一索引，重复回调会落出两条订单，

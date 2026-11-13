@@ -340,7 +340,7 @@ t.describe("charge_order 发奖", function()
         t.expect(h.orders.store["wechat:ORDER-1"].status).to.equal("GRANTED")
     end)
 
-    t.it("clears a stale reconciliation block when a grant finally succeeds", function()
+    t.it("does not let an automatic grant clear a manual reconciliation block", function()
         local h = harness_with_critical({ status = "COMMITTED" })
         local order = assert(h.record())
         assert(h.charge.block_reconcile(h.orders, order, "manual review", 100))
@@ -352,7 +352,8 @@ t.describe("charge_order 发奖", function()
         })
         t.expect(result.status).to.equal("COMMITTED")
         t.expect(h.orders.store["wechat:ORDER-1"].status).to.equal("GRANTED")
-        t.expect(h.orders.store["wechat:ORDER-1"].reconcile_blocked_at).to.be_nil()
+        -- 阻断标记只能由人工显式解除（unblock_reconcile），自动发奖不得顺手清掉
+        t.expect(h.orders.store["wechat:ORDER-1"].reconcile_blocked_at).to.equal(100)
     end)
 
     -- UNKNOWN 不能重试成"没发"，也不能宣称已发：保持 GRANTING 等对账
@@ -472,6 +473,126 @@ t.describe("charge_order 多数派写入", function()
         h.orders.critical_find_and_modify = function()
             return "CONFIRMED", {}
         end
+        -- 写入通道有了，但重复订单的回读仍然没有多数派读通道
+        ok, err = h.charge.check_write_channel(h.orders)
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.match("critical_find")
+        h.orders.critical_find = function()
+            return nil
+        end
         t.expect(h.charge.check_write_channel(h.orders)).to.equal(true)
+    end)
+end)
+
+-- P1-01：重复订单的回读必须是多数派读。
+-- 普通 find_one 会读到主节点上尚未多数派确认的写入，随后切主回滚就是
+-- "渠道 ACK 成功、订单凭证消失"。回读看不到时只能按 UNKNOWN 让渠道重推。
+t.describe("charge_order 重复订单的多数派回读", function()
+    local EXISTING = {
+        provider = "wechat",
+        order_id = "ORDER-1",
+        rid = 7,
+        amount = 600,
+        currency = "CNY",
+        action = "grant",
+        service_op_id = "srv_x",
+        status = "VERIFIED_RECEIVED",
+    }
+
+    t.it("treats a duplicate key as idempotent only when the majority read sees it", function()
+        local h = harness()
+        local reads = 0
+        h.orders.critical_find_and_modify = function()
+            return "REJECTED", { code = 11000, errmsg = "E11000 duplicate key" }
+        end
+        h.orders.critical_find = function()
+            reads = reads + 1
+            return EXISTING
+        end
+        local order, created = h.record()
+        t.expect(reads).to.equal(1)
+        t.expect(type(order)).to.equal("table")
+        t.expect(created).to.equal(false)
+        t.expect(order.rid).to.equal(7)
+    end)
+
+    -- 主节点上看得见、但多数派读看不见：写入可能还没被多数派确认，切主会回滚
+    t.it("returns UNKNOWN when the duplicate is not visible to a majority read", function()
+        local h = harness()
+        h.orders.store["wechat:ORDER-1"] = {
+            provider = "wechat",
+            order_id = "ORDER-1",
+            rid = 7,
+            amount = 600,
+            currency = "CNY",
+            action = "grant",
+        }
+        h.orders.critical_find_and_modify = function()
+            return "REJECTED", { code = 11000, errmsg = "E11000 duplicate key" }
+        end
+        h.orders.critical_find = function()
+            return nil
+        end
+        local order, err = h.record()
+        t.expect(order).to.be_nil()
+        t.expect(err).to.equal("UNKNOWN")
+        -- 普通读明明看得到这条记录，也不能拿它当凭据
+        t.expect(h.orders:find_one({ provider = "wechat", order_id = "ORDER-1" })).to.exist()
+    end)
+
+    t.it("returns UNKNOWN when the majority read itself fails", function()
+        local h = harness()
+        h.orders.critical_find_and_modify = function()
+            return "REJECTED", { code = 11000, errmsg = "E11000 duplicate key" }
+        end
+        h.orders.critical_find = function()
+            error("majority read timeout")
+        end
+        local order, err = h.record()
+        t.expect(order).to.be_nil()
+        t.expect(err).to.equal("UNKNOWN")
+    end)
+
+    -- findAndModify 的唯一键冲突也可能以 ok=1 + writeErrors 的形状回来：
+    -- 只看 ret.ok 会把它当成功，必须按"多数派未确认"重新判定
+    t.it("treats ok=1 with duplicate writeErrors as a duplicate, not a success", function()
+        local h = harness()
+        local reads = 0
+        h.orders.critical_find_and_modify = function()
+            return "REJECTED", { ok = 1, writeErrors = { { code = 11000, errmsg = "E11000 duplicate key" } } }
+        end
+        h.orders.critical_find = function()
+            reads = reads + 1
+            return EXISTING
+        end
+        local order, created = h.record()
+        t.expect(reads).to.equal(1)
+        t.expect(type(order)).to.equal("table")
+        t.expect(created).to.equal(false)
+    end)
+
+    -- 非重复键的 REJECTED 是明确失败：不能回读，更不能把旧订单当成功返回
+    t.it("does not treat a non-duplicate rejection as an idempotent hit", function()
+        local h = harness()
+        local reads = 0
+        h.orders.store["wechat:ORDER-1"] = {
+            provider = "wechat",
+            order_id = "ORDER-1",
+            rid = 7,
+            amount = 600,
+            currency = "CNY",
+            action = "grant",
+        }
+        h.orders.critical_find_and_modify = function()
+            return "REJECTED", { code = 13, errmsg = "not authorized" }
+        end
+        h.orders.critical_find = function()
+            reads = reads + 1
+            return h.orders.store["wechat:ORDER-1"]
+        end
+        local order, err = h.record()
+        t.expect(order).to.be_nil()
+        t.expect(err).to.match("not authorized")
+        t.expect(reads).to.equal(0)
     end)
 end)

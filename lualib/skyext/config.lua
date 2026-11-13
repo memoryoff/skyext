@@ -2,15 +2,19 @@ local skynet = require "skynet"
 
 local M = {}
 
--- 三份缓存各自独立：
---   raw_conf   环境变量读到的原始字符串（get 的视图）
---   typed_conf get_boolean / get_number 的类型化结果
---   table_conf get_table 求值出来的表
--- 早期三者共用一张 conf：先 get 把 "false"/"1024" 写进去，之后 get_boolean 直接把
+-- 四份缓存各自独立：
+--   raw_conf    环境变量读到的原始字符串（get 的视图）
+--   bool_conf   get_boolean 的结果
+--   number_conf get_number 的结果
+--   table_conf  get_table 求值出来的表
+-- 早期它们共用一张 conf：先 get 把 "false"/"1024" 写进去，之后 get_boolean 直接把
 -- 字符串 "false" 返回（Lua 里非空字符串为真）、get_number 直接返回字符串，
 -- if config.get_boolean("x") then 就会在本该为假时走进 true 分支。
+-- boolean 与 number 也不能共用：同一个键先按布尔取会缓存 true/false，之后按数字
+-- 取就会拿到布尔值（反之亦然）。类型由 getter 决定，缓存必须按类型隔离。
 local raw_conf = {}
-local typed_conf = {}
+local bool_conf = {}
+local number_conf = {}
 local table_conf = {}
 
 local function read_env(key)
@@ -43,7 +47,7 @@ local function peek(key)
 end
 
 function M.get_boolean(key)
-    local cached = typed_conf[key]
+    local cached = bool_conf[key]
     if cached ~= nil then
         return cached
     end
@@ -55,12 +59,12 @@ function M.get_boolean(key)
 
     -- 配置里只认小写 "true"；"1"/"yes"/"TRUE" 都是假
     value = value == "true"
-    typed_conf[key] = value
+    bool_conf[key] = value
     return value
 end
 
 function M.get_number(key)
-    local cached = typed_conf[key]
+    local cached = number_conf[key]
     if cached ~= nil then
         return cached
     end
@@ -75,7 +79,7 @@ function M.get_number(key)
         -- nil 存不进缓存表，保持"每次重新问一遍"的既有语义
         return
     end
-    typed_conf[key] = value
+    number_conf[key] = value
     return value
 end
 

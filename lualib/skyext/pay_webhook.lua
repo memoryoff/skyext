@@ -159,6 +159,27 @@ function Webhook:handle(req)
         return reject(500, "storage_unavailable")
     end
 
+    -- 人工阻断 = 终态门禁：订单已经交给人工补偿/核对，重复回调不得重新触发发奖，
+    -- 也不得顺手清掉阻断标记（否则"必须人工确认"就被一次渠道重推绕过了）。
+    -- 渠道此前已经 ACK 过，这里回 200 让重推停下，但语义明确是 manual_review。
+    if order.reconcile_blocked_at then
+        if not self:ack(name, order, now) then
+            m_requests:inc(1, { result = "ack_failed" })
+            return reject(503, "ack_not_persisted", { retryable = true })
+        end
+        log.warn(
+            "pay callback hit an order blocked for manual review",
+            "provider",
+            name,
+            "order_id",
+            tostring(order.order_id),
+            "blocked_at",
+            tostring(order.reconcile_blocked_at)
+        )
+        m_requests:inc(1, { result = "manual_review" })
+        return { status = 200, body = { result = "manual_review", status = "REJECTED" } }
+    end
+
     -- 发奖前先推进到 GRANTING。订单状态的权威在订单集合（回调层持有），
     -- 不在实体进程；不先落这一步，发奖中途崩溃的单子对账永远扫不到
     local marked = charge_order.transition(
@@ -218,20 +239,16 @@ function Webhook:handle(req)
     m_grant:inc(1, { status = tostring(status) })
 
     if status == "COMMITTED" or decision.duplicate then
-        local moved = charge_order.transition(
+        -- 不清 reconcile_blocked_at：那是人工终态，自动路径不能替人解除
+        charge_order.transition(
             self.orders_coll,
             name,
             order.order_id,
             charge_order.STATUS.GRANTING,
             charge_order.STATUS.GRANTED,
             { granted_at = now },
-            now,
-            { reconcile_blocked_at = true }
+            now
         )
-        if not moved and order.status == charge_order.STATUS.GRANTED then
-            -- 已 GRANTED 的重复回调不会再触发状态迁移，但仍应解除此前的人工阻断
-            charge_order.unblock_reconcile(self.orders_coll, order, now)
-        end
         if not self:ack(name, order, now) then
             m_requests:inc(1, { result = "ack_failed" })
             return reject(503, "ack_not_persisted", { retryable = true })

@@ -16,8 +16,22 @@ local function harness(opts)
         order_index_ok = opts.order_index_ok ~= false,
         reconcile_index_ok = opts.reconcile_index_ok ~= false,
         index_calls = 0,
+        probe_calls = 0,
         forks = 0,
     }
+    h.probe_ok = opts.probe_ok ~= false
+    h.probe_err = opts.probe_err or "probe majority write not confirmed (UNKNOWN): timeout"
+    h.collection = opts.collection
+        or {
+            _name = "charge_order",
+            critical_probe = function()
+                h.probe_calls = h.probe_calls + 1
+                if h.probe_ok then
+                    return true
+                end
+                return nil, h.probe_err
+            end,
+        }
     h.pay_conf = opts.pay_conf
         or {
             host = "127.0.0.1",
@@ -56,7 +70,7 @@ local function harness(opts)
         },
         ["skyext.mongo_conn"] = {
             get_collection = function()
-                return opts.collection or { _name = "charge_order" }
+                return h.collection
             end,
         },
         ["skyext.charge_order"] = {
@@ -130,6 +144,30 @@ t.describe("pay_callback 启动门禁", function()
         t.expect(h.index_calls).to.equal(0)
         t.expect(h.server).to.be_nil()
         t.expect(h.forks).to.equal(0)
+    end)
+
+    -- 接口存在不等于多数派可用：探针必须真的写一笔、多数派读回、再清理。
+    -- 探针失败时不能开监听，也不能白建索引
+    t.it("refuses to listen when the majority probe is not confirmed", function()
+        local h = harness({ probe_ok = false })
+        local ok, err = h.CMD.start()
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.match("probe majority write not confirmed")
+        t.expect(h.probe_calls).to.equal(1)
+        t.expect(h.index_calls).to.equal(0)
+        t.expect(h.server).to.be_nil()
+        t.expect(h.forks).to.equal(0)
+    end)
+
+    t.it("refuses to listen when the majority probe raises", function()
+        local h = harness()
+        h.collection.critical_probe = function()
+            error("connection refused")
+        end
+        local ok, err = h.CMD.start()
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.match("connection refused")
+        t.expect(h.server).to.be_nil()
     end)
 
     t.it("refuses to listen when the order index gate fails", function()
