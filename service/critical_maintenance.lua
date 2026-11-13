@@ -142,6 +142,11 @@ function CMD.start(conf)
     for k, v in pairs(conf or {}) do
         g_opts[k] = v
     end
+    local valid, verr = critical_maintenance.validate_opts(g_opts)
+    if not valid then
+        log.error("critical maintenance not started, invalid config", "err", verr)
+        return false, verr
+    end
 
     local tc = types.get(g_opts.type_name)
     -- 冷账本与恢复任务集合必须显式配置。缺配置时 entity_agent 是 fail-closed
@@ -173,6 +178,9 @@ function CMD.start(conf)
         return false, derr
     end
     g_deps = deps
+    -- 两组扫描各自的轮转游标：归档游标按“跳过的候选数”推进，意图游标按 rid
+    -- keyset 推进；都放在 deps 上，跨 run_once 调用保留
+    g_deps.intent_cursor = nil
 
     -- 恢复任务执行器：抢占走 claim_job 的 (job_version, lease_until) CAS；
     -- 证明必须经 owner 实体队列（critical_resolve_intent），那里已完成 Fence 认领。

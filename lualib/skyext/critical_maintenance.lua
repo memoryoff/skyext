@@ -21,6 +21,23 @@ local M = {}
 M.DEFAULT_SCAN = 32
 M.DEFAULT_INTERVAL = 60
 
+local function positive_integer(value)
+    return type(value) == "number" and value > 0 and value == math.floor(value)
+end
+
+function M.validate_opts(opts)
+    opts = opts or {}
+    if type(opts.interval) ~= "number" or opts.interval <= 0 then
+        return false, "interval must be a positive number"
+    end
+    for _, key in ipairs({ "scan_limit", "archive_limit", "reconcile_scan", "reconcile_lease" }) do
+        if opts[key] ~= nil and not positive_integer(opts[key]) then
+            return false, key .. " must be a positive integer"
+        end
+    end
+    return true
+end
+
 local m_archive = metrics.counter("skyext_critical_maintenance_total", "Maintenance rounds by task", { "task" })
 local m_candidates =
     metrics.gauge("skyext_critical_maintenance_candidates", "Candidates found by the last maintenance scan", { "task" })
@@ -83,15 +100,22 @@ function M.scan_intents(role_coll, opts)
         return nil, "role collection is required"
     end
     local key = opts.key or "rid"
-    local called, docs, err = pcall(role_coll.find_many, role_coll, {
+    local query = {
         [critical.INTENT_FIELD .. ".state"] = "PREPARED",
-    }, {
+    }
+    if opts.cursor ~= nil then
+        -- 与归档扫描同一套 keyset 轮转：卡住的角色仍留在 PREPARED 集合里，
+        -- 每轮从队头重扫会让后面的角色永远排不进来
+        query["$and"] = { { [key] = { ["$gt"] = opts.cursor } } }
+    end
+    local called, docs, err = pcall(role_coll.find_many, role_coll, query, {
         projection = {
             [key] = 1,
             [critical.INTENT_FIELD .. ".op_id"] = 1,
             [critical.INTENT_FIELD .. ".prepared_at"] = 1,
             _id = 0,
         },
+        sort = { { [key] = 1 } },
         limit = opts.limit or M.DEFAULT_SCAN,
     })
     if not called then
@@ -123,6 +147,8 @@ function M.run_once(deps, opts)
         return nil, "deps.role_coll is required"
     end
     local stats = { archived = 0, intents = 0, skipped = 0, failed = 0 }
+    local scan_limit = opts.scan_limit or opts.limit or M.DEFAULT_SCAN
+    local archive_limit = opts.archive_limit or opts.limit
 
     -- 归档候选的轮转游标：卡住的文档（加载失败、节点不可达）不会离开候选集，
     -- 每轮都从 0 开始扫的话，≥limit 个卡住文档就能让后面的角色永远排不进来，
@@ -131,14 +157,14 @@ function M.run_once(deps, opts)
     local candidates, aerr = M.scan_archive(deps.role_coll, {
         now = opts.now,
         retention = opts.retention,
-        limit = opts.limit,
+        limit = scan_limit,
         key = opts.key,
         skip = archive_skip,
     })
     if not candidates then
         return nil, aerr
     end
-    if #candidates >= (opts.limit or M.DEFAULT_SCAN) then
+    if #candidates >= scan_limit then
         deps.archive_cursor = archive_skip + #candidates
     else
         deps.archive_cursor = 0
@@ -167,7 +193,7 @@ function M.run_once(deps, opts)
         else
             -- deps 的契约是 (ok, stats|reason)；pcall 会在前面多插一个 true，
             -- 只取两个返回值会把 `true` 当成 stats
-            local called, ok, result = pcall(deps.archive, entry.rid, opts.limit)
+            local called, ok, result = pcall(deps.archive, entry.rid, archive_limit)
             if not called then
                 stats.failed = stats.failed + 1
                 log.error("critical archive raised", "rid", tostring(entry.rid), "err", tostring(ok))
@@ -180,9 +206,18 @@ function M.run_once(deps, opts)
     end
     m_archive:inc(1, { task = "archive" })
 
-    local intents, ierr = M.scan_intents(deps.role_coll, opts)
+    local intents, ierr = M.scan_intents(deps.role_coll, {
+        limit = scan_limit,
+        key = opts.key,
+        cursor = deps.intent_cursor,
+    })
     if not intents then
         return nil, ierr
+    end
+    if #intents >= scan_limit then
+        deps.intent_cursor = intents[#intents].rid
+    else
+        deps.intent_cursor = nil
     end
     m_candidates:set(#intents, { task = "intent" })
     local intent_now = opts.now or os.time()

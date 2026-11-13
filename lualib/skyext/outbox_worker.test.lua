@@ -487,3 +487,35 @@ t.describe("outbox_worker 默认投递的结果分类", function()
         t.expect(delivery.is_retryable(h.mod.default_deliver(envelope))).to.equal(true)
     end)
 end)
+
+t.describe("outbox_worker 配置校验", function()
+    local mod = require "skyext.outbox_worker"
+
+    t.it("accepts positive integer settings", function()
+        t.expect(mod.validate_opts({ interval = 1, scan_limit = 1, limit = 1, max_loads = 1 })).to.equal(true)
+    end)
+
+    t.it("rejects zero values instead of treating them as unlimited or disabled", function()
+        local ok, err = mod.validate_opts({ interval = 0, scan_limit = 1, limit = 1, max_loads = 1 })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.match("interval")
+
+        ok, err = mod.validate_opts({ interval = 1, scan_limit = 0, limit = 1, max_loads = 1 })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.match("scan_limit")
+
+        ok, err = mod.validate_opts({ interval = 1, scan_limit = 1, limit = 0, max_loads = 1 })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.match("limit")
+
+        ok, err = mod.validate_opts({ interval = 1, scan_limit = 1, limit = 1, max_loads = 0 })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.match("max_loads")
+    end)
+
+    t.it("rejects fractional count settings", function()
+        local ok, err = mod.validate_opts({ interval = 1, scan_limit = 1.5, limit = 1, max_loads = 1 })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.match("scan_limit")
+    end)
+end)

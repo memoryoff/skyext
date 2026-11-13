@@ -75,6 +75,28 @@ t.describe("critical_maintenance 扫描", function()
         t.expect(coll.calls[1].query[critical.INTENT_FIELD .. ".state"]).to.equal("PREPARED")
     end)
 
+    t.it("rotates prepared intents with a keyset cursor", function()
+        local first = {
+            { rid = 1, [critical.INTENT_FIELD] = { op_id = "srv_a" } },
+            { rid = 2, [critical.INTENT_FIELD] = { op_id = "srv_b" } },
+        }
+        local second = {
+            { rid = 3, [critical.INTENT_FIELD] = { op_id = "srv_c" } },
+        }
+        local coll = fake_coll(first, second)
+
+        local page, err = maintenance.scan_intents(coll, { limit = 2 })
+        t.expect(err).to.be_nil()
+        t.expect(page[2].rid).to.equal(2)
+        t.expect(coll.calls[1].opts.sort[1].rid).to.equal(1)
+
+        local next_page, next_err = maintenance.scan_intents(coll, { limit = 2, cursor = 2 })
+        t.expect(next_err).to.be_nil()
+        -- rid <= 2 的意图已经处理过，下一页必须从 3 开始，否则卡住的角色会反复占位
+        t.expect(coll.calls[2].query["$and"][1].rid["$gt"]).to.equal(2)
+        t.expect(next_page[1].rid).to.equal(3)
+    end)
+
     t.it("ignores documents without a usable intent", function()
         local coll = fake_coll({ { rid = 3, [critical.INTENT_FIELD] = { state = "PREPARED" } } })
         local list = assert(maintenance.scan_intents(coll))
@@ -122,6 +144,28 @@ t.describe("critical_maintenance 单轮", function()
         t.expect(ensured[1].op_id).to.equal("srv_a")
     end)
 
+    t.it("uses scan_limit for both scans and archive_limit for the per-role archive", function()
+        local coll = fake_coll(
+            { { rid = 1, [critical.OPS_OLDEST_FIELD] = 100 } },
+            { { rid = 2, [critical.INTENT_FIELD] = { op_id = "srv_a" } } }
+        )
+        local archive_limit
+        local stats = assert(maintenance.run_once({
+            role_coll = coll,
+            archive = function(_, limit)
+                archive_limit = limit
+                return true, { archived = 0 }
+            end,
+            ensure_job = function()
+                return true
+            end,
+        }, { scan_limit = 1, archive_limit = 7, now = 1000 }))
+        t.expect(stats.intents).to.equal(1)
+        t.expect(coll.calls[1].opts.limit).to.equal(1)
+        t.expect(coll.calls[2].opts.limit).to.equal(1)
+        t.expect(archive_limit).to.equal(7)
+    end)
+
     t.it("counts a failing archive as failed and keeps going", function()
         local coll = fake_coll({ { rid = 1, [critical.OPS_OLDEST_FIELD] = 100 } })
         local stats = assert(maintenance.run_once({
@@ -142,6 +186,41 @@ t.describe("critical_maintenance 单轮", function()
 
     t.it("requires a role collection", function()
         t.expect(maintenance.run_once({}, {})).to.be_nil()
+    end)
+end)
+
+t.describe("critical_maintenance 配置校验", function()
+    t.it("accepts positive integer limits", function()
+        t.expect(maintenance.validate_opts({
+            interval = 1,
+            scan_limit = 1,
+            archive_limit = 1,
+            reconcile_scan = 1,
+            reconcile_lease = 1,
+        })).to
+            .equal(true)
+    end)
+
+    t.it("rejects zero interval and zero limits", function()
+        local ok, err = maintenance.validate_opts({
+            interval = 0,
+            scan_limit = 1,
+            archive_limit = 1,
+            reconcile_scan = 1,
+            reconcile_lease = 1,
+        })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.match("interval")
+
+        ok, err = maintenance.validate_opts({
+            interval = 1,
+            scan_limit = 0,
+            archive_limit = 1,
+            reconcile_scan = 1,
+            reconcile_lease = 1,
+        })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.match("scan_limit")
     end)
 end)
 

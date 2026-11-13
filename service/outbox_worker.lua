@@ -146,6 +146,11 @@ function CMD.start(conf)
     for k, v in pairs(conf or {}) do
         g_opts[k] = v
     end
+    local valid, verr = outbox_worker.validate_opts(g_opts)
+    if not valid then
+        log.error("outbox worker not started, invalid config", "err", verr)
+        return false, verr
+    end
 
     local tc = types.get(g_opts.type_name)
     local colls = { role = mongo_conn.get_collection(tc.db_name, tc.db_coll) }

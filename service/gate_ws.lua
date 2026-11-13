@@ -176,13 +176,21 @@ end
 
 -- 同步 RPC + 受控超时。用 fork 跑真正的 skynet.call，超时只唤醒等待方，
 -- 迟到的结果由 on_late_ack 补偿（登录端可能已经登记了这条连接）。
+--
+-- 超时后不能立刻杀掉 worker：登录端可能只是回包慢，迟到成功仍要补 disconnect。
+-- 但也不能让它无限挂在一个静默黑洞目标上，所以再等一个宽限期后回收协程；
+-- 这期间连接已经由 close_session 关闭，迟到 open 由登录端墓碑拒绝。
+local REAP_GRACE_CS = 100
 local function call_with_timeout(addr, timeout_ms, on_late_ack, ...)
     local co = coroutine.running()
     -- 内层函数不是 vararg，必须先把参数收下来
     local args = table.pack(...)
     local done, timed_out, call_ok, result = false, false, nil, nil
-    skynet.fork(function()
+    local call_done = false
+    local worker
+    worker = skynet.fork(function()
         local pok, pret = pcall(skynet.call, addr, "lua", table.unpack(args, 1, args.n))
+        call_done = true
         if done then
             if pok and on_late_ack then
                 on_late_ack()
@@ -200,6 +208,13 @@ local function call_with_timeout(addr, timeout_ms, on_late_ack, ...)
         end
         done, timed_out = true, true
         skynet.wakeup(co)
+        -- 宽限期给迟到回包留出补偿窗口；超过后 worker 仍阻塞在 yield_call，
+        -- 必须回收，否则每条重连都会留下一个永久挂起的协程
+        skynet.timeout(math.max(centiseconds, REAP_GRACE_CS), function()
+            if not call_done then
+                skynet.killthread(worker)
+            end
+        end)
     end)
     skynet.wait(co)
     if timed_out then

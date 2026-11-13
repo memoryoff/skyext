@@ -19,6 +19,9 @@ local function harness(opts)
             body = body and cjson.decode(body) or nil,
         }
         h.timeouts[#h.timeouts + 1] = httpc.timeout
+        if opts.yield_request then
+            coroutine.yield()
+        end
         if opts.respond then
             local status, res = opts.respond(host, uri, body)
             if not status then
@@ -161,6 +164,34 @@ t.describe("etcd.transport", function()
             local res, err = h.transport.post(cli, "/v3/kv/put", { key = "a" }, 3)
             t.expect(res).to.be_nil()
             t.expect(err).to.match("connect failed")
+            t.expect(h.httpc.timeout).to.equal(1000)
+        end)
+
+        t.it("keeps the strictest timeout while overlapping requests are in flight", function()
+            local h = harness({ yield_request = true })
+            local cli = client(h, "http://127.0.0.1:2379")
+            local a = coroutine.create(function()
+                return h.transport.post(cli, "/v3/kv/put", { key = "a" }, 5)
+            end)
+            local b = coroutine.create(function()
+                return h.transport.post(cli, "/v3/kv/put", { key = "b" }, 2)
+            end)
+            local c = coroutine.create(function()
+                return h.transport.post(cli, "/v3/kv/put", { key = "c" }, 5)
+            end)
+
+            assert(coroutine.resume(a))
+            assert(coroutine.resume(b))
+            -- A 仍在飞，B 的 2s 更严格；C 不能因为 A 结束就沿用旧的 10s 基线
+            assert(coroutine.resume(c))
+            t.expect(h.timeouts[1]).to.equal(500)
+            t.expect(h.timeouts[2]).to.equal(200)
+            t.expect(h.timeouts[3]).to.equal(200)
+
+            assert(coroutine.resume(a))
+            t.expect(h.httpc.timeout).to.equal(200)
+            assert(coroutine.resume(c))
+            assert(coroutine.resume(b))
             t.expect(h.httpc.timeout).to.equal(1000)
         end)
 

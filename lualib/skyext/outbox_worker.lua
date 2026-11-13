@@ -34,6 +34,26 @@ M.DEFAULT_INTERVAL = 5
 -- 可能触发 handoff），不设上限时一次扫描就能把整批离线角色全捞起来
 M.DEFAULT_MAX_LOADS = 8
 
+local function positive_integer(value)
+    return type(value) == "number" and value > 0 and value == math.floor(value)
+end
+
+-- 配置校验放在服务启动门禁里调用。0 在 Lua 中是真值，不能靠 `conf.x or default`
+-- 兜底：scan_limit=0 会让 Mongo 的 limit(0) 变成不限制，batch=0 会让调度器永远
+-- 取不到事件，interval=0 会退化成每个 skynet tick 扫一轮。
+function M.validate_opts(opts)
+    opts = opts or {}
+    if type(opts.interval) ~= "number" or opts.interval <= 0 then
+        return false, "interval must be a positive number"
+    end
+    for _, key in ipairs({ "scan_limit", "limit", "max_loads" }) do
+        if opts[key] ~= nil and not positive_integer(opts[key]) then
+            return false, key .. " must be a positive integer"
+        end
+    end
+    return true
+end
+
 local m_scan = metrics.counter("skyext_outbox_scan_total", "Outbox scan rounds", { "result" })
 local m_pump = metrics.counter("skyext_outbox_pump_total", "Outbox pump outcomes", { "result" })
 local m_age = metrics.histogram(

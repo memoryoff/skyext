@@ -38,6 +38,9 @@ local function harness(type_config)
         ["skyext.critical_maintenance"] = {
             DEFAULT_INTERVAL = 60,
             DEFAULT_SCAN = 32,
+            validate_opts = function()
+                return true
+            end,
         },
         ["skyext.critical_reconciler"] = {
             DEFAULT_SCAN = 16,

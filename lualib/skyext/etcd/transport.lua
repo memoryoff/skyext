@@ -156,13 +156,36 @@ local function prepare(self, opts)
     return { headers = headers, body = body }
 end
 
--- httpc 的超时是模块级变量，只在请求最开始、第一次让出之前读一次，
--- 因此"赋值 → 发请求 → 还原"之间不会被其它协程读到错的值。
+-- httpc 的超时是模块级变量，只在请求最开始、第一次让出之前读一次。
+-- 但模块级变量会被并发请求互相覆盖：A 请求结束时若直接恢复旧值，B 仍在飞行，
+-- 新请求 C 会读到 A 的旧值。这里用活动请求集合把全局值保持在“当前最严格的
+-- 超时”，最后一个请求结束才恢复基线；不改变 httpc 的模块级接口。
+local g_active_timeouts = {}
+local g_timeout_base = httpc.timeout
+
+local function effective_timeout()
+    local value = g_timeout_base
+    for _, active in pairs(g_active_timeouts) do
+        if active < value then
+            value = active
+        end
+    end
+    return value
+end
+
 local function with_timeout(timeout, f, ...)
-    local saved = httpc.timeout
-    httpc.timeout = math.max(1, math.floor(timeout * 100))
+    -- 没有任何活动请求时，以当前全局值为基线；避免其它代码刚改过 httpc.timeout
+    -- 时还沿用模块加载时的旧值
+    if next(g_active_timeouts) == nil then
+        g_timeout_base = httpc.timeout
+    end
+    local token = {}
+    local effective = math.max(1, math.floor(timeout * 100))
+    g_active_timeouts[token] = effective
+    httpc.timeout = effective_timeout()
     local ok, a, b = pcall(f, ...)
-    httpc.timeout = saved
+    g_active_timeouts[token] = nil
+    httpc.timeout = effective_timeout()
     if not ok then
         error(a, 0)
     end

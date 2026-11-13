@@ -434,6 +434,10 @@ function service_mt:get_nodes()
     return nodes
 end
 
+local function service_state(nodes)
+    return (#nodes > 0) and "VERIFIED" or "EMPTY_CONFIRMED"
+end
+
 local function get_service_obj(service)
     local obj = g_map_service[service]
     if not obj then
@@ -478,6 +482,8 @@ function service_mt:init()
         return false
     end
     self.inited = true
+    self.state = service_state(self:get_nodes())
+    self.last_verified_at = os.time()
     skynet.fork(function()
         while true do
             local ok, err = xpcall(self.watch, debug.traceback, self)
@@ -595,6 +601,10 @@ function service_mt:update_revision(revision)
     self.etcd_revision = revision
 
     local nodes = self:get_nodes()
+    if self.inited then
+        self.state = service_state(nodes)
+        self.last_verified_at = os.time()
+    end
     event_channel_api.publish("service_change", self.service, nodes)
 
     log.info("service update_revision", "service", self.service, "revision", revision, "nodes", nodes)

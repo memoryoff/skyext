@@ -290,6 +290,19 @@ t.describe("cluster_discovery service discovery", function()
         })
     end)
 
+    t.it("reports VERIFIED and the verification time after a successful first query", function()
+        local h = harness()
+        h.start()
+        h.replies[ROLE_PREFIX] = readdir_result({
+            kv("/skynet/service/entity:role/rolenode1", { node_revision = 10 }),
+        }, "12")
+
+        local nodes, state, verified_at = h.CMD.query_service("entity:role")
+        t.expect(nodes).to.equal({ "rolenode1" })
+        t.expect(state).to.equal("VERIFIED")
+        t.expect(type(verified_at)).to.equal("number")
+    end)
+
     t.it("answers with an empty list instead of crashing before the first query lands", function()
         -- etcd 在首查时不可用：以前 map_node 还是 nil，query_service 直接炸在 pairs(nil) 上，
         -- 而且 inited 已经置位，之后每次查询都会以同样的方式失败
@@ -374,7 +387,10 @@ t.describe("cluster_discovery service discovery", function()
         local h = harness()
         h.start()
         h.replies[ROLE_PREFIX] = readdir_result(nil, "12")
-        t.expect(h.CMD.query_service("entity:role")).to.equal({})
+        local nodes, state, verified_at = h.CMD.query_service("entity:role")
+        t.expect(nodes).to.equal({})
+        t.expect(state).to.equal("EMPTY_CONFIRMED")
+        t.expect(type(verified_at)).to.equal("number")
         t.expect(h.published[#h.published].nodes).to.equal({})
     end)
 end)

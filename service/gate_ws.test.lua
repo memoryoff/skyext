@@ -19,6 +19,7 @@ local function harness(opts)
         conn_co = {},
         calls = {},
         timers = {},
+        kills = {},
     }
     local noop = function() end
 
@@ -64,6 +65,10 @@ local function harness(opts)
         timeout = function(cs, fn)
             h.timers[#h.timers + 1] = { cs = cs, fn = fn }
             return #h.timers
+        end,
+        killthread = function(thread)
+            h.kills[#h.kills + 1] = thread
+            return thread
         end,
     }, { __index = skynet })
 
@@ -334,6 +339,19 @@ t.describe("gate_ws registration lifecycle", function()
         t.expect(h.CMD.count()).to.equal(0)
         t.expect(h.closes[1]).to.equal({ fd = 9, code = 1011, reason = "register failed" })
         t.expect(h.sent).to.equal({ { LOGIN, "disconnect", h.last_cid } })
+    end)
+
+    t.it("reaps a registration RPC that never answers after the timeout", function()
+        local h = harness({ handshake_timeout_ms = 50 })
+        h.call_block = true
+        h.connect(9)
+        h.fire_timeout()
+        t.expect(h.CMD.state(h.cid(9))).to.equal("CLOSED")
+        -- 宽限期前不杀 worker：给迟到的 open 回来补 disconnect 的机会
+        t.expect(#h.kills).to.equal(0)
+        -- 第二个定时器是宽限期回收：登录端一直不响应时不能永久留下协程
+        h.fire_timeout()
+        t.expect(#h.kills).to.equal(1)
     end)
 
     t.it("compensates a late ACK after the timeout already closed the connection", function()
