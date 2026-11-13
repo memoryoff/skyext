@@ -297,6 +297,8 @@ t.describe("Outbox 回执链路契约", function()
             hash_fn = function()
                 return "h"
             end,
+            -- 构造期要求冷账本；这条用例只验证回执解包，不进 handle
+            ledger = {},
         }))
         receiver:ack_source({ source_type = "role", source_id = 1, event_id = EVENT })
 

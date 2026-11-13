@@ -182,18 +182,21 @@ function CMD.start(conf)
                 return { status = "UNKNOWN", reason = tostring(result) }
             end
             if result.discard == true then
-                -- 意图已确认取消，但内存可能带着 apply 的痕迹。卸载实体让下一次
-                -- 请求从库重读——不这么做，被污染的副本会继续服务到 idle 超时。
-                -- 这一步必须在 resolve 返回之后做：resolve 本身在实体队列里
-                local unloaded, uerr = call_owner(g_opts.type_name, rid, "unload_entity", rid)
-                if not unloaded then
+                -- 意图已确认取消（或已提交），但内存可能带着 apply 的痕迹。
+                -- 卸载实体让下一次请求从库重读——不这么做，被污染的副本会继续服务
+                -- 到 idle 超时，而且隔离态下普通回存是停的。
+                -- 必须走裸命令：entity_call 解析不到 unload_entity，且会重入 gate
+                local called, unloaded, uerr = pcall(router.unload_entity, g_opts.type_name, rid)
+                if not called then
                     log.warn(
                         "critical resolve could not unload the entity",
                         "rid",
                         tostring(rid),
                         "err",
-                        tostring(uerr)
+                        tostring(unloaded)
                     )
+                elseif unloaded ~= true then
+                    log.warn("critical resolve unload was refused", "rid", tostring(rid), "err", tostring(uerr))
                 end
             end
             return result

@@ -41,8 +41,7 @@ local function outbox_receiver()
     local outbox = require "skyext.outbox"
     local crypto = require "crypto"
     -- 冷账本：热账本 7 天后归档，没有它就无法证明同一个 service_op_id 执行过，
-    -- 重投就会二次入账。取不到时 receiver 会在投递阶段 fail-closed，不会静默放行
-    local ledger
+    -- 重投就会二次入账。取不到时构造期就失败，不留一个运行期会静默卡住的 receiver
     local ok_ledger, got = pcall(function()
         local types = require "skyext.entity.types"
         local tc = types.get("role")
@@ -50,10 +49,12 @@ local function outbox_receiver()
             return require("skyext.mongo_conn").get_collection(tc.critical_ledger.db, tc.critical_ledger.coll)
         end
     end)
-    if ok_ledger then
-        ledger = got
+    if not ok_ledger then
+        -- 真正的失败点在下面的构造期 assert；这里只留线索，不刷 error
+        log.warn("outbox receiver ledger lookup failed", "err", tostring(got))
     end
-    -- op_types 必须显式给出：空白名单等于放行任意操作类型
+    local ledger = ok_ledger and got or nil
+    -- 构造期就要求 ledger：缺了是部署错误，应该让节点起不来，而不是运行期静默不投递
     g_outbox_receiver = assert(outbox.new_receiver({
         hash_fn = crypto.hmac_sha256,
         op_types = { "mail.send" },

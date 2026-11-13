@@ -353,6 +353,12 @@ function M.encode_notify(name, param)
 end
 
 function M.call(fd, name, param, session, timeout)
+    -- fd 为 nil 时 pending.fd 也是 nil，后面的"来源连接校验"会被跳过，
+    -- 任意连接都能唤醒这次调用。直接在入口拒绝
+    if fd == nil then
+        log.error("sproto call needs a connection", "name", name)
+        return nil
+    end
     if session == nil then
         log.error("sproto call needs a session id", "name", name, "fd", fd)
         return nil

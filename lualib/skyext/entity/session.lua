@@ -639,8 +639,10 @@ end
 function M.with_request(key, f, req_id, request_name, request_digest)
     -- req_id 直接来自客户端包头，必须限在 u32：会话快照用 `<I4` 编码它，
     -- 超界的值会让 string.pack 抛错（不是返回 nil,err），迁移每次失败、
-    -- 角色被永久钉在本节点。这里是唯一能拦住它的地方
-    if req_id ~= nil and (math.type(req_id) ~= "integer" or req_id < 0 or req_id > 0xFFFFFFFF) then
+    -- 角色被永久钉在本节点。
+    -- 上界取 0xFFFFFFFE 而不是 0xFFFFFFFF：淘汰时会写 `min_cached_req_id = req_id + 1`，
+    -- 留一个值给它，否则淘汰最后一个 id 之后快照编码同样溢出
+    if req_id ~= nil and (math.type(req_id) ~= "integer" or req_id < 0 or req_id > 0xFFFFFFFE) then
         return false, "invalid request id"
     end
     local conn = g_conns[key]

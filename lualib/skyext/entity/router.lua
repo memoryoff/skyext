@@ -32,6 +32,20 @@ function M.call(type_name, entity_id, cmd, ...)
     end
 end
 
+-- 卸载实体（裸服务命令，**不走 entity_call**）。
+--
+-- 恢复任务在"意图已取消、但内存可能被 apply 污染"时用它把实体踢出内存，
+-- 下一次请求从库重读。不能走 entity_call：那会在实体队列里再调 unload，
+-- 重入 gate 直接死锁；而且 `unload_entity` 也不在 FRAMEWORK/handlers 里，
+-- entity_call 会报 "unknown entity command"。
+function M.unload_entity(type_name, entity_id)
+    local node, service_name = get_target(type_name, entity_id)
+    if node == self_node() then
+        return skynet.call(service_name, "lua", "unload_entity", entity_id)
+    end
+    return cluster.call(node, service_name, "unload_entity", entity_id)
+end
+
 -- 只对**已经在内存里**的实体执行，绝不触发加载。
 -- 用于广播、状态查询这类"实体不在就跳过"的路径：触发加载会让一个非关键调用
 -- 抢锁、读库、甚至把别的节点上的实体 handoff 过来，代价和风险都不对等。

@@ -147,6 +147,32 @@ t.describe("charge_order 落单", function()
         t.expect(h.record({ rid = 0 })).to.be_nil()
         t.expect(h.record({ rid = -3 })).to.be_nil()
         t.expect(h.record({ rid = {} })).to.be_nil()
+        -- tonumber 会收 "0x10"(16)、"7e2"(700)、" 7 "；这些不是纯十进制账号
+        t.expect(h.record({ rid = "0x10" })).to.be_nil()
+        t.expect(h.record({ rid = "7e2" })).to.be_nil()
+        t.expect(h.record({ rid = " 7 " })).to.be_nil()
+        -- float 超过 2^53 不能当账号（解析时可能已丢精度，只能靠量级拦）
+        t.expect(h.record({ rid = 1e100 })).to.be_nil()
+    end)
+
+    -- 修复前字符串 rid 被原样落库：读侧不归一会把"重复回调"误判成
+    -- order conflict（409），历史订单既不能被回调救也不能被对账救
+    t.it("treats a legacy string rid in storage as the same account", function()
+        local h = harness()
+        h.orders.store["wechat:ORDER-1"] = {
+            provider = "wechat",
+            order_id = "ORDER-1",
+            rid = "7",
+            amount = 600,
+            currency = "CNY",
+            action = "grant",
+            service_op_id = "srv_x",
+            status = h.charge.STATUS.VERIFIED_RECEIVED,
+        }
+        local order, created = h.record()
+        t.expect(order ~= nil).to.equal(true)
+        t.expect(created).to.equal(false)
+        t.expect(order.rid).to.equal("7")
     end)
 
     -- 重复回调金额/币种/账号不一致：是串单或伪造，不能"以最新一次为准"

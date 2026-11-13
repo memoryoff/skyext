@@ -504,12 +504,15 @@ function M._quarantine_event(ctx, event, critical_table, now, attempts, reason, 
     return nil
 end
 
--- 未到上限：只记一次尝试次数，事件保持 PENDING，本轮停止（保序）
-function M._note_deliver_attempt(ctx, event, critical_table, now, attempts, max_retry)
+-- 未到上限：只记一次尝试次数，事件保持 PENDING，本轮停止（保序）。
+-- field 默认 deliver_attempts；状态 CAS 失败用独立的 cas_attempts 计数，
+-- 不能和"投递失败"混在一个阈值里——那会把已投出去的消息误标成毒事件
+function M._note_deliver_attempt(ctx, event, critical_table, now, attempts, max_retry, field)
+    field = field or "deliver_attempts"
     for _ = 1, max_retry + 1 do
         local state = dbmgr.critical_update(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, ctx.doc._version, {
             ["$set"] = {
-                [M.FIELD .. "." .. event.event_id .. ".deliver_attempts"] = attempts,
+                [M.FIELD .. "." .. event.event_id .. "." .. field] = attempts,
                 [M.FIELD .. "." .. event.event_id .. ".last_attempt_at"] = now,
             },
         }, {
@@ -521,7 +524,7 @@ function M._note_deliver_attempt(ctx, event, critical_table, now, attempts, max_
             local next_table = copy_critical(critical_table)
             local ev = next_table[M.FIELD] and next_table[M.FIELD][event.event_id]
             if type(ev) == "table" then
-                ev.deliver_attempts = attempts
+                ev[field] = attempts
                 ev.last_attempt_at = now
             end
             dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, next_table, ctx.handle)
@@ -662,30 +665,32 @@ function M.pump(ctx, deliver, opts)
                         local refreshed = dbmgr.refresh_critical(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, {
                             handle = ctx.handle,
                         })
+                        if not refreshed then
+                            -- 多数派读失败是环境故障：不计数（A-09 的教训），
+                            -- 但要留痕，否则这类"永远 PENDING"完全不可诊断
+                            log.warn("outbox status CAS retry could not refresh the document", "event", event.event_id)
+                        end
                         if refreshed then
                             local fresh = dbmgr.cached_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id)
                             local current = fresh and fresh[M.FIELD] and fresh[M.FIELD][event.event_id]
                             if type(current) == "table" and current.status == M.STATUS.PENDING then
-                                local attempts = (current.deliver_attempts or 0) + 1
-                                if attempts >= (opts.max_deliver_attempts or M.MAX_DELIVER_ATTEMPTS) then
-                                    local quarantined = M._quarantine_event(
-                                        ctx,
-                                        event,
-                                        fresh,
-                                        now,
-                                        attempts,
-                                        "status CAS kept missing",
-                                        max_retry
+                                local attempts = (current.cas_attempts or 0) + 1
+                                -- **不标 FAILED**：消息已经进可靠队列，接收方可能已经执行。
+                                -- 标"毒事件"会让源端永远不再重投，一旦消息丢了就是永久丢业务。
+                                -- 这里只记独立计数 + 限流日志，交给告警介入
+                                if attempts == 1 or attempts % 10 == 0 then
+                                    log.error(
+                                        "outbox status CAS keeps missing",
+                                        "event",
+                                        event.event_id,
+                                        "attempts",
+                                        attempts
                                     )
-                                    if quarantined then
-                                        critical_table = quarantined
-                                        stats.quarantined = stats.quarantined + 1
-                                    end
-                                else
-                                    local noted = M._note_deliver_attempt(ctx, event, fresh, now, attempts, max_retry)
-                                    if noted then
-                                        critical_table = noted
-                                    end
+                                end
+                                local noted =
+                                    M._note_deliver_attempt(ctx, event, fresh, now, attempts, max_retry, "cas_attempts")
+                                if noted then
+                                    critical_table = noted
                                 end
                             end
                         end
@@ -1031,6 +1036,12 @@ function M.new_receiver(opts)
     end
     if type(opts.op_types) ~= "table" or #opts.op_types == 0 then
         return nil, "op_types must be a non-empty list"
+    end
+    -- 冷账本是"至多一次"的另一半：热条目 7 天后归档，没有它就证明不了
+    -- 同一个 service_op_id 执行过。缺了必须在构造期报错，不能推迟到第一条消息——
+    -- 那时事件已经发出，只能靠 retryable 卡住，运维看不到根因
+    if opts.ledger == nil then
+        return nil, "ledger is required for an outbox receiver"
     end
     local capability = require "skyext.capability"
     local issuer, err = capability.new_issuer(namespace, opts.op_types)

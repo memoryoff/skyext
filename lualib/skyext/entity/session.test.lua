@@ -272,6 +272,9 @@ t.describe("session request gating", function()
 
         t.expect(h.session.with_request(key, function() end, -1)).to.equal(false)
         t.expect(h.session.with_request(key, function() end, 1.5)).to.equal(false)
+        -- 上界是 0xFFFFFFFE：淘汰会写 min_cached_req_id = req_id + 1，
+        -- 留一个值给它，否则淘汰最后一个 id 之后快照编码同样溢出
+        t.expect(h.session.with_request(key, function() end, 0xFFFFFFFF)).to.equal(false)
     end)
 
     t.it("runs the handler inside the entity gate and keeps all of its return values", function()

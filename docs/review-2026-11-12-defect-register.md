@@ -29,12 +29,13 @@
 | 第三轮对抗审查 · 已修 | 11 | C-01 ~ C-11，见 §11 |
 | 第四轮全量对抗审查 · 已修 | 10 | D-01 ~ D-07、D-09、D-14、D-15，见 §12 |
 | 第四轮全量对抗审查 · 待修 | 25 | D-08、D-10 ~ D-13、D-16 ~ D-37，见 §12 |
-| 代码层待修 | 0 | — |
+| 复核 `5bc8073` · 已修 | 8 | RV-01 ~ RV-08，见 §13 |
+| 阻塞生产的 P0 | 0 | 5 条 P0 全部收敛 |
 | 需真实环境验证 | 7 | V-01 / V-06 已实测通过；V-02 ~ V-05 需要多节点与故障注入；V-07 已提供可复跑脚本 |
 | 设计权衡（记录不改） | 4 | 见 §5 |
 | 后续优化 | 3 | P2 类，不阻塞生产验收 |
 
-> **提交基线**：`27ae912`（第十批已提交）。第二轮审计的 B-01 ~ B-06 在工作区，未提交。
+> **提交基线**：`5bc8073`（§12 台账 + 第一批修复）。§13 的复核修正在其后的工作区提交。
 >
 > **口径**：只把「代码改完 + 新增测试通过 + 全量门禁通过」记为已修；
 > 需要真实多节点 / 故障注入的项一律标「待环境」，不写「已验证」。
@@ -685,3 +686,46 @@ P0-1 与 P0-2 是同一个病的两个实例。
 本轮被证实为 **D-03（P0）**。§11.3 第 3 条推测（"`req_id` 超出 u32 会让 export 失败"）
 被证实为 **D-15（P1）**。§11.3 第 4 条（`unresumable` 被 attach 忽略）为 **D-25（P2）**。
 推测项应当在下一轮审查前先做一次可达性验证，而不是等到下一轮才升级。
+
+---
+
+## 13. 对 `5bc8073` 的再审查（复核上一批修复）
+
+> 三个子代理按域复核刚提交的 10 项修复，要求"找修复引入的新问题"并做变异测试。
+> 共报 12 条新问题、8 条未闭合。最严重的一条是 **P0-1 的出口根本派发不到**——
+> 代码写了，但运行时走不通，属于"修复没闭合"。
+
+### 13.1 已修
+
+| 编号 | 级别 | 问题 | 修复 |
+| --- | --- | --- | --- |
+| RV-01 | **P0** | `critical_maintenance` 用 `call_owner(..., "unload_entity", rid)` → 走 `router.call` → `entity_call` → `handler_of`，而 `unload_entity` 只是 `CMD` 裸命令，既不在 `FRAMEWORK` 也不在业务 handlers 里，直接 `error("unknown entity command")`，被 pcall 吞成一条 warn。`DISCARDED` 之后实体不卸载、隔离态普通回存全停，在线角色整段会话零落库 | 新增 `router.unload_entity()` 裸命令通道（仿 `bind_session` 的本地/跨节点分发）；maintenance 改用它。**不能注册进 FRAMEWORK**：`entity_call` 已在实体队列内，再调 unload 会重入 gate 死锁 |
+| RV-02 | P1 | `critical_resolve_intent` 的 COMMITTED 分支不带 `discard`。COMMIT 落库但 ACK 丢失时实体仍隔离，任务写 COMPLETED_COMMITTED 后永远停在隔离态（`refresh_critical` 不清 state，全仓无 `隔离→NORMAL` 迁移） | COMMITTED/BUSINESS_REJECTED 时用 `dbmgr.state_of` 判断，隔离态也返回 `discard=true`；正常态不打扰 |
+| RV-03 | P1 | `abort_intent` 忽略 `mark_discarded` 返回值。失败时库里意图已清、内存意图还在，`scan_intents` 不再按库建任务，该实体永久卡住 | 只有原本隔离态才要求标记成功，失败返回 `UNKNOWN` 让任务重试 |
+| RV-04 | P1 | D-06 位于"`deliver` 已返回 true"的分支内，CAS 连续失败 5 轮会把**已经投出去**的消息标成 FAILED（`failed_reason="status CAS kept missing"`），与 FAILED"消息从未投出"的语义冲突；源端不再重投，消息一旦丢失就是永久丢业务 | 改用独立 `cas_attempts` 计数（`_note_deliver_attempt` 增加 field 参数），**不标 FAILED**，只限流日志 + 告警 |
+| RV-05 | P2 | D-07 用 `ipairs` 校验、调用方用 `#events` 计数；`#[1]=a,[3]=b` 结果不确定，能造出"写 2 条、计数 +3"的永久偏高 | `validate_outbox_events` 先断言键是 `1..n` 的连续正整数（稠密数组），再按 `1..count` 校验 |
+| RV-06 | P2 | D-15 上界取 `0xFFFFFFFF`，淘汰时 `min_cached_req_id = req_id + 1` 变成 `0x100000000`，快照 `string.pack("<I4", ...)` 仍抛 overflow；且 `req_id < min_cached_req_id` 对所有 u32 成立，会话被打成不可用 | 上界改 `0xFFFFFFFE`，给淘汰水位留一个值 |
+| RV-07 | P1 | D-04 只归一入口，历史字符串 `rid` 订单重复回调时 `existing.rid ~= rid` → `order conflict`（409），钱收了奖不发且对账也救不回 | 抽出 `normalize_rid`，读侧比较也归一 |
+| RV-08 | P1 | outbox 缺 ledger 只在运行期 `retryable`，事件永远 pending、无 DLQ、无根因；`new_receiver` 构造成功但业务永久不执行 | `new_receiver` 构造期直接拒绝缺 ledger；示例 handler 的 ledger 查找失败只留 warn，真正的失败点是构造期 `assert` |
+
+**边界加固**（同一批）：
+- `normalize_rid` 字符串只收 `^%d+$`（`tonumber` 会收 `"0x10"`→16、`"7e2"`→700、`" 7 "`）；float 超过 2^53 拒绝
+- `is_intent_abort_shape` 禁止 `_critical_ops_v1.<op>.<子字段>` 多段路径
+- `sproto_api.call` 拒绝 `fd == nil`（否则 `pending.fd` 为 nil，来源连接校验被跳过）
+- outbox 的 CAS 重试在 `refresh_critical` 失败时补一条 warn（原先三条失败子路径零日志）
+
+**测试**：新增/改写 14 条，其中 3 条专门补子代理变异测试指出的覆盖缺口（"refresh 失败不计数""已被别人推进不计数""计数要累加"），2 条验证 `router.unload_entity` 走的是裸命令而非 `entity_call`。
+
+### 13.2 明确取舍（不是缺陷，记录理由）
+
+- **COMMITTED 分支的 discard 会踢在线玩家**：`unload_entity` → `_release_lock` 无 `detach`，会 `_kick_client`。但隔离态下 `save_allowed` 恒 false，不卸载的后果是整段会话零落库、进程一崩全丢。两害相权，掉线重连（数据不丢）优于静默丢数据。
+- **D-06 的 refresh 永久失败仍不计数**：这是环境故障，按 A-09 的既定口径不该计入毒事件阈值。已补日志，但没有把它变成 FAILED。
+- **已丢精度的 float 无法从值上识别**：`9007199254740993.0` 在 Lua 里解析成 `…992.0`，量级检查拦不住。只在量级（>2^53）上拒绝，并在注释说明局限。
+
+### 13.3 复核确认没问题的部分
+
+- `is_intent_abort_shape` 通过后，identity/`_fence`/`_version` 与路径冲突检查**仍然执行**（隔离分支不是 else），`$set` 的 value 是子文档不会被当操作符；业务字段写入被拦。
+- `refresh_critical` 只调 `critical_read`，无 `query` 回环；失败时 `query` 回 UNKNOWN → reconciler 写 RETRY_WAIT，不会被误判成"没执行过"。
+- `deps.archive_cursor` 不满页即归零，不会无限增长；重启从 0 开始只重复扫一轮，幂等。
+- D-06 没有把环境故障误计入阈值：`_advance` 只对 `cas mismatch`/`version mismatch` 走 REJECTED，`server_rejected`/`majority_unavailable`/`lease_expired`/`state_invalid` 全部走 BLOCKED。
+- 生产路径 `call`/`dispatch` 的连接标识都是 `conn_id`，类型一致；文档注明 `M.call` 当前无业务调用者。

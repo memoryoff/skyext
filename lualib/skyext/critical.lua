@@ -213,11 +213,28 @@ local function validate_outbox_events(events)
     if type(events) ~= "table" then
         return nil, "outbox must be a table"
     end
+    -- 必须是连续数组：`#` 对带洞表的结果不确定，而调用方用 `#events` 计数、
+    -- 这里按下标写入。两者口径不一致时，一条畸形输入就能让 pending_count
+    -- 永久偏高（正是"丢分片且计数永不收敛"那条）
+    local count = 0
+    local max_index = 0
+    for k in pairs(events) do
+        if math.type(k) ~= "integer" or k < 1 then
+            return nil, "outbox must be a dense array"
+        end
+        count = count + 1
+        if k > max_index then
+            max_index = k
+        end
+    end
+    if max_index ~= count then
+        return nil, "outbox must be a dense array"
+    end
     -- 批内 event_id 必须唯一：同一次 CAS 里 `$set` 同一路径写两次只留最后一份，
-    -- 而 pending_count 按 #events 计。结果是第二个分片的业务效果永久丢失，
-    -- 计数还比真实事件多，worker 每轮命中该角色永不收敛
+    -- 而 pending_count 按条数计。结果是第二个分片的业务效果永久丢失
     local seen = {}
-    for i, ev in ipairs(events) do
+    for i = 1, count do
+        local ev = events[i]
         if type(ev) ~= "table" then
             return nil, "outbox event #" .. i .. " must be a table"
         end
@@ -1258,8 +1275,17 @@ function M.abort_intent(ctx_or_entity, opts)
     copy[M.OPS_FIELD][intent.op_id] = op_doc
     dbmgr.set_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, copy, ctx.handle)
     -- 隔离态取消意图之后，内存里的普通字段仍可能带着 apply 的痕迹，不能回 NORMAL
-    -- 继续服务。标作废，让 unload 直接丢弃，下一次请求从库重读就是干净状态
-    dbmgr.mark_discarded(ctx.dbname, ctx.dbcoll, ctx.unique_id, ctx.handle)
+    -- 继续服务。标作废，让 unload 直接丢弃，下一次请求从库重读就是干净状态。
+    -- 只有**原本就隔离**的条目才需要标：正常态取消意图后内存仍然可信。
+    -- 标记失败必须报 UNKNOWN 让任务重试——否则库里意图已清、内存意图还在，
+    -- scan_intents 不再按库建任务，这个实体就永远出不去了
+    local state_now = dbmgr.state_of(ctx.dbname, ctx.dbcoll, ctx.unique_id)
+    if state_now == "CRITICAL_QUARANTINED" then
+        local marked = dbmgr.mark_discarded(ctx.dbname, ctx.dbcoll, ctx.unique_id, ctx.handle)
+        if not marked then
+            return "UNKNOWN", "mark_discarded failed"
+        end
+    end
     return "CONFIRMED", { version = detail.version, op_id = intent.op_id }
 end
 

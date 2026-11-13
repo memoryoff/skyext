@@ -519,6 +519,13 @@ t.describe("sproto_api outbound calls", function()
         t.expect(h.api.call(h.fd, "role_ping", {}, nil, 0.01)).to.be_nil()
         t.expect(sent).to.equal(false)
     end)
+
+    -- fd 为 nil 时 pending.fd 也是 nil，"来源连接校验"会被跳过
+    t.it("refuses a call without a connection", function()
+        local h = harness()
+        t.expect(h.api.call(nil, "role_ping", {}, 9, 0.01)).to.be_nil()
+        t.expect(h.api.has_pending(9)).to.equal(false)
+    end)
 end)
 
 -- 响应在 send 期间就回来：此时 skynet.wakeup 还是空操作，必须靠 done 短路

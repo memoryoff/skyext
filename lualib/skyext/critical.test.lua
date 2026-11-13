@@ -114,8 +114,17 @@ local function fake_dbmgr(store)
         return true
     end
 
+    -- 只读观测：abort_intent 用它判断"原本是不是隔离态"，只有隔离态
+    -- 才需要在清意图之后标作废
+    function M.state_of()
+        return store.state
+    end
+
     -- 隔离态取消意图之后标作废：内存可能带着 apply 的痕迹，不能再回 NORMAL
     function M.mark_discarded()
+        if store.mark_discarded_fails then
+            return false, "owner changed"
+        end
         if store.state ~= M.STATE.CRITICAL_QUARANTINED then
             return false, store.state
         end
@@ -809,6 +818,22 @@ t.describe("critical 查询与恢复", function()
         t.expect(h.store.critical._critical_intent_v1).to.be_nil()
     end)
 
+    -- 标记作废失败不能报成功：库里意图已清、内存意图还在，
+    -- scan_intents 不再按库建任务，这个实体就永远出不去了
+    t.it("reports UNKNOWN when a quarantined entry cannot be marked discarded", function()
+        local h = harness()
+        local own = "srv_" .. string.rep("f", 64)
+        h.store.persisted_critical = {
+            _critical_intent_v1 = { op_id = own, op_type = "buy", param_hash = string.rep("a", 64) },
+        }
+        h.store.persisted_version = 1
+        h.store.state = h.dbmgr.STATE.CRITICAL_QUARANTINED
+        h.store.mark_discarded_fails = true
+
+        local state = h.critical.abort_intent(h.entity, { majority_read = true })
+        t.expect(state).to.equal("UNKNOWN")
+    end)
+
     t.it("reports EXPIRED_NOT_EXECUTED only when there is no record", function()
         local h = harness()
         local q = h.critical.query(h.entity, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0002", {
@@ -1459,6 +1484,27 @@ t.describe("critical 源侧 Outbox", function()
         end
 
         local result = internal(h, { outbox = { shard(), shard() } })
+        t.expect(result.status).to.equal(h.critical.STATUS.PRECHECK_REJECTED)
+        t.expect(h.applied).to.equal(0)
+        t.expect(#h.store.updates).to.equal(0)
+    end)
+
+    -- 带洞数组：`#` 对带洞表的结果不确定，而计数与写入都用它。
+    -- 口径不一致时 pending_count 会永久偏高，worker 每轮命中永不收敛
+    t.it("refuses a sparse outbox array", function()
+        local h = harness()
+        local function shard(suffix)
+            return {
+                event_id = "evt_" .. string.rep(suffix, 64),
+                target_type = "role",
+                target_id = 9,
+                op_type = "mail.send",
+                param_hash = string.rep("a", 64),
+                status = "PENDING",
+            }
+        end
+        local sparse = { [1] = shard("1"), [3] = shard("2") }
+        local result = internal(h, { outbox = sparse })
         t.expect(result.status).to.equal(h.critical.STATUS.PRECHECK_REJECTED)
         t.expect(h.applied).to.equal(0)
         t.expect(#h.store.updates).to.equal(0)

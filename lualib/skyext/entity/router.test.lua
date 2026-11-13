@@ -93,6 +93,29 @@ local function harness(opts)
 end
 
 t.describe("entity.router", function()
+    -- 恢复任务用它把"意图已取消、内存可能被 apply 污染"的实体踢出内存。
+    -- 必须走裸服务命令：entity_call 解析不到 unload_entity，而且会在
+    -- 实体队列里重入 gate 直接死锁
+    t.describe("unload_entity", function()
+        t.it("sends a raw unload_entity command instead of entity_call", function()
+            local h = harness()
+            h.router.unload_entity("role", 2)
+            local c = h.calls[1]
+            t.expect(c.tag).to.equal("skynet.call")
+            t.expect(c[3]).to.equal("unload_entity")
+            t.expect(c[4]).to.equal(2)
+        end)
+
+        t.it("uses cluster.call for a remote entity", function()
+            local h = harness()
+            h.router.unload_entity("role", 1)
+            local c = h.calls[1]
+            t.expect(c.tag).to.equal("cluster.call")
+            t.expect(c[3]).to.equal("unload_entity")
+            t.expect(c[4]).to.equal(1)
+        end)
+    end)
+
     t.describe("call", function()
         t.it("本节点的实体直接走 skynet.call", function()
             local h = harness()

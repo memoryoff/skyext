@@ -109,6 +109,31 @@ end
 
 -- 回调验签后落单。返回 order, created；重复回调返回已有订单且 created=false。
 -- 订单号与金额/币种/账号任一不一致都拒绝——那是伪造或串单，不能"以最新一次为准"。
+-- rid 归一：JSON 渠道把商户参数按字符串回传极常见（"7" 而不是 7）。
+-- 读侧也要用同一份归一——修复前字符串 rid 被原样落库，历史订单不归一
+-- 会让"重复回调"被误判成 order conflict（409），钱收了奖不发
+local function normalize_rid(value)
+    if type(value) == "string" then
+        -- 只接受纯十进制：`tonumber` 还会收 "0x10"(16)、"7e2"(700)、
+        -- " 7 " 等，渠道回传这些时账号语义已经被改写
+        if not value:match("^%d+$") then
+            return nil
+        end
+        value = tonumber(value)
+    end
+    if math.type(value) == "float" then
+        -- float 超过 2^53 已经丢精度，再 tointeger 只会得到一个错误的账号
+        if math.abs(value) > 9007199254740992 then
+            return nil
+        end
+        value = math.tointeger(value)
+    end
+    if math.type(value) ~= "integer" then
+        return nil
+    end
+    return value
+end
+
 function M.record(orders_coll, opts)
     if type(orders_coll) ~= "table" then
         return nil, "orders collection is required"
@@ -134,16 +159,10 @@ function M.record(orders_coll, opts)
         return nil, err
     end
     -- rid 必须是正整数。实体路由（placement.calc_node）对非整数直接 error，
-    -- 而 JSON 渠道把商户参数按字符串回传极常见（"7" 而不是 7）。放过去的结果是：
-    -- 订单落单成功、发奖永远抛错、渠道每次重推都 500、对账 query_op 同样抛错 →
-    -- 永远 UNKNOWN，既不 NOT_STARTED 也不 block。钱收了，奖永远不发
-    local rid = opts.rid
-    if type(rid) == "string" then
-        rid = tonumber(rid)
-    end
-    if math.type(rid) ~= "integer" then
-        rid = math.tointeger(rid)
-    end
+    -- 而 JSON 渠道把商户参数按字符串回传极常见。放过去的结果是：订单落单成功、
+    -- 发奖永远抛错、渠道每次重推都 500、对账 query_op 同样抛错 → 永远 UNKNOWN，
+    -- 既不 NOT_STARTED 也不 block。钱收了，奖永远不发
+    local rid = normalize_rid(opts.rid)
     if math.type(rid) ~= "integer" or rid <= 0 then
         return nil, "rid must be a positive integer"
     end
@@ -181,7 +200,11 @@ function M.record(orders_coll, opts)
         -- 是同一笔就按已有订单处理，否则才算冲突
         local existing = orders_coll:find_one({ provider = provider, order_id = order_id })
         if type(existing) == "table" then
-            if existing.amount ~= opts.amount or existing.currency ~= currency or existing.rid ~= rid then
+            if
+                existing.amount ~= opts.amount
+                or existing.currency ~= currency
+                or normalize_rid(existing.rid) ~= rid
+            then
                 return nil, "order conflict"
             end
             return existing, false
@@ -205,7 +228,7 @@ function M.record(orders_coll, opts)
         created = leo.updatedExisting == false
     end
     -- 重复回调必须与首次回调完全一致：金额/币种/账号任一不同都是串单或伪造
-    if order.amount ~= opts.amount or order.currency ~= currency or order.rid ~= rid then
+    if order.amount ~= opts.amount or order.currency ~= currency or normalize_rid(order.rid) ~= rid then
         log.error(
             "charge order conflict",
             "provider",

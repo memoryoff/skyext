@@ -46,12 +46,20 @@ local function fake_dbmgr(store)
         return true
     end
     function M.refresh_critical()
+        if store.refresh_fails then
+            return nil, store.refresh_fails
+        end
         store.refreshed = (store.refreshed or 0) + 1
         -- 多数派读会把内存版本对齐到库里的真实值（store.db_version 模拟"库里更高"）
         if store.db_version then
             while store.doc._version < store.db_version do
                 local current = store.doc._version
                 assert(orm.advance_persisted_version(store.doc, current, current + 1))
+            end
+        end
+        if store.advanced_status then
+            for _, ev in pairs(store.critical._critical_outbox_v1 or {}) do
+                ev.status = store.advanced_status
             end
         end
         return true, store.doc._version
@@ -334,9 +342,50 @@ t.describe("outbox 投递", function()
         end, { now = 100 }))
         t.expect(stats.failed).to.equal(1)
         t.expect(h.store.critical._critical_outbox_v1[EVENT].status).to.equal("PENDING")
-        -- 多数派读对齐版本之后记下尝试次数，下一轮才有机会走到阈值
-        t.expect(h.store.critical._critical_outbox_v1[EVENT].deliver_attempts).to.equal(1)
+        -- 多数派读对齐版本之后记下尝试次数，下一轮才有机会走到阈值。
+        -- 用独立的 cas_attempts：投递本身已经成功，不能污染 deliver_attempts 的毒事件阈值
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].cas_attempts).to.equal(1)
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].deliver_attempts).to.be_nil()
         t.expect((h.store.refreshed or 0) >= 1).to.equal(true)
+    end)
+
+    -- 下面三条盯的是新增分支的保护条件：改坏了不会有任何其它用例变红
+    t.it("does not count a CAS retry when the majority read fails", function()
+        local h = harness()
+        h.seed({ assert(h.event()) })
+        h.store.db_version = 3
+        h.store.refresh_fails = "socket closed"
+        assert(h.outbox.pump(h.ctx, function()
+            return true
+        end, { now = 100 }))
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].cas_attempts).to.be_nil()
+    end)
+
+    t.it("does not count a CAS retry when another writer already advanced the event", function()
+        local h = harness()
+        h.seed({ assert(h.event()) })
+        h.store.db_version = 3
+        h.store.advanced_status = "ENQUEUED"
+        assert(h.outbox.pump(h.ctx, function()
+            return true
+        end, { now = 100 }))
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].cas_attempts).to.be_nil()
+    end)
+
+    t.it("accumulates cas_attempts across rounds", function()
+        local h = harness()
+        h.seed({ assert(h.event()) })
+        h.store.db_version = 3
+        assert(h.outbox.pump(h.ctx, function()
+            return true
+        end, { now = 100 }))
+        h.store.db_version = h.doc._version + 1
+        assert(h.outbox.pump(h.ctx, function()
+            return true
+        end, { now = 101 }))
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].cas_attempts).to.equal(2)
+        -- 独立计数不能污染毒事件阈值
+        t.expect(h.store.critical._critical_outbox_v1[EVENT].deliver_attempts).to.be_nil()
     end)
 
     t.it("treats a raising deliver function as an unconfirmed delivery", function()
@@ -531,14 +580,13 @@ t.describe("outbox 接收方", function()
         t.expect(h.holder.calls[1].opts.ledger).to.equal(h.ledger)
     end)
 
-    -- 没配冷账本是部署错误：拒绝处理（retryable），不能放行
-    t.it("refuses to execute without a cold ledger", function()
+    -- 缺冷账本是部署错误：构造期就拒绝，不能推迟到第一条消息才卡住
+    t.it("refuses to build a receiver without a cold ledger", function()
         local h = receiver_harness()
-        local bare = assert(h.outbox.new_receiver({ hash_fn = fake_hash(), op_types = { "mail.send" } }))
-        local result = bare:handle(h.entity, h.envelope(), {})
-        t.expect(require("skyext.entity.delivery").is_retryable(result)).to.equal(true)
+        local receiver, err = h.outbox.new_receiver({ hash_fn = fake_hash(), op_types = { "mail.send" } })
+        t.expect(receiver).to.be_nil()
+        t.expect(err).to.equal("ledger is required for an outbox receiver")
         t.expect(#h.holder.calls).to.equal(0)
-        t.expect(#h.acks).to.equal(0)
     end)
 
     t.it("issues a capability and runs the internal commit kernel", function()

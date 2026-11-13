@@ -703,6 +703,11 @@ local function is_intent_abort_shape(update)
         if type(path) ~= "string" or path:sub(1, #prefix) ~= prefix then
             return false
         end
+        -- 只准 `_critical_ops_v1.<op_id>` 一整条记录，不许再往里写子字段
+        local op_id = path:sub(#prefix + 1)
+        if op_id == "" or op_id:find("%.") then
+            return false
+        end
         if type(value) ~= "table" then
             return false
         end

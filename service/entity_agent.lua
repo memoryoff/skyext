@@ -382,6 +382,13 @@ FRAMEWORK.critical_resolve_intent = function(entity, op_id)
 
     local proof = critical.query(entity, op_id, { now = os.time(), ledger = ledger, majority_read = true })
     if proof.status == "COMMITTED" or proof.status == "BUSINESS_REJECTED" then
+        -- 已提交，但实体可能还停在隔离态（COMMIT 落库、ACK 丢失那条路径）。
+        -- 隔离态下普通回存是停的，不卸载的话这个角色会一直零落库。
+        -- 正常态不打扰：内存就是权威副本，没必要为一次查询把在线玩家踢下线
+        local state = require("skyext.dbmgr").state_of(type_config.db_name, type_config.db_coll, entity.id)
+        if state == "CRITICAL_QUARANTINED" then
+            return { status = "COMMITTED", discard = true }
+        end
         return { status = "COMMITTED" }
     end
     if proof.status == "IN_PROGRESS" then

@@ -1254,6 +1254,12 @@ t.describe("dbmgr 关键状态机", function()
             .equal("REJECTED")
         -- 不带开关时，连意图取消也不许
         t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, abort_update)).to.equal("REJECTED")
+        -- 只准整条 op 记录，不许往里写子字段（会让下次 load 提取失败）
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, {
+            ["$set"] = { ["_critical_ops_v1.op_a.nested"] = { status = "ABORTED" } },
+            ["$unset"] = { _critical_intent_v1 = true },
+        }, { allow_quarantined_intent_abort = true })).to
+            .equal("REJECTED")
         -- 正确形状放行
         local state = h.db.critical_update("demo", "role", "rid", 7, 0, abort_update, {
             allow_quarantined_intent_abort = true,
