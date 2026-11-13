@@ -78,9 +78,17 @@ local function harness(opts)
             -- majority 关键写入走 runCommand
             database = {
                 runCommand = function(_, ...)
-                    h.last = { op = "runCommand", coll = coll_name, args = table.pack(...) }
+                    local args = table.pack(...)
+                    h.last = { op = "runCommand", coll = coll_name, args = args }
+                    h.commands = h.commands or {}
+                    h.commands[#h.commands + 1] = { coll = coll_name, args = args }
                     if h.run_command_error then
                         error(h.run_command_error)
+                    end
+                    -- 按命令名分别回包：探针一轮里要 insert / find / delete 三种结果
+                    local by_cmd = h.run_command_results
+                    if by_cmd and by_cmd[args[1]] ~= nil then
+                        return by_cmd[args[1]]
                     end
                     return h.run_command_result
                 end,
@@ -408,12 +416,76 @@ t.describe("mongo_conn 关键写入", function()
         t.expect(h.last.args[h.last.args.n]).to.equal({ w = "majority", j = true })
     end)
 
-    t.it("critical_probe reports a reachable connection", function()
-        local h = with_result({ ok = 1 })
+    -- 只发 hello 是假探针：secondary 也能应答 hello。这里必须真的写一次、
+    -- 多数派读回、再清理，而且绝不能写进玩家角色集合
+    t.it("critical_probe writes, reads back and cleans up with majority", function()
+        local h = started()
+        h.run_command_results = {
+            insert = { ok = 1, n = 1 },
+            find = { ok = 1, cursor = { firstBatch = { { _id = "probe" } } } },
+            delete = { ok = 1, n = 1 },
+        }
         t.expect(h.CMD.critical_probe("role")).to.equal(true)
-        h.run_command_result = { ok = 0, errmsg = "unauthorized" }
+
+        local names = {}
+        for _, call in ipairs(h.commands) do
+            names[#names + 1] = call.args[1]
+        end
+        t.expect(names).to.equal({ "insert", "find", "delete" })
+
+        local insert = h.commands[1].args
+        t.expect(insert[2]).to.equal("skyext_health_probe")
+        t.expect(insert[2] == "role").to.equal(false)
+        t.expect(insert[3]).to.equal("documents")
+        t.expect(type(insert[4][1]._id)).to.equal("string")
+        t.expect(insert[insert.n - 1]).to.equal("writeConcern")
+        t.expect(insert[insert.n]).to.equal({ w = "majority", j = true })
+
+        local find = h.commands[2].args
+        t.expect(find[2]).to.equal("skyext_health_probe")
+        t.expect(find[find.n - 1]).to.equal("readConcern")
+        t.expect(find[find.n]).to.equal({ level = "majority" })
+
+        local delete = h.commands[3].args
+        t.expect(delete[2]).to.equal("skyext_health_probe")
+        t.expect(delete[delete.n - 1]).to.equal("writeConcern")
+        t.expect(delete[delete.n]).to.equal({ w = "majority", j = true })
+    end)
+
+    t.it("critical_probe refuses to report health when any leg is unconfirmed", function()
+        -- 写没确认：UNKNOWN 也不能算健康
+        local h = started()
+        h.run_command_results = {
+            insert = { ok = 1, writeConcernError = { errmsg = "not majority" } },
+        }
         local ok, err = h.CMD.critical_probe("role")
         t.expect(ok).to.be_nil()
-        t.expect(err).to.equal("unauthorized")
+        t.expect(err).to.match("majority write not confirmed")
+
+        -- 写确认了但读不到：读关注没生效
+        h.run_command_results = {
+            insert = { ok = 1, n = 1 },
+            find = { ok = 1, cursor = { firstBatch = {} } },
+        }
+        ok, err = h.CMD.critical_probe("role")
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.match("not visible to a majority read")
+
+        -- 清理失败不能当成功：否则每跑一次留一条垃圾
+        h.run_command_results = {
+            insert = { ok = 1, n = 1 },
+            find = { ok = 1, cursor = { firstBatch = { { _id = "probe" } } } },
+            delete = { ok = 0, errmsg = "unauthorized" },
+        }
+        ok, err = h.CMD.critical_probe("role")
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.match("cleanup not confirmed")
+        t.expect(logged(h, "critical probe cleanup not confirmed")).to.equal(true)
+
+        -- 命令通道直接抛错
+        h.run_command_error = "socket closed"
+        ok, err = h.CMD.critical_probe("role")
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.match("probe insert raised")
     end)
 end)

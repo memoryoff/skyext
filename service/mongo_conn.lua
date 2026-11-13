@@ -203,15 +203,67 @@ function CMD.critical_find(coll, query, projection)
     return batch and batch[1] or nil
 end
 
--- 探针：确认这个连接确实能走 majority 写。返回 true 或 nil, err
+-- 探针：确认这个连接**真的能走 majority 写**。返回 true 或 nil, err
+--
+-- 为什么不能只发 hello：secondary 也能正常应答 hello，而关键经济操作要的是
+-- "多数派确认 + journal 落盘"。一个 hello 通过的连接完全可能在 w:majority 上
+-- 超时（副本数不够、journal 不可用、连接其实挂在 secondary 上）。
+-- 所以这里做一次真实的写入 → 多数派读回 → 清理。
+--
+-- 写的是独立集合，**绝不往玩家角色集合里插测试记录**：探针会随运维手动执行，
+-- 把垃圾写进 role 集合迟早被当成真实存档读出来。
+local PROBE_COLLECTION = "skyext_health_probe"
+
+local function probe_id()
+    return string.format("probe:%s:%s:%d:%d", tostring(g_name), tostring(g_index), os.time(), math.random(1, 1000000))
+end
+
 function CMD.critical_probe(coll)
-    local col_obj = g_db[coll]
-    local called, r = run_command(col_obj, "hello")
+    local probe_coll = g_db[PROBE_COLLECTION]
+    local id = probe_id()
+
+    local called, r = run_command(
+        probe_coll,
+        "insert",
+        PROBE_COLLECTION,
+        "documents",
+        { { _id = id, at = os.time() } },
+        "writeConcern",
+        MAJORITY_WRITE_CONCERN
+    )
     if not called then
-        return nil, r
+        return nil, "probe insert raised: " .. tostring(r)
     end
-    if type(r) ~= "table" or r.ok ~= 1 then
-        return nil, (type(r) == "table" and r.errmsg) or r or "no reply"
+    local state, err = classify_write(r)
+    if state ~= "CONFIRMED" then
+        -- UNKNOWN 同样不能算健康：探针存在的意义就是不接受"可能写了"
+        return nil, string.format("probe majority write not confirmed (%s): %s", state, tostring(err))
+    end
+
+    -- 多数派读回：写入确认了但对读不可见，说明读关注没生效
+    local doc, read_err = CMD.critical_find(PROBE_COLLECTION, { _id = id }, { _id = true })
+    if not doc then
+        return nil, "probe document not visible to a majority read: " .. tostring(read_err or "not found")
+    end
+
+    -- 清理失败不能让探针报健康：每跑一次留一条垃圾，最终会把告警淹没
+    local del_called, del = run_command(
+        probe_coll,
+        "delete",
+        PROBE_COLLECTION,
+        "deletes",
+        { { q = { _id = id }, limit = 1 } },
+        "writeConcern",
+        MAJORITY_WRITE_CONCERN
+    )
+    if not del_called then
+        log.error("critical probe cleanup raised", "coll", coll, "id", id, "err", tostring(del))
+        return nil, "probe cleanup raised: " .. tostring(del)
+    end
+    local del_state, del_err = classify_write(del)
+    if del_state ~= "CONFIRMED" then
+        log.error("critical probe cleanup not confirmed", "coll", coll, "id", id, "state", del_state)
+        return nil, string.format("probe cleanup not confirmed (%s): %s", del_state, tostring(del_err))
     end
     return true
 end

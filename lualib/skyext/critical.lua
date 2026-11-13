@@ -36,9 +36,11 @@ M.STATUS = {
     OP_CONFLICT = "OP_CONFLICT",
     EXPIRED = "EXPIRED",
     INTERNAL_AUTH_DENIED = "INTERNAL_AUTH_DENIED",
-    -- 纯读预检（validate）自身抛错：**没有**进入 PREPARE，也没有任何持久化写入。
+    -- 确定**零写入**的内部/环境故障：纯读预检（validate）抛错，或 PREPARE 被拒
+    -- （版本/CAS/fence/租约不符、更新非法、多数派通道缺失）。
     -- 不能复用 UNKNOWN —— 那是"可能写了"，会触发隔离与恢复任务，而查询侧只会看到
-    -- NOT_STARTED，调用方拿到的两个答案互相矛盾
+    -- NOT_STARTED，调用方拿到的两个答案互相矛盾。允许受控重试。
+    -- 缓存是否一并隔离由拒绝原因决定：内存已不是库的副本时必须隔离（见 PREPARE_STALE_CODES）
     INTERNAL_ERROR = "INTERNAL_ERROR",
     UNKNOWN = "UNKNOWN",
     -- 只出现在 query 结果里
@@ -427,6 +429,21 @@ local function fence_of(ctx)
     return ctx.handle and ctx.handle.fence or nil
 end
 
+-- dbmgr 的原因码（测试桩可能不带，按空表处理：缺省时一律当作"缓存仍可信"，
+-- 也就是退回加白名单之前的处置方式，不会凭空隔离玩家）
+local REASON = dbmgr.REASON or {}
+
+-- PREPARE 被拒时，哪些原因说明**缓存已经不是库的副本**。
+-- 这几类继续用旧缓存回存只会每轮 CAS 失败刷日志，玩家读到的也是过期数据；
+-- 必须隔离，等实体重载后再重试。格式/配置类拒绝（更新非法、多数派通道缺失）
+-- 不影响缓存可信度，回到 NORMAL 即可。
+local PREPARE_STALE_CODES = {
+    [REASON.VERSION_MISMATCH] = true,
+    [REASON.CAS_MISMATCH] = true,
+    [REASON.LEASE_EXPIRED] = true,
+    [REASON.STATE_INVALID] = true,
+}
+
 -- 返回 decision。req:
 --   op_id / op_type / param_hash / source_namespace / source_id / params / response_meta
 local function commit_core(ctx, req, handlers)
@@ -712,7 +729,7 @@ local function commit_core(ctx, req, handlers)
             prepared_at = req.now,
             state = "PREPARED",
         }
-        local state, detail = dbmgr.critical_update(
+        local state, detail, code = dbmgr.critical_update(
             ctx.dbname,
             ctx.dbcoll,
             ctx.key,
@@ -729,8 +746,34 @@ local function commit_core(ctx, req, handlers)
                     recovery_id = req.op_id,
                 })
             end
-            dbmgr.end_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, ctx.handle, true)
-            return decision(M.STATUS.UNKNOWN, nil, M.NO_CACHE, { reason = "prepare rejected: " .. tostring(detail) })
+            -- 到这里**确定没有写入**：返回 UNKNOWN 会让调用方去查恢复任务、隔离缓存，
+            -- 而 critical.query 只会回 NOT_STARTED，两个答案互相矛盾。
+            -- 但"没写"不等于"缓存还能用"：版本/CAS/fence/租约类拒绝说明内存已经
+            -- 不是库的副本，继续回存只会每轮失败并把过期数据喂给玩家 —— 隔离等重载。
+            --
+            -- owner_changed 例外：条目已经归新的 owner，旧 handle 连改状态的资格都没有，
+            -- 这里什么都不做（也不去碰 end_critical）
+            if code ~= REASON.OWNER_CHANGED then
+                if PREPARE_STALE_CODES[code] then
+                    dbmgr.end_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, ctx.handle, false)
+                    m_quarantined:inc(1, { reason = "prepare_" .. tostring(code) })
+                    log.error(
+                        "critical prepare rejected with a stale cache, quarantining",
+                        "op_id",
+                        req.op_id,
+                        "code",
+                        tostring(code),
+                        "detail",
+                        tostring(detail)
+                    )
+                else
+                    -- 格式/配置类拒绝：缓存仍然可信，回到 NORMAL 才能继续普通回存
+                    dbmgr.end_critical(ctx.dbname, ctx.dbcoll, ctx.unique_id, ctx.handle, true)
+                end
+            end
+            return decision(M.STATUS.INTERNAL_ERROR, nil, M.NO_CACHE, {
+                reason = "prepare rejected: " .. tostring(code or detail),
+            })
         end
         critical = copy_critical(critical)
         critical[M.INTENT_FIELD] = intent_doc
@@ -922,6 +965,11 @@ function M.execute_client(entity, grant_fields, seq, op_type, params, handlers, 
     end
     if type(opts.hmac_fn) ~= "function" then
         return decision(M.STATUS.INTERNAL_AUTH_DENIED, nil, M.NO_CACHE, { reason = "hmac_fn is required" })
+    end
+    -- 漏传 equal_fn 会让 grant.verify 静默退回 `==`：mac 比较变成非常量时间，
+    -- 而且违反模块自己写的使用约定。这种接线错误必须在入口就炸掉，不能靠注释提醒
+    if type(opts.equal_fn) ~= "function" then
+        return decision(M.STATUS.INTERNAL_AUTH_DENIED, nil, M.NO_CACHE, { reason = "equal_fn is required" })
     end
     local ok, err = grant.verify(grant_fields, grant_fields.mac, opts.hmac_fn, opts.equal_fn)
     if not ok then

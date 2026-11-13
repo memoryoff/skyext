@@ -48,6 +48,21 @@ local function fake_dbmgr(store)
         CRITICAL_QUARANTINED = "CRITICAL_QUARANTINED",
         DISCARDED = "DISCARDED",
     }
+    -- 与真实 dbmgr 的 M.REASON 同名：critical 靠 code 决定要不要隔离缓存，
+    -- 桩只回两个值会让那条分支永远测不到
+    M.REASON = {
+        INVALID_UPDATE = "invalid_update",
+        NOT_CACHED = "not_cached",
+        OWNER_CHANGED = "owner_changed",
+        STATE_INVALID = "state_invalid",
+        VERSION_MISMATCH = "version_mismatch",
+        CAS_MISMATCH = "cas_mismatch",
+        LEASE_EXPIRED = "lease_expired",
+        MAJORITY_UNAVAILABLE = "majority_unavailable",
+        SERVER_REJECTED = "server_rejected",
+        UNKNOWN = "unknown",
+        MEMORY_DIVERGED = "memory_diverged",
+    }
     store.updates = {}
     store.state = M.STATE.NORMAL
 
@@ -89,18 +104,18 @@ local function fake_dbmgr(store)
         store.updates[#store.updates + 1] = { expected = expected, update = update, handle = opts and opts.handle }
         local n = #store.updates
         if store.state == M.STATE.CRITICAL_QUARANTINED then
-            return "REJECTED", "CRITICAL_QUARANTINED"
+            return "REJECTED", "CRITICAL_QUARANTINED", M.REASON.STATE_INVALID
         end
         -- unknown_at / reject_at 只让第 N 次写入失败，用来单独覆盖 PREPARE 与 COMMIT 两条路径
         if store.unknown and (store.unknown_at == nil or store.unknown_at == n) then
             store.state = M.STATE.CRITICAL_QUARANTINED
-            return "UNKNOWN", store.unknown
+            return "UNKNOWN", store.unknown, M.REASON.UNKNOWN
         end
         if store.reject and (store.reject_at == nil or store.reject_at == n) then
-            return "REJECTED", "cas mismatch"
+            return "REJECTED", "cas mismatch", store.reject_code or M.REASON.CAS_MISMATCH
         end
         if store.doc._version ~= expected then
-            return "REJECTED", "version mismatch"
+            return "REJECTED", "version mismatch", M.REASON.VERSION_MISMATCH
         end
         local next_version = expected + 1
         assert(orm.advance_persisted_version(store.doc, expected, next_version))
@@ -248,6 +263,31 @@ t.describe("critical 客户端入口", function()
         t.expect(#h.store.updates).to.equal(0)
         t.expect(h.applied).to.equal(0)
         t.expect(h.store.state).to.equal("NORMAL")
+    end)
+
+    -- 漏传 equal_fn 时 grant.verify 会静默退回 `==`。这种接线错误必须当场拒绝，
+    -- 否则生产环境就在用非常量时间比较验签，而且没有任何信号
+    t.it("refuses a client call without a constant-time comparator", function()
+        local h = harness()
+        local result = h.critical.execute_client(h.entity, h.new_grant(), 1, "shop.buy", { amount = 1 }, h.handlers(), {
+            hmac_fn = HASH,
+            hash_fn = HASH,
+            now = h.now,
+        })
+        t.expect(result.status).to.equal(h.critical.STATUS.INTERNAL_AUTH_DENIED)
+        t.expect(result.reason).to.equal("equal_fn is required")
+        t.expect(#h.store.updates).to.equal(0)
+        t.expect(h.applied).to.equal(0)
+
+        -- 传了但不是函数（拼错字段之类）同样拒绝，不能降级
+        local wrong = h.critical.execute_client(h.entity, h.new_grant(), 1, "shop.buy", { amount = 1 }, h.handlers(), {
+            hmac_fn = HASH,
+            hash_fn = HASH,
+            equal_fn = true,
+            now = h.now,
+        })
+        t.expect(wrong.status).to.equal(h.critical.STATUS.INTERNAL_AUTH_DENIED)
+        t.expect(#h.store.updates).to.equal(0)
     end)
 
     t.it("refuses a seq beyond the grant range and a tampered mac", function()
@@ -425,6 +465,42 @@ t.describe("critical 客户端入口", function()
         t.expect(h.store.state).to.equal("CRITICAL_QUARANTINED")
         -- 预检过了，但 apply 绝不能执行
         t.expect(h.applied).to.equal(0)
+    end)
+
+    -- PREPARE 被拒是**确定没写**，不能报 UNKNOWN（那会让调用方去找恢复任务，
+    -- 而 critical.query 只会回 NOT_STARTED）。但缓存是否还可信要看原因码
+    t.it("quarantines the stale cache when the prepare CAS misses", function()
+        local h = harness()
+        h.store.reject = "cas mismatch"
+        h.store.reject_at = 1
+        local result = h.client(1)
+        t.expect(result.status).to.equal(h.critical.STATUS.INTERNAL_ERROR)
+        t.expect(result.cache_policy).to.equal(h.critical.NO_CACHE)
+        t.expect(result.recovery_id).to.be_nil()
+        t.expect(h.store.state).to.equal("CRITICAL_QUARANTINED")
+        t.expect(h.applied).to.equal(0)
+    end)
+
+    t.it("keeps the cache writable when the prepare rejection is not about staleness", function()
+        local h = harness()
+        h.store.reject = "unsupported update operator"
+        h.store.reject_code = h.dbmgr.REASON.INVALID_UPDATE
+        h.store.reject_at = 1
+        local result = h.client(1)
+        t.expect(result.status).to.equal(h.critical.STATUS.INTERNAL_ERROR)
+        -- 格式错不代表内存过期：隔离它只会让玩家多一次无谓重载
+        t.expect(h.store.state).to.equal("NORMAL")
+    end)
+
+    t.it("leaves a cache owned by another handle untouched", function()
+        local h = harness()
+        h.store.reject = "owner changed"
+        h.store.reject_code = h.dbmgr.REASON.OWNER_CHANGED
+        h.store.reject_at = 1
+        local result = h.client(1)
+        t.expect(result.status).to.equal(h.critical.STATUS.INTERNAL_ERROR)
+        -- 条目已经归新 owner，旧 handle 连"改成隔离"的资格都没有
+        t.expect(h.store.state).to.equal("PREPARING")
     end)
 
     t.it("quarantines when apply raises and never sends the commit", function()

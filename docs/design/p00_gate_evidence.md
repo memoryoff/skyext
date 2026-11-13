@@ -16,8 +16,8 @@
 
 门禁结论：**P00-A、P00-B、P00-D 通过；P00-C 的协议级/调度级合同通过，真实网络 WS 回环
 留待 P02 的集成环境执行**（见 §3 的边界说明）。`extract_critical_fields` 与
-`advance_persisted_version` 目前是已冻结、已验证但**尚未接入生产加载/保存路径**的接口，
-接线属于 P07。
+`advance_persisted_version` 已接入生产路径（P07）：`dbmgr.load` 在 `orm.decode` 之前调用
+`extract`，`dbmgr.critical_update` 用 `advance_persisted_version` 推进内存版本（见 §2 末的边界说明）。
 
 ## 1. P00-A：Sproto 解码 + 规范化 + HMAC
 

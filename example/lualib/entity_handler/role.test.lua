@@ -102,3 +102,47 @@ t.describe("role outbox receiver", function()
         t.expect(#h.errors).to.equal(1)
     end)
 end)
+
+-- 支付发奖：框架的 charge_grant 需要游戏层给出真实的资产效果。
+-- 这组用例盯的是 critical 的 handler 契约：validate 纯读、apply 只改内存。
+t.describe("role 充值发奖 handler", function()
+    local function entity_with_bag()
+        local bag = { items = {} }
+        function bag:add_item(res_type, res_id, count)
+            self.items[#self.items + 1] = { res_type = res_type, res_id = res_id, count = count }
+        end
+        return { id = 7, data = { modules = {} }, modules = { bag = bag } }, bag
+    end
+
+    t.it("adds the converted amount to the bag on apply", function()
+        local h = harness()
+        local entity, bag = entity_with_bag()
+        local handlers = h.handler.charge_handlers(entity, { order_id = "o-1" })
+        t.expect(handlers.validate(entity, { amount = 100, currency = "CNY" })).to.equal(true)
+        -- validate 必须纯读：跑完 validate 背包还是空的
+        t.expect(#bag.items).to.equal(0)
+        t.expect(handlers.apply(entity, { amount = 100, currency = "CNY" })).to.equal(true)
+        t.expect(bag.items[1]).to.equal({ res_type = 1, res_id = 1, count = 10000 })
+    end)
+
+    t.it("rejects an unsupported currency or a non-positive amount before touching memory", function()
+        local h = harness()
+        local entity, bag = entity_with_bag()
+        local handlers = h.handler.charge_handlers(entity, {})
+        t.expect(handlers.validate(entity, { amount = 100, currency = "USD" })).to.equal(false)
+        t.expect(handlers.validate(entity, { amount = 0, currency = "CNY" })).to.equal(false)
+        t.expect(handlers.validate(entity, { amount = -1, currency = "CNY" })).to.equal(false)
+        -- 整值浮点（JSON/BSON 往返常见）必须按整数收下，不能被当成非法
+        t.expect(handlers.validate(entity, { amount = 100.0, currency = "CNY" })).to.equal(true)
+        t.expect(#bag.items).to.equal(0)
+    end)
+
+    t.it("refuses to apply when the bag module is missing", function()
+        local h = harness()
+        local entity = { id = 7, modules = {}, data = { modules = {} } }
+        local handlers = h.handler.charge_handlers(entity, {})
+        t.expect(handlers.validate(entity, { amount = 100, currency = "CNY" })).to.equal(false)
+        -- apply 不依赖 validate 的结果：绕过校验直接调也不能静默发 0 个
+        t.expect(handlers.apply(entity, { amount = 100, currency = "XXX" })).to.equal(false)
+    end)
+end)

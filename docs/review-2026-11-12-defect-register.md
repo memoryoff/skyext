@@ -24,13 +24,14 @@
 | 分类 | 数量 | 说明 |
 | --- | --- | --- |
 | 已修复并验证（第五 ~ 九批） | 22 | F-01 ~ F-10、R-01 ~ R-12 |
-| 对抗审查发现 · 已修 | 14 | A-01 ~ A-14，见 §8 / §9 |
+| 对抗审查发现 · 已修 | 14 | A-01 ~ A-14，见 §8 |
+| 第二轮源码审计 · 已修 | 6 | B-01 ~ B-06（DB Fence / Critical Commit），见 §10 |
 | 代码层待修 | 0 | — |
 | 需真实环境验证 | 7 | V-01 / V-06 已实测通过；V-02 ~ V-05 需要多节点与故障注入；V-07 已提供可复跑脚本 |
 | 设计权衡（记录不改） | 4 | 见 §5 |
 | 后续优化 | 3 | P2 类，不阻塞生产验收 |
 
-> **提交基线**：`bf0abf4`（第九批）。第十批（A-07 ~ A-14）在工作区，未提交。
+> **提交基线**：`27ae912`（第十批已提交）。第二轮审计的 B-01 ~ B-06 在工作区，未提交。
 >
 > **口径**：只把「代码改完 + 新增测试通过 + 全量门禁通过」记为已修；
 > 需要真实多节点 / 故障注入的项一律标「待环境」，不写「已验证」。
@@ -293,7 +294,7 @@
 
 ## 7. 建议修复顺序
 
-1. **代码层已无待修项**：R-01 ~ R-12、A-01 ~ A-14 全部收敛，
+1. **代码层已无待修项**：R-01 ~ R-12、A-01 ~ A-14、B-01 ~ B-06 全部收敛，
    `./bin/skyext test` 124 files / 124 passed。
 2. **真实环境验证**（不是代码缺陷，不能由单测替代）：
    - V-01 副本集 stepDown —— 已用加强后的脚本重跑通过（见 §4）
@@ -467,3 +468,48 @@
 
 这一步不是形式主义：第一版变异里 `_advance` 那条**没有**变红，才发现
 "ENQUEUED 路径的标记写入"完全没有断言，补了用例才把它守住。
+
+---
+
+## 10. 第二轮源码审计（DB Fence / Critical Commit）
+
+> 来源：外部第二轮审计（对 `6bfc9c5` 的 Critical Commit / DB Fence 逐函数审查）。
+> 处置口径与前面一致：只有「改完代码 + 新增用例 + 全量门禁通过」才算已修。
+> 门禁：`./bin/skyext test` 124 files / 124 passed；`luacheck .` 310 files 0 警告；
+> `stylua --check .`、`check_paths`、`make -C example lint`（44 files）全通过。
+
+### 10.1 已修
+
+| 编号 | 问题 | 修复 | 验证 |
+| --- | --- | --- | --- |
+| B-01 | `$rename` 的目标路径绕过身份字段保护：`{["$rename"]={gold="rid"}}` 里 `fields["rid"]` 是 nil，校验只看 key 就会放行，真实 mongod 会把 `rid` 改成 gold 的值 | `dbmgr.critical_update` 加**更新操作符白名单**（只允许 `$set` / `$unset`）。`$inc`/`$currentDate` 一并拒绝：它们会让库里的值偏离内存副本，而 CAS 之后内存仍是普通字段的权威副本。非表载荷也在这里拒绝（否则 `write["$set"]._version` 会索引到字符串上，冒成 Lua 错误而不是拒绝） | `dbmgr.test.lua`「refuses $rename before it can retarget the identity, fence or version」「refuses update operators outside the whitelist」 |
+| B-02 | `extra_query` 的"只允许等值"只查 `type(v)=="table"`，`$where` 的值是字符串 → 放行，CAS 变成任意服务端表达式 | 拒绝 `$` 前缀的键与非字符串键；等值条件仍然可用（Outbox 的"该事件仍是 PENDING"依赖它） | `dbmgr.test.lua`「refuses extra_query operators so the CAS stays an equality match」 |
+| B-03 | PREPARE 被拒一律回 `NORMAL` 并报 `UNKNOWN`：CAS/版本/fence 不符说明缓存已不是库的副本，继续回存只会每轮失败；而 `UNKNOWN` 又暗示"可能写了"，与 `critical.query` 的 `NOT_STARTED` 矛盾 | `critical_update` 返回第三个值 `code`（`dbmgr.REASON`）；`commit_core` 按 code 分级：`version_mismatch`/`cas_mismatch`/`lease_expired`/`state_invalid` → 隔离；`owner_changed` → 不碰（条目已归新 owner）；`invalid_update`/`majority_unavailable`/`server_rejected` → 回 `NORMAL`。状态统一改报 `INTERNAL_ERROR`（确定零写入） | `critical.test.lua` 3 例（隔离 / 保持可写 / 不动他人条目） |
+| B-04 | `critical_probe` 只发 `hello`，注释却写"确认能走 majority 写"；secondary 也能应答 `hello` | 改成真实的 `w:majority, j:true` 写入 → 多数派读回 → 清理，写的是独立集合 `skyext_health_probe`（绝不往角色集合插测试记录）。任一条腿没确认都返回失败，清理失败也不报健康 | `service/mongo_conn.test.lua` 2 例（命令序列 + 三种失败腿） |
+| B-05 | `execute_client` 只强制 `hmac_fn`，漏传 `equal_fn` 时 `grant.verify` 静默退回 `==` | 入口强制要求 `equal_fn` 是函数，缺失/类型错一律 `INTERNAL_AUTH_DENIED` | `critical.test.lua`「refuses a client call without a constant-time comparator」 |
+| B-06 | 示例游戏没有 `charge_handlers`：`pay_callback → charge_grant → critical.execute_internal` 链路在框架侧完整，但游戏层缺资产效果，启用支付会直接报 "entity handler has no charge_handlers" | `example/lualib/entity_handler/role.lua` 实现充值到账 handler：validate 纯读、apply 只改内存（`modules.bag:add_item`），换算只写一份避免 validate/apply 分叉 | `example/lualib/entity_handler/role.test.lua` 3 例 |
+
+顺带修正的文档不一致：
+
+- `docs/design/p00_gate_evidence.md` §0 原写"`extract_critical_fields` / `advance_persisted_version`
+  尚未接入生产路径"，与 §2 末尾"`dbmgr.load` 已在 decode 前调用 extract"自相矛盾；已统一为
+  "两项均已接入（P07）"。
+- `docs/design/p17_verification.md` §3 B1 第 2 步原写"用 `critical_probe()` 确认命令通道可用"，
+  与 B-04 修复后的语义对齐为"确认多数派写可用"。
+
+### 10.2 仍未闭合（不是代码缺陷，不得写成"已验证"）
+
+| 项 | 现状 |
+| --- | --- |
+| V-02 双节点迁移回环 | 待跑（需要两个 skynet 节点 + 真实客户端） |
+| V-03 Mongo 网络分区 | 待跑 |
+| V-04 etcd 租约抖动 | 待跑 |
+| V-05 真实 WebSocket 回环 | 待跑 |
+
+### 10.3 这轮确认"不是缺陷"的两点
+
+- `$rename` / `$where` 只有内部调用方能触达（`critical` 自己只产生 `$set`/`$unset`，
+  `outbox` 用 `$set`），属于框架 API 硬化缺口，不是远程可利用路径；修复的价值在于
+  "所有权不变量不依赖调用方自觉"。
+- 普通回存（`save_doc`）本身带 `_version` + `_fence` 条件，所以 B-03 修复前的实际后果是
+  "过期缓存继续被业务读取、普通回存持续 CAS 失败刷日志"，不是直接把错误数据写进库。

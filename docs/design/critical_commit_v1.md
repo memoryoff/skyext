@@ -57,7 +57,7 @@ Mongo 字段名：不含 NUL、不含 `.`、不以 `$` 开头。`field_name_safe
 | `COMMITTED` | 是（COMMIT CAS） | `CACHEABLE` |
 | `BUSINESS_REJECTED` | 是（只写拒绝结果，不改 ORM） | `CACHEABLE` |
 | `PRECHECK_REJECTED` | **否** | `NO_CACHE` |
-| `INTERNAL_ERROR`（`validate` 自身抛错） | **否**，也未进入 PREPARE | `NO_CACHE` |
+| `INTERNAL_ERROR`（`validate` 抛错，或 PREPARE 被拒） | **否**，零写入 | `NO_CACHE` |
 | `OP_CONFLICT` / `EXPIRED` / `INTERNAL_AUTH_DENIED` | 否 | `CACHEABLE` / `NO_CACHE` |
 | `UNKNOWN` | 可能已写 | `NO_CACHE` |
 | `IN_PROGRESS` | 否 | `NO_CACHE` |
@@ -66,10 +66,20 @@ Mongo 字段名：不含 NUL、不含 `.`、不以 `$` 开头。`field_name_safe
 `PRECHECK_REJECTED` 是"这次条件不满足"，**不是该 op_id 的持久化终态**：不写意图、
 不声明持久化拒绝、不进 L1。条件变化后同一 `op_id` 可以重新预检。
 
-`INTERNAL_ERROR` 是 `validate` 自己抛错的专用结果：纯读预检发生在 PREPARE 之前，
-库里没有任何写入，因此**不能**复用 `UNKNOWN`——`UNKNOWN` 的语义是"可能已写"，
-会触发缓存隔离与恢复任务，而 `critical.query` 对同一次操作只会回 `NOT_STARTED`，
-调用方拿到的两个答案互相矛盾。这条路径只记错误日志、不进 L1、允许受控重试。
+`INTERNAL_ERROR` 是**确定零写入**的内部/环境故障：`validate` 自己抛错，或 PREPARE
+被 `dbmgr.critical_update` 拒绝（版本/CAS/fence 不符、租约过期、更新非法、多数派通道
+缺失）。两者都没有任何持久化写入，因此**不能**复用 `UNKNOWN`——`UNKNOWN` 的语义是
+"可能已写"，会触发缓存隔离与恢复任务，而 `critical.query` 对同一次操作只会回
+`NOT_STARTED`，调用方拿到的两个答案互相矛盾。这条路径只记错误日志、不进 L1、允许受控重试。
+
+**PREPARE 被拒时缓存要不要隔离，由原因码决定**（`dbmgr.REASON`，不再是靠 detail
+字符串猜）：
+
+| 原因码 | 缓存处置 | 理由 |
+|---|---|---|
+| `version_mismatch` / `cas_mismatch` / `lease_expired` / `state_invalid` | 隔离（`CRITICAL_QUARANTINED`） | 内存已经不是库的副本：继续回存只会每轮 CAS 失败，玩家读到的也是过期数据 |
+| `owner_changed` | 不动 | 条目已归新的 owner，旧 handle 没有资格改它的状态 |
+| `invalid_update` / `majority_unavailable` / `server_rejected` | 回到 `NORMAL` | 写入确定没发生，缓存仍然可信；隔离只会让玩家多一次无谓重载 |
 
 ### 4.1 容量：预警、腾挪、清理
 

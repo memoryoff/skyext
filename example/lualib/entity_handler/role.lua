@@ -88,6 +88,60 @@ function M.handlers.__apply_outbox_event(entity, envelope, msg_id)
     return result
 end
 
+-- 充值到账（P09/P11）。链路：
+--   pay_callback 验签落单 -> entity_agent.framework_charge_grant 签 capability
+--   -> charge_order.grant -> critical.execute_internal -> 这里
+--
+-- 没有这个 handler，`charge_grant` 会直接报 "entity handler has no charge_handlers"：
+-- 框架侧的支付链路是完整的，缺的正是游戏层这一条资产效果。
+--
+-- 两条硬约束（critical 的 handler 契约）：
+--   * validate 纯读、不 yield；
+--   * apply 只改内存，不 RPC、不推送、不发邮件——本角色 CAS 失败时没有任何东西可回滚。
+local CHARGE_RATE = { CNY = 100 } -- 示例汇率：1 元 = 100 金币
+local CHARGE_RES = { res_type = 1, res_id = 1 } -- 金币在 res 表里的坐标
+
+-- validate 与 apply 必须用同一份换算：两边各写一遍迟早会在浮点/取整上分叉，
+-- 而分叉的后果是"校验通过、apply 算出的数量不同"
+local function charge_count(params)
+    if type(params) ~= "table" then
+        return nil, "params is required"
+    end
+    local amount = math.tointeger(params.amount)
+    if not amount or amount <= 0 then
+        return nil, "invalid amount"
+    end
+    local rate = CHARGE_RATE[params.currency]
+    if not rate then
+        return nil, "unsupported currency: " .. tostring(params.currency)
+    end
+    return amount * rate
+end
+
+function M.charge_handlers(entity, _order)
+    return {
+        validate = function(_, params)
+            local count, err = charge_count(params)
+            if not count then
+                return false, err
+            end
+            if not entity.modules or not entity.modules.bag then
+                return false, "bag module is not loaded"
+            end
+            return true
+        end,
+        apply = function(entity, params)
+            local count = charge_count(params)
+            if not count then
+                -- validate 已经拦过：走到这里说明有人绕过了它，不能悄悄发 0 个
+                return false, "invalid charge params"
+            end
+            entity.modules.bag:add_item(CHARGE_RES.res_type, CHARGE_RES.res_id, count)
+            return true
+        end,
+    }
+end
+
 function M.on_load(entity)
     log.info("role entity loaded", "rid", entity.id)
 end

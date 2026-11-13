@@ -1294,18 +1294,90 @@ t.describe("dbmgr 关键状态机", function()
         t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(false)
     end)
 
-    -- 只看 $set 会漏掉 $unset/$inc：它们同样能删掉身份字段或改掉版本
-    t.it("rejects identity and version writes on every update operator", function()
+    -- 身份、fence、版本都是框架独占的：$set/$unset 两条通道都要拦
+    t.it("rejects identity, fence and version writes on every allowed operator", function()
         local h = harness(nil, nil, true)
         h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { rid = 8 } })).to.equal("REJECTED")
         t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$unset"] = { rid = true } })).to
             .equal("REJECTED")
-        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$inc"] = { rid = 1 } })).to.equal("REJECTED")
         t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$unset"] = { _version = true } })).to
             .equal("REJECTED")
         t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$unset"] = { _fence = true } })).to
             .equal("REJECTED")
         t.expect(#h.critical_updates).to.equal(0)
+    end)
+
+    -- $rename 的 key 是**源路径**、value 才是目标路径。只查 key 时
+    -- {["$rename"] = { gold = "rid" }} 能通过校验并把身份字段改成 gold 的值
+    t.it("refuses $rename before it can retarget the identity, fence or version", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.store.gold = 500
+        local before = copy(h.store)
+
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$rename"] = { gold = "rid" } })).to
+            .equal("REJECTED")
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$rename"] = { gold = "_fence" } })).to
+            .equal("REJECTED")
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$rename"] = { _fence = "old_fence" } })).to
+            .equal("REJECTED")
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$rename"] = { gold = "_version" } })).to
+            .equal("REJECTED")
+
+        -- 一次都不能发出去：发出去之后只有 UNKNOWN 一条路，玩家资产只能隔离
+        t.expect(#h.critical_updates).to.equal(0)
+        t.expect(h.doc._version).to.equal(0)
+        t.expect(h.store).to.equal(before)
+    end)
+
+    -- 白名单之外的操作符一律拒绝。$inc/$currentDate 会让库里的值偏离内存副本，
+    -- 而关键 CAS 之后内存仍是普通字段的权威副本
+    t.it("refuses update operators outside the whitelist", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+
+        local state, reason, code = h.db.critical_update("demo", "role", "rid", 7, 0, { ["$inc"] = { gold = 1 } })
+        t.expect(state).to.equal("REJECTED")
+        t.expect(reason).to.equal('unsupported update operator: "$inc"')
+        t.expect(code).to.equal(h.db.REASON.INVALID_UPDATE)
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$currentDate"] = { at = true } })).to
+            .equal("REJECTED")
+        -- 非表载荷会让后面的 write["$set"]._version 索引到字符串上（Lua 错误，不是拒绝）
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = "not a table" })).to.equal("REJECTED")
+        t.expect(#h.critical_updates).to.equal(0)
+        t.expect(h.doc._version).to.equal(0)
+    end)
+
+    -- extra_query 只能追加等值条件。`$where` 的值是字符串，能绕过"不许 table"的类型检查
+    t.it("refuses extra_query operators so the CAS stays an equality match", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+
+        local state, reason, code = h.db.critical_update(
+            "demo",
+            "role",
+            "rid",
+            7,
+            0,
+            { ["$set"] = { gold = 1 } },
+            { extra_query = { ["$where"] = "this.rid == 7" } }
+        )
+        t.expect(state).to.equal("REJECTED")
+        t.expect(reason).to.equal("extra_query must not use query operators")
+        t.expect(code).to.equal(h.db.REASON.INVALID_UPDATE)
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { gold = 1 } }, {
+            extra_query = { _version = 99 },
+        })).to
+            .equal("REJECTED")
+        t.expect(#h.critical_updates).to.equal(0)
+
+        -- 普通等值条件仍然可用（Outbox 依赖它做"该事件仍是 PENDING"）
+        t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { gold = 1 } }, {
+            extra_query = { name = "original" },
+        })).to
+            .equal("CONFIRMED")
+        t.expect(h.critical_updates[1].query.name).to.equal("original")
     end)
 
     -- 同一张 update 表复用做下一步 CAS 时，注入的 _version 不能留在调用方表里

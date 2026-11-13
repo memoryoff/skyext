@@ -18,7 +18,7 @@ Skynet Mongo 驱动的 `safe_update` / `findAndModify` 只带默认写关注（`
 | `critical_update(query, update, upsert)` | `{w="majority", j=true}` | `"CONFIRMED", {n, nModified}` / `"REJECTED", err` / `"UNKNOWN", err` |
 | `critical_find(query, projection)` | `readConcern={level="majority"}` | 文档 / `nil, err` |
 | `critical_find_and_modify(doc)` | `{w="majority", j=true}` | `"CONFIRMED", ret` / `"REJECTED", err` / `"UNKNOWN", err` |
-| `critical_probe()` | `hello` 命令 | `true` / `nil, err` |
+| `critical_probe(coll)` | 真实 `{w="majority", j=true}` 写入 + 多数派读回 + 清理 | `true` / `nil, err` |
 
 三态的定义：
 
@@ -28,6 +28,23 @@ Skynet Mongo 驱动的 `safe_update` / `findAndModify` 只带默认写关注（`
   生效，调用方可以按业务失败处理。
 - **UNKNOWN**：`writeConcernError`、网络异常/超时、`ok=1` 但仍带 `errmsg`。**写入可能
   已经生效**，调用方必须按未决处理：不能重试成"没写"，也不能当成"已提交"。
+
+## 2.1 `critical_update` 的输入约束
+
+`dbmgr.critical_update` 是框架唯一的多数派 CAS 入口，身份字段（`rid`）、`_fence`、
+`_version` 由框架独占。校验分三层：
+
+1. **更新操作符白名单**：只允许 `$set` / `$unset`。`$rename` 的 key 是**源路径**、
+   value 才是目标路径，逐个特判操作符一定会漏掉下一种写法——`{ ["$rename"] = { gold = "rid" } }`
+   能把身份字段改名成 gold 的值。`$inc` / `$currentDate` 会让库里的值偏离内存副本，
+   而 CAS 之后内存仍是普通字段的权威副本，下一次回存就把旧值写回去。
+2. **字段级保护**：任何操作符的**键**都不允许是身份字段、`_fence`、`_version`
+   （`_version` 只允许 `$set` 且必须恰好 +1）。
+3. **`extra_query` 只允许等值条件**：拒绝表值（范围/正则），也拒绝 `$` 前缀的键
+   （`$where` 的值是字符串，能绕过"不许 table"的类型检查，把 CAS 变成任意服务端表达式）。
+
+拒绝时返回 `state, detail, code`，`code` 见 `dbmgr.REASON`——上层不能靠 detail
+字符串分流，"CAS 没打中"（缓存已过期）和"更新格式非法"（缓存仍可信）的处置完全不同。
 
 ## 3. fence 认领
 

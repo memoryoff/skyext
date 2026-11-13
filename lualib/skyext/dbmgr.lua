@@ -108,15 +108,19 @@ local function with_row_lock(dbname, dbcoll, unique_id, f)
         rows[unique_id] = lock
     end
     lock.users = lock.users + 1
-    local ok, result, err = pcall(lock.run, f)
+    -- 原样透传 f 的返回值个数：关键 CAS 除了 (state, detail) 还要带机器可读的
+    -- reason code（见 M.REASON），而 load 之类只回两个值，不能被补成三个
+    local ok, packed = pcall(lock.run, function()
+        return table.pack(f())
+    end)
     lock.users = lock.users - 1
     if lock.users == 0 then
         rows[unique_id] = nil
     end
     if not ok then
-        error(result, 0)
+        error(packed, 0)
     end
-    return result, err
+    return table.unpack(packed, 1, packed.n)
 end
 
 local function lease_valid(handle)
@@ -635,59 +639,99 @@ function M.quarantine_critical(dbname, dbcoll, unique_id, handle, reason)
     end)
 end
 
+-- 拒绝原因码。上层不能靠 detail 字符串分流：同样是 "REJECTED"，
+-- "CAS 没打中"（缓存已经不是库的副本，必须隔离重载）和"更新格式非法"（缓存仍然可信）
+-- 需要完全不同的处置。detail 继续保留给人看，code 给程序看。
+M.REASON = {
+    INVALID_UPDATE = "invalid_update",
+    NOT_CACHED = "not_cached",
+    OWNER_CHANGED = "owner_changed",
+    STATE_INVALID = "state_invalid",
+    VERSION_MISMATCH = "version_mismatch",
+    CAS_MISMATCH = "cas_mismatch",
+    LEASE_EXPIRED = "lease_expired",
+    MAJORITY_UNAVAILABLE = "majority_unavailable",
+    SERVER_REJECTED = "server_rejected",
+    UNKNOWN = "unknown",
+    MEMORY_DIVERGED = "memory_diverged",
+}
+
+-- 允许的更新操作符白名单。为什么是白名单而不是逐个特判：
+--   * `$rename` 的 key 是**源路径**、value 才是目标路径，只查 key 会让
+--     `{ ["$rename"] = { gold = "rid" } }` 直接改掉身份字段，`_fence` 同理；
+--   * `$inc` / `$currentDate` 这类会让库里的值偏离内存副本，而关键 CAS 之后
+--     内存仍是普通字段的权威副本，下一次普通回存就把旧值写回去。
+-- ORM、critical、outbox 实际只产生 `$set` 与 `$unset`，收紧不影响任何调用方。
+local ALLOWED_UPDATE_OPERATORS = {
+    ["$set"] = true,
+    ["$unset"] = true,
+}
+
 -- 关键 CAS。
 -- expected_version 是调用方认为的当前持久化版本，函数内部补齐 key/_version/_fence 三个条件，
--- 调用方只需要给 update（$set / $unset / $inc 等）。
+-- 调用方只需要给 update（只允许 $set / $unset）。
 --
 -- 返回：
 --   "CONFIRMED", { version = 新版本, n = , nModified = }   -- 多数派已确认
---   "REJECTED",  reason                                    -- 确定没写（CAS 未匹配或命令级拒绝）
---   "UNKNOWN",   reason                                    -- 可能已写；entry 已进入隔离
+--   "REJECTED",  reason, code                              -- 确定没写（CAS 未匹配或命令级拒绝）
+--   "UNKNOWN",   reason, code                              -- 可能已写；entry 已进入隔离
 function M.critical_update(dbname, dbcoll, key, unique_id, expected_version, update, opts)
     check_collection(dbname, dbcoll)
     opts = opts or {}
     if math.type(expected_version) ~= "integer" or expected_version < 0 then
-        return "REJECTED", "expected_version must be a non-negative integer"
+        return "REJECTED", "expected_version must be a non-negative integer", M.REASON.INVALID_UPDATE
     end
     if type(update) ~= "table" then
-        return "REJECTED", "update must be a table"
+        return "REJECTED", "update must be a table", M.REASON.INVALID_UPDATE
     end
 
     return with_row_lock(dbname, dbcoll, unique_id, function()
         local entry = get_entry(dbname, dbcoll, unique_id)
         if not entry then
-            return "REJECTED", "not cached"
+            return "REJECTED", "not cached", M.REASON.NOT_CACHED
         end
         if opts.handle and entry.handle ~= opts.handle then
-            return "REJECTED", "owner changed"
+            return "REJECTED", "owner changed", M.REASON.OWNER_CHANGED
         end
         local state = entry.state or M.STATE.NORMAL
         if state == M.STATE.CRITICAL_QUARANTINED or state == M.STATE.DISCARDED then
-            return "REJECTED", state
+            return "REJECTED", state, M.REASON.STATE_INVALID
         end
         if entry.doc._version ~= expected_version then
             -- 内存版本和调用方的预期已经不一致，再发出去只会是无效 CAS
-            return "REJECTED", "version mismatch"
+            return "REJECTED", "version mismatch", M.REASON.VERSION_MISMATCH
         end
 
         local next_version = expected_version + 1
         -- 身份与版本必须是框架独占的：只看 $set 会漏掉 $unset/$inc/$rename，
-        -- 那些同样能删掉 rid 或改掉 _version
+        -- 那些同样能删掉 rid 或改掉 _version。先过操作符白名单：未知操作符
+        -- 一律拒绝，`$rename` 的目标路径根本不进入下面的字段检查
         for op, fields in pairs(update) do
-            if type(fields) == "table" then
-                if fields[key] ~= nil then
-                    return "REJECTED", "update must not rewrite the identity field"
+            if not ALLOWED_UPDATE_OPERATORS[op] then
+                if type(op) == "string" and #op <= 32 then
+                    return "REJECTED",
+                        "unsupported update operator: " .. string.format("%q", op),
+                        M.REASON.INVALID_UPDATE
                 end
-                if fields._fence ~= nil then
-                    return "REJECTED", "update must not touch _fence"
+                return "REJECTED", "unsupported update operator", M.REASON.INVALID_UPDATE
+            end
+            if type(fields) ~= "table" then
+                -- 非表载荷会让后面的 write["$set"]._version 索引到字符串/数字上，
+                -- 那是一个能冒到调用方的 Lua 错误，而不是可处理的拒绝
+                return "REJECTED", "update operator payload must be a table", M.REASON.INVALID_UPDATE
+            end
+            if fields[key] ~= nil then
+                return "REJECTED", "update must not rewrite the identity field", M.REASON.INVALID_UPDATE
+            end
+            if fields._fence ~= nil then
+                return "REJECTED", "update must not touch _fence", M.REASON.INVALID_UPDATE
+            end
+            if fields._version ~= nil then
+                if op ~= "$set" then
+                    return "REJECTED", "_version is managed by the framework", M.REASON.INVALID_UPDATE
                 end
-                if fields._version ~= nil then
-                    if op ~= "$set" then
-                        return "REJECTED", "_version is managed by the framework"
-                    end
-                    if fields._version ~= next_version then
-                        return "REJECTED", "_version must advance by exactly one"
-                    end
+                if fields._version ~= next_version then
+                    return "REJECTED", "_version must advance by exactly one", M.REASON.INVALID_UPDATE
                 end
             end
         end
@@ -709,10 +753,10 @@ function M.critical_update(dbname, dbcoll, key, unique_id, expected_version, upd
             for j = i + 1, #paths do
                 local a, b = paths[i], paths[j]
                 if a.path == b.path then
-                    return "REJECTED", "conflicting update paths"
+                    return "REJECTED", "conflicting update paths", M.REASON.INVALID_UPDATE
                 end
                 if b.path:sub(1, #a.path + 1) == a.path .. "." or a.path:sub(1, #b.path + 1) == b.path .. "." then
-                    return "REJECTED", "conflicting parent/child update paths"
+                    return "REJECTED", "conflicting parent/child update paths", M.REASON.INVALID_UPDATE
                 end
             end
         end
@@ -738,11 +782,19 @@ function M.critical_update(dbname, dbcoll, key, unique_id, expected_version, upd
         -- 调用方可以追加条件（例如 Outbox 的 "该事件仍是 PENDING"）。
         -- 只允许等值条件：范围/正则会把 CAS 变成不可预测的匹配
         for k, v in pairs(opts.extra_query or {}) do
+            if type(k) ~= "string" then
+                return "REJECTED", "extra_query keys must be strings", M.REASON.INVALID_UPDATE
+            end
+            if k:sub(1, 1) == "$" then
+                -- `$where` 的值是字符串，能绕过下面"只允许等值"的类型检查，
+                -- 把 CAS 变成一段任意服务端表达式；`$comment` 之类同理
+                return "REJECTED", "extra_query must not use query operators", M.REASON.INVALID_UPDATE
+            end
             if query[k] ~= nil then
-                return "REJECTED", "extra_query must not override the CAS conditions"
+                return "REJECTED", "extra_query must not override the CAS conditions", M.REASON.INVALID_UPDATE
             end
             if type(v) == "table" then
-                return "REJECTED", "extra_query only supports equality"
+                return "REJECTED", "extra_query only supports equality", M.REASON.INVALID_UPDATE
             end
             query[k] = v
         end
@@ -751,7 +803,7 @@ function M.critical_update(dbname, dbcoll, key, unique_id, expected_version, upd
             -- 锁已经释放（或换了持有者）时不能再发多数派写：fence 条件挡不住
             -- "同一个 fence 但租约已过期"的迟到写，这一层必须在本地拦
             if not lease_valid(handle) then
-                return "REJECTED", "lease expired"
+                return "REJECTED", "lease expired", M.REASON.LEASE_EXPIRED
             end
             query._fence = handle.fence
         end
@@ -759,7 +811,7 @@ function M.critical_update(dbname, dbcoll, key, unique_id, expected_version, upd
         local coll_obj = get_collection_obj(dbname, dbcoll)
         if not coll_obj.critical_update then
             -- 没有多数派写通道就不做关键写：降级成 w=1 等于放弃已提交语义
-            return "REJECTED", "majority update unavailable"
+            return "REJECTED", "majority update unavailable", M.REASON.MAJORITY_UNAVAILABLE
         end
 
         local called, state_or_n, detail = pcall(coll_obj.critical_update, coll_obj, query, write, false)
@@ -769,31 +821,32 @@ function M.critical_update(dbname, dbcoll, key, unique_id, expected_version, upd
                 -- 标记"内存版本可疑"，由调用方用 refresh_critical 对齐后再继续
                 entry.stale = true
                 log.error("metadata update raised", "unique_id", unique_id, "err", state_or_n)
-                return "UNKNOWN", state_or_n
+                return "UNKNOWN", state_or_n, M.REASON.UNKNOWN
             end
             entry.state = M.STATE.CRITICAL_QUARANTINED
             save_wheel_obj():remove(entry)
             log.error("critical update raised, quarantining", "unique_id", unique_id, "err", state_or_n)
-            return "UNKNOWN", state_or_n
+            return "UNKNOWN", state_or_n, M.REASON.UNKNOWN
         end
         if state_or_n == "UNKNOWN" then
             if opts.metadata_only then
                 entry.stale = true
                 log.error("metadata update unknown", "unique_id", unique_id, "reason", detail)
-                return "UNKNOWN", detail
+                return "UNKNOWN", detail, M.REASON.UNKNOWN
             end
             entry.state = M.STATE.CRITICAL_QUARANTINED
             save_wheel_obj():remove(entry)
             log.error("critical update unknown, quarantining", "unique_id", unique_id, "reason", detail)
-            return "UNKNOWN", detail
+            return "UNKNOWN", detail, M.REASON.UNKNOWN
         end
         if state_or_n ~= "CONFIRMED" then
-            return "REJECTED", detail
+            -- 命令级拒绝（writeErrors / ok~=1）：确定没写，但原因在服务端，调用方无法据此判断缓存是否可信
+            return "REJECTED", detail, M.REASON.SERVER_REJECTED
         end
         local n = type(detail) == "table" and detail.n or 0
         if n ~= 1 then
             -- nMatched=0：版本或 fence 条件没命中，确定没有应用本次更新
-            return "REJECTED", "cas mismatch"
+            return "REJECTED", "cas mismatch", M.REASON.CAS_MISMATCH
         end
 
         -- 数据库已经到新版本，内存必须跟上。推进失败说明内存和库已经分叉，
@@ -802,7 +855,7 @@ function M.critical_update(dbname, dbcoll, key, unique_id, expected_version, upd
             entry.state = M.STATE.CRITICAL_QUARANTINED
             save_wheel_obj():remove(entry)
             log.error("critical update applied but memory version diverged", "unique_id", unique_id)
-            return "UNKNOWN", "memory version diverged"
+            return "UNKNOWN", "memory version diverged", M.REASON.MEMORY_DIVERGED
         end
         return "CONFIRMED", { version = next_version, n = n, nModified = detail.nModified }
     end)
