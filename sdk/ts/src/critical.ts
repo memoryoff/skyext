@@ -48,17 +48,35 @@ export type BuildResult<T> = { ok: true; value: T } | { ok: false; error: string
 
 const isInteger = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v);
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.length > 0;
-const isRid = (v: unknown): v is CriticalRid => {
+const MAX_INT64 = 0x7fffffffffffffffn;
+const normalizeRid = (v: unknown): bigint | number | null => {
     if (typeof v === "bigint") {
-        return v > 0n;
+        return v > 0n && v <= MAX_INT64 ? v : null;
     }
     if (typeof v === "number") {
-        return Number.isSafeInteger(v) && v > 0;
+        return Number.isSafeInteger(v) && v > 0 ? v : null;
     }
-    return typeof v === "string" && /^[1-9]\d*$/.test(v);
+    if (typeof v !== "string" || !/^[1-9]\d*$/.test(v)) {
+        return null;
+    }
+    const n = BigInt(v);
+    return n <= MAX_INT64 ? n : null;
 };
-const isMac = (v: unknown): v is CriticalMac =>
-    (typeof v === "string" && v.length > 0) || (v instanceof Uint8Array && v.byteLength > 0);
+
+const normalizeMac = (v: unknown): Uint8Array | null => {
+    if (v instanceof Uint8Array) {
+        return v.byteLength > 0 ? v : null;
+    }
+    if (typeof v !== "string" || v.length === 0) {
+        return null;
+    }
+    // 字符串是 latin1 字节串，不是 UTF-8 文本。直接交给 encodeDeep 会把
+    // 0x80..0xff 扩展成两字节，导致 HMAC 在 wire 上被改坏。
+    return Uint8Array.from(Array.from(v, (c) => c.charCodeAt(0) & 0xff));
+};
+
+const isRid = (v: unknown): v is CriticalRid => normalizeRid(v) !== null;
+const isMac = (v: unknown): v is CriticalMac => normalizeMac(v) !== null;
 
 /** 结构校验；返回 null 表示通过，否则返回错误信息 */
 export function validateGrant(grant: unknown): string | null {
@@ -72,7 +90,7 @@ export function validateGrant(grant: unknown): string | null {
     if (!isRid(g.rid)) {
         return "invalid rid";
     }
-    if (!nonEmpty(g.grant_id) || g.grant_id.length !== 32) {
+    if (!nonEmpty(g.grant_id) || !/^[0-9a-f]{32}$/.test(g.grant_id)) {
         return "invalid grant_id";
     }
     if (!isInteger(g.issued_at) || !isInteger(g.expires_at)) {
@@ -100,7 +118,11 @@ export function buildRequest(
     if (grantError) {
         return { ok: false, error: grantError };
     }
-    const grant = opts.grant;
+    const grant = {
+        ...opts.grant,
+        rid: normalizeRid(opts.grant.rid)!,
+        mac: normalizeMac(opts.grant.mac)!,
+    };
     if (!isInteger(opts.seq) || opts.seq < 1 || opts.seq > grant.max_seq) {
         return { ok: false, error: "seq out of range" };
     }
@@ -132,8 +154,8 @@ export function buildQuery(opts: CriticalQueryOptions): BuildResult<{ protocol: 
     if (!nonEmpty(opts?.protocol)) {
         return { ok: false, error: "protocol is required" };
     }
-    if (!nonEmpty(opts.op_id)) {
-        return { ok: false, error: "op_id is required" };
+    if (!/^(?:srv_[0-9a-f]{64}|[0-9a-f]{32}_[0-9a-f]{4})$/.test(opts.op_id)) {
+        return { ok: false, error: "invalid op_id" };
     }
     return { ok: true, value: { protocol: opts.protocol, request: { op_id: opts.op_id } } };
 }

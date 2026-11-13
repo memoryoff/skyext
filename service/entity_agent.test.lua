@@ -242,7 +242,7 @@ local function harness(opts)
         },
         ["skyext.entity.types"] = {
             get = function()
-                return { client_enabled = true }
+                return opts.type_config or { client_enabled = true }
             end,
             format_agent_service_name = function()
                 return ".entity_agent:role:1"
@@ -446,6 +446,30 @@ t.describe("entity_agent serialized ingress", function()
         local h = harness()
         h.lease_expired = true
         t.expect(h.CMD.resume_session(7, cid(9), "nonce-9", 0)).to.equal(errcode.ENTITY_NOT_FOUND)
+        t.expect(h.events).to.equal({})
+    end)
+
+    t.it("refuses a new bind while the entity is migrating", function()
+        local h = harness()
+        h.entity.migrating = true
+        t.expect(h.CMD.bind_session(7, cid(9))).to.equal(errcode.SESSION_CLOSED)
+        t.expect(h.entity.session).to.be_nil()
+        t.expect(h.events).to.equal({})
+    end)
+
+    t.it("refuses resume while the entity is migrating", function()
+        local h = harness()
+        h.entity.migrating = true
+        h.entity.session_io = {
+            session_epoch = string.rep("a", 32),
+            nonce = "nonce-9",
+            sent = 0,
+            acked = 0,
+            out_buf = {},
+            owner_epoch = 1,
+            unresumable = false,
+        }
+        t.expect(h.CMD.resume_session(7, cid(9), "nonce-9", 0)).to.equal(errcode.RESUME_UNAVAILABLE)
         t.expect(h.events).to.equal({})
     end)
 
@@ -754,6 +778,20 @@ t.describe("entity_agent 框架内部命令", function()
         t.expect(result.status).to.equal("UNKNOWN")
     end)
 
+    t.it("does not let a business handler impersonate the reserved payment command", function()
+        local h = harness()
+        local called = false
+        h.handler.handlers.charge_grant = function()
+            called = true
+            return { status = "COMMITTED" }
+        end
+        local ok = pcall(function()
+            h.CMD.entity_call(7, "charge_grant", {})
+        end)
+        t.expect(ok).to.equal(false)
+        t.expect(called).to.equal(false)
+    end)
+
     t.it("installs game-provided framework commands through the explicit extension point", function()
         local h = harness({
             framework_commands = {
@@ -813,6 +851,87 @@ t.describe("entity_agent 框架内部命令", function()
         local ok, result = h.CMD.entity_call(7, "critical_status", "srv_" .. string.rep("a", 64))
         t.expect(ok).to.equal(true)
         t.expect(result.status).to.equal("UNKNOWN")
+    end)
+
+    t.it("retries discard when a retried resolve finds no intent but the cache is still quarantined", function()
+        local marked = 0
+        local h = harness({
+            type_config = {
+                client_enabled = true,
+                db_name = "role",
+                db_coll = "role",
+                critical_ledger = { db = "role", coll = "op_ledger" },
+                critical_jobs = { db = "role", coll = "critical_jobs" },
+            },
+            module_sources = {
+                ["skyext.critical"] = {
+                    query = function()
+                        return { status = "NOT_STARTED" }
+                    end,
+                    abort_intent = function()
+                        return "REJECTED", "no pending intent"
+                    end,
+                },
+                ["skyext.dbmgr"] = {
+                    state_of = function()
+                        return "CRITICAL_QUARANTINED"
+                    end,
+                    mark_discarded = function()
+                        marked = marked + 1
+                        return true
+                    end,
+                },
+                ["skyext.mongo_conn"] = {
+                    get_collection = function()
+                        return {}
+                    end,
+                },
+            },
+        })
+        local ok, result = h.CMD.entity_call(7, "critical_resolve_intent", "srv_" .. string.rep("a", 64))
+        t.expect(ok).to.equal(true)
+        t.expect(result.status).to.equal("NOT_COMMITTED")
+        t.expect(result.discard).to.equal(true)
+        t.expect(marked).to.equal(1)
+    end)
+
+    t.it("keeps the resolve retryable when a quarantined cache cannot be marked discarded", function()
+        local h = harness({
+            type_config = {
+                client_enabled = true,
+                db_name = "role",
+                db_coll = "role",
+                critical_ledger = { db = "role", coll = "op_ledger" },
+                critical_jobs = { db = "role", coll = "critical_jobs" },
+            },
+            module_sources = {
+                ["skyext.critical"] = {
+                    query = function()
+                        return { status = "NOT_STARTED" }
+                    end,
+                    abort_intent = function()
+                        return "REJECTED", "no pending intent"
+                    end,
+                },
+                ["skyext.dbmgr"] = {
+                    state_of = function()
+                        return "CRITICAL_QUARANTINED"
+                    end,
+                    mark_discarded = function()
+                        return false, "owner changed"
+                    end,
+                },
+                ["skyext.mongo_conn"] = {
+                    get_collection = function()
+                        return {}
+                    end,
+                },
+            },
+        })
+        local ok, result = h.CMD.entity_call(7, "critical_resolve_intent", "srv_" .. string.rep("b", 64))
+        t.expect(ok).to.equal(true)
+        t.expect(result.status).to.equal("UNKNOWN")
+        t.expect(result.reason).to.match("mark_discarded failed")
     end)
 
     t.it("still rejects a genuinely unknown command", function()
@@ -880,6 +999,16 @@ t.describe("entity_agent 会话迁移命令", function()
         local ok, result = h.CMD.entity_call(7, "session_export", "b1")
         t.expect(ok).to.equal(true)
         t.expect(result).to.be_nil()
+    end)
+
+    t.it("refuses to export a session that already lost replay continuity", function()
+        local h = harness()
+        h.entity.session_io = session_io()
+        h.entity.session_io.unresumable = true
+        local ok, result = h.CMD.entity_call(7, "session_export", "b1")
+        t.expect(ok).to.equal(true)
+        t.expect(result).to.be_nil()
+        t.expect(h.entity.migration_exported).to.be_nil()
     end)
 
     t.it("refuses a snapshot that would move the owner epoch backwards", function()

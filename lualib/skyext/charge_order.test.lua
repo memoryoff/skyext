@@ -175,7 +175,7 @@ t.describe("charge_order 落单", function()
         local order, created = h.record()
         t.expect(order ~= nil).to.equal(true)
         t.expect(created).to.equal(false)
-        t.expect(order.rid).to.equal("7")
+        t.expect(order.rid).to.equal(7)
     end)
 
     -- 重复回调金额/币种/账号不一致：是串单或伪造，不能"以最新一次为准"

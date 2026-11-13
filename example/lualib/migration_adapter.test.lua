@@ -45,6 +45,9 @@ local function harness(opts)
                 return h.entities
             end
             if cmd == "migration_quiesce" then
+                if opts.quiesce_raises then
+                    error("entity agent unavailable")
+                end
                 return h.quiesce_ok ~= false, h.quiesce_err
             end
             if cmd == "migration_release" then
@@ -73,6 +76,9 @@ local function harness(opts)
                 return h.attach_ok ~= false, h.attach_err
             end
             if cmd == "freeze_owner" then
+                if opts.freeze_raises then
+                    error("gate unavailable")
+                end
                 return h.freeze_info or { sent = 0, epoch = 2, barrier_id = "b1" }, h.freeze_err
             end
             -- 取消兜底的两条腿要能分别注入失败：A-11 的核心是
@@ -193,6 +199,17 @@ t.describe("migration_adapter 六阶段", function()
         t.expect(call.args[1]).to.equal(7)
     end)
 
+    t.it("treats a quiesce RPC exception as possibly applied and fallback can unfreeze it", function()
+        local h = harness({ quiesce_raises = true })
+        local e = entity()
+        local ok, err = h.adapter.quiesce(e)
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.match("unavailable")
+        t.expect(e._quiesced).to.equal(true)
+        h.adapter.fallback(e, "quiesce failed")
+        t.expect(count_calls(h, "migration_unquiesce")).to.equal(1)
+    end)
+
     t.it("puts the gate barrier on the connection, not on the node", function()
         local h = harness()
         t.expect(h.adapter.freeze(entity(), "b1")).to.equal(true)
@@ -202,6 +219,16 @@ t.describe("migration_adapter 六阶段", function()
         t.expect(call.args[1]).to.equal("conn-7")
         t.expect(call.args[2]).to.equal(2)
         t.expect(call.args[3]).to.equal("b1")
+    end)
+
+    t.it("treats a freeze RPC exception as possibly applied and fallback kicks", function()
+        local h = harness({ freeze_raises = true })
+        local e = entity()
+        local ok, err = h.adapter.freeze(e, "b1")
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.match("unavailable")
+        h.adapter.fallback(e, "freeze failed")
+        t.expect(count_calls(h, "kick")).to.equal(1)
     end)
 
     t.it("refuses to freeze an entity without an owner epoch", function()

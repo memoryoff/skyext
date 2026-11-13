@@ -112,9 +112,9 @@ migration.run({
 
 1. `conf.enabled == true`；
 2. 取适配器：`CMD.set_adapter` 注入的优先，否则 `require(conf.adapter)`；
-3. 六个必需阶段（`list_entities` / `quiesce` / `freeze` / `export` / `transfer` /
-   `handoff` / `activate`）必须都是函数，缺一个就拒绝；
-4. 可选阶段 `probe`（BUSY 限时等待）与 `fallback`（降级通知）缺失只影响行为细节；
+3. 必需阶段（`list_entities` / `quiesce` / `freeze` / `export` / `transfer` /
+   `handoff` / `activate` / `fallback`）必须都是函数，缺一个就拒绝；
+4. 可选阶段只有 `probe`（BUSY 限时等待）；
 5. `adapter.init(conf)` 可选，用于拿实体类型等配置；
 6. 注册 `migrate` 停服钩子——注册失败同样拒绝启动。
 

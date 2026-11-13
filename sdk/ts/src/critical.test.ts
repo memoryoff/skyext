@@ -66,8 +66,14 @@ describe("client critical request", () => {
             expect(result.value.request.grant.rid).toBe(rid);
         }
         expect(validateGrant(grant({ rid: "70067467908940524" }))).toBeNull();
+        const normalized = buildRequest(opts({ grant: grant({ rid: "70067467908940524" }) }));
+        expect(normalized.ok).toBe(true);
+        if (normalized.ok) {
+            expect(normalized.value.request.grant.rid).toBe(70067467908940524n);
+        }
         expect(validateGrant(grant({ rid: 0 }))).toBe("invalid rid");
         expect(validateGrant(grant({ rid: "0" }))).toBe("invalid rid");
+        expect(validateGrant(grant({ rid: "9223372036854775808" }))).toBe("invalid rid");
     });
 
     test("accepts a binary mac as well as an encoded string", () => {
@@ -76,6 +82,12 @@ describe("client critical request", () => {
         expect(result.ok).toBe(true);
         if (result.ok) {
             expect(result.value.request.grant.mac).toBe(mac);
+        }
+        const highBytes = String.fromCharCode(0xde, 0xad, 0xbe, 0xef);
+        const normalized = buildRequest(opts({ grant: grant({ mac: highBytes }) }));
+        expect(normalized.ok).toBe(true);
+        if (normalized.ok) {
+            expect(Array.from(normalized.value.request.grant.mac as Uint8Array)).toEqual([0xde, 0xad, 0xbe, 0xef]);
         }
         expect(validateGrant(grant({ mac: new Uint8Array() }))).toBe("invalid mac");
     });
@@ -90,5 +102,7 @@ describe("client critical request", () => {
         const q = buildQuery({ protocol: "critical.query", op_id: "srv_" + "a".repeat(64) });
         expect(q.ok).toBe(true);
         expect(buildQuery({ protocol: "critical.query", op_id: "" }).ok).toBe(false);
+        expect(buildQuery({ protocol: "critical.query", op_id: "srv_" + "A".repeat(64) }).ok).toBe(false);
+        expect(buildQuery({ protocol: "critical.query", op_id: "a".repeat(33) + "_0001" }).ok).toBe(false);
     });
 });

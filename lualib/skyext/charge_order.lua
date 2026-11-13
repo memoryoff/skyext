@@ -134,6 +134,7 @@ local function normalize_rid(value)
     end
     return value
 end
+M.normalize_rid = normalize_rid
 
 function M.record(orders_coll, opts)
     if type(orders_coll) ~= "table" then
@@ -223,6 +224,9 @@ function M.record(orders_coll, opts)
                 end
                 return nil, "order conflict"
             end
+            -- 历史订单可能是字符串 rid。返回值必须归一化，否则后续 router.call
+            -- 会在 placement.calc_node 的 integer 校验处直接抛错。
+            existing.rid = rid
             return existing, false
         end
         return nil, (type(ret) == "table" and ret.errmsg) or ferr or "order upsert failed"
@@ -267,6 +271,7 @@ function M.record(orders_coll, opts)
         )
         return nil, "order conflict"
     end
+    order.rid = rid
     m_orders:inc(1, { status = order.status })
     return order, created
 end

@@ -113,8 +113,20 @@ t.describe("critical_reconciler 状态机", function()
         assert(run(h, { scan_limit = 7 }))
         local q = h.queries[1]
         t.expect(q.opts.limit).to.equal(7)
+        t.expect(q.opts.skip).to.equal(0)
+        t.expect(q.opts.sort).to.equal({ { updated_at = 1 }, { rid = 1 }, { op_id = 1 } })
         t.expect(q.query.state["$in"]).to.equal({ S.PENDING, S.CLAIMING_FENCE, S.RETRY_WAIT })
         t.expect(q.query["$or"][1].lease_until["$lte"]).to.equal(1000)
+    end)
+
+    t.it("advances the scan cursor when the page is full", function()
+        local h = harness()
+        h.jobs = {}
+        for i = 1, 2 do
+            h.jobs[i] = { rid = i, op_id = "srv_" .. string.rep("a", 64), job_version = 1, state = S.PENDING }
+        end
+        assert(run(h, { scan_limit = 2 }))
+        t.expect(h.deps.scan_cursor).to.equal(2)
     end)
 
     t.it("fails closed on missing deps or owner", function()

@@ -229,6 +229,9 @@ local function harness(handle, stored, defer)
     function collection:critical_update(query, update, upsert)
         h.critical_updates[#h.critical_updates + 1] = { query = query, update = update, upsert = upsert }
         if h.critical_state then
+            if h.critical_state_applies then
+                apply_update(h.store, update, false)
+            end
             return h.critical_state, h.critical_detail
         end
         if not match_doc(h.store, query) then
@@ -1601,7 +1604,7 @@ end)
 
 -- P13：Outbox 状态 CAS 是元数据写，不能和资产提交的 UNKNOWN 混为一类
 t.describe("dbmgr 元数据 CAS 与版本对齐", function()
-    local OUTBOX = { ["$set"] = { ["_critical_outbox_v1.evt"] = { status = "ENQUEUED" } } }
+    local OUTBOX = { ["$set"] = { ["_critical_outbox_v1"] = { evt = { status = "ENQUEUED" } } } }
 
     t.it("does not quarantine the cache for a metadata-only unknown", function()
         local h = harness(nil, nil, true)
@@ -1632,6 +1635,42 @@ t.describe("dbmgr 元数据 CAS 与版本对齐", function()
         t.expect(version).to.equal(3)
         t.expect(h.doc._version).to.equal(3)
         t.expect(h.db.cached_critical("demo", "role", 7)._critical_outbox_pending_count).to.equal(0)
+    end)
+
+    -- metadata CAS 已经落库但回包 UNKNOWN，随后普通字段变脏：如果直接拿旧版本
+    -- 做普通 CAS，会 n=0；读回 "版本 +1" 时若不看 stale，就会误 ACK 掉未保存的脏字段。
+    t.it("refreshes a stale metadata version before saving dirty business fields", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.critical_state_applies = true
+        h:enable_critical("UNKNOWN", "write concern timeout")
+        local state = h.db.critical_update("demo", "role", "rid", 7, 0, OUTBOX, { metadata_only = true })
+        t.expect(state).to.equal("UNKNOWN")
+        h.critical_doc = copy(h.store)
+        h.critical_read_error = nil
+        h.doc.name = "saved-after-stale"
+
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(true)
+        t.expect(h.store.name).to.equal("saved-after-stale")
+        t.expect(h.store._version).to.equal(2)
+        t.expect(h.doc._version).to.equal(2)
+        t.expect(orm.is_dirty(h.doc)).to.equal(false)
+    end)
+
+    t.it("keeps dirty data when a stale cache cannot be refreshed", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.critical_state_applies = true
+        h:enable_critical("UNKNOWN", "write concern timeout")
+        local state = h.db.critical_update("demo", "role", "rid", 7, 0, OUTBOX, { metadata_only = true })
+        t.expect(state).to.equal("UNKNOWN")
+        h.critical_read_error = "socket closed"
+        h.doc.name = "must-remain-dirty"
+
+        t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(false)
+        t.expect(h.store.name).to.equal("original")
+        t.expect(orm.is_dirty(h.doc)).to.equal(true)
+        t.expect(h.doc._version).to.equal(0)
     end)
 
     -- 读到旧副本时绝不能把内存版本退回去：那会让下一次 CAS 永远打不中

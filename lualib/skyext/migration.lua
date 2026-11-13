@@ -194,6 +194,9 @@ function M.run(deps, opts)
     if type(deps) ~= "table" or type(deps.list_entities) ~= "function" then
         return nil, "deps.list_entities is required"
     end
+    if type(deps.fallback) ~= "function" then
+        return nil, "deps.fallback is required"
+    end
     local called, entities, lerr = pcall(deps.list_entities)
     if not called then
         return nil, "list_entities failed: " .. tostring(entities)

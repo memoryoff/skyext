@@ -102,7 +102,13 @@ function M.reconcile_order(orders_coll, order, deps, opts)
         return M.OUTCOME.UNKNOWN, "order is required"
     end
     local now = opts.now or os.time()
-    local proof, perr = deps.query_op(order.rid, order.service_op_id)
+    local rid = charge_order.normalize_rid(order.rid)
+    if not rid then
+        return M.OUTCOME.UNKNOWN, "invalid order rid"
+    end
+    -- 旧订单可能把 rid 存成十进制字符串；路由和实体位置计算只接受 integer。
+    order.rid = rid
+    local proof, perr = deps.query_op(rid, order.service_op_id)
     if not proof then
         -- 查不到证明不等于没执行：绝不能因此把订单标成未发奖
         log.warn("charge reconcile query failed", "order", tostring(order.order_id), "err", tostring(perr))

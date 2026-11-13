@@ -23,6 +23,7 @@ local function deps(over)
     ok("freeze")
     ok("handoff")
     ok("activate")
+    ok("fallback")
     d.export = function()
         d.calls[#d.calls + 1] = "export"
         return { bytes = "SNAP", session_epoch = "S" }
@@ -151,6 +152,16 @@ t.describe("migration 批次", function()
         t.expect(stats.fallback).to.equal(0)
     end)
 
+    t.it("refuses a batch when the fallback outlet is missing", function()
+        local ok, err = migration.run({
+            list_entities = function()
+                return { entity() }
+            end,
+        }, {})
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.equal("deps.fallback is required")
+    end)
+
     -- 单个玩家的关键操作未决不能永久阻塞整节点退出
     t.it("degrades a critical-unknown entity without blocking the rest", function()
         local d = deps()
@@ -209,6 +220,7 @@ t.describe("migration 批次", function()
             list_entities = function()
                 error("etcd down")
             end,
+            fallback = function() end,
         }, {})
         t.expect(ok).to.be_nil()
         t.expect(err).to.match("etcd down")

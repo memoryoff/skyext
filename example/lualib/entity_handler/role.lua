@@ -163,7 +163,10 @@ function M.charge_handlers(entity, _order)
                 -- validate 已经拦过：走到这里说明有人绕过了它，不能悄悄发 0 个
                 return false, "invalid charge params"
             end
-            entity.modules.bag:add_item(CHARGE_RES.res_type, CHARGE_RES.res_id, count)
+            local added, add_err = entity.modules.bag:add_item(CHARGE_RES.res_type, CHARGE_RES.res_id, count)
+            if not added then
+                return false, add_err or "add_item failed"
+            end
             return true
         end,
     }

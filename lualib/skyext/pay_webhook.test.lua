@@ -346,6 +346,17 @@ t.describe("pay_webhook 落单与发奖", function()
         t.expect(h.orders.store.docs[1].status).to.equal("GRANTING")
     end)
 
+    t.it("does not return 200 when the ACK write fails", function()
+        local h = harness()
+        h.webhook.ack = function()
+            return false
+        end
+        local out = h.webhook:handle(fake_req("/pay/wechat/callback", h.body))
+        t.expect(out.status).to.equal(503)
+        t.expect(out.body.code).to.equal("ack_not_persisted")
+        t.expect(out.body.retryable).to.equal(true)
+    end)
+
     t.it("refuses to ack when no grant channel is configured", function()
         local h = harness({ no_grant = true })
         local out = h.webhook:handle(fake_req("/pay/wechat/callback", h.body))

@@ -130,9 +130,25 @@ t.describe("launcher 启动自检", function()
         local h = harness({ conf = { pay_callback = { enabled = true, role_type = "role", providers = {} } } })
         local report = h.launcher.self_check()
         -- 没配 providers，且它依赖的 critical_maintenance 也没启用
-        t.expect(#report.problems).to.equal(2)
+        t.expect(#report.problems).to.equal(3)
         t.expect(report.problems[1]).to.match("providers")
         t.expect(report.problems[2]).to.match("critical_maintenance is not enabled")
+        t.expect(report.problems[3]).to.match("role_type role is not configured")
+    end)
+
+    t.it("flags a payment callback role_type that is not a persistent configured entity", function()
+        local h = harness({
+            conf = {
+                pay_callback = { enabled = true, role_type = "missing", providers = { "mock" } },
+                critical_maintenance = { enabled = true, type_name = "role" },
+                entity_types = { role = {} },
+            },
+        })
+        local report = h.launcher.self_check()
+        t.expect(#report.problems).to.equal(3)
+        t.expect(report.problems[1]).to.match("critical_ledger")
+        t.expect(report.problems[2]).to.match("critical_jobs")
+        t.expect(report.problems[3]).to.match("missing")
     end)
 
     t.it("flags critical_maintenance enabled without critical_ledger/critical_jobs", function()
@@ -176,9 +192,10 @@ t.describe("launcher 启动自检", function()
             },
         })
         local report = h.launcher.self_check()
-        t.expect(#report.problems).to.equal(2)
+        t.expect(#report.problems).to.equal(3)
         t.expect(report.problems[1]).to.match("pay_callback is enabled but critical_maintenance is not enabled")
         t.expect(report.problems[2]).to.match("outbox_worker is enabled but critical_maintenance is not enabled")
+        t.expect(report.problems[3]).to.match("role_type role is not configured")
     end)
 
     t.it("does not flag the dependency when critical_maintenance is enabled and configured", function()

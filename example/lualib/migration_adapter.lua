@@ -134,7 +134,13 @@ local function pick_target(entity)
 end
 
 function M.quiesce(entity)
-    local ok, reason = call_agent(self_node(), entity.id, "migration_quiesce", entity.id)
+    local called, ok, reason = pcall(call_agent, self_node(), entity.id, "migration_quiesce", entity.id)
+    if not called then
+        -- RPC 可能已经在源实体上生效，只是回包丢失。先把“可能已冻结”登记下来，
+        -- 失败路径会幂等地调用 unquiesce；不登记会让实体永久停在 migrating=true。
+        entity._quiesced = true
+        return nil, tostring(ok)
+    end
     if not ok then
         return nil, tostring(reason)
     end
@@ -146,7 +152,15 @@ function M.freeze(entity, barrier_id)
     if not entity.owner_epoch then
         return nil, "entity has no owner epoch"
     end
-    local info, err = call_gate(entity.conn_id, "freeze_owner", entity.conn_id, entity.owner_epoch, barrier_id)
+    local called, info, err =
+        pcall(call_gate, entity.conn_id, "freeze_owner", entity.conn_id, entity.owner_epoch, barrier_id)
+    if not called then
+        -- 网关可能已经建立屏障，只是连接在回包前断了。按 UNKNOWN 保留 barrier
+        -- 身份，让 fallback 必须踢客户端解除可能存在的 frozen_epoch。
+        g_inflight[entity.id] = { id = entity.id, conn_id = entity.conn_id, barrier_id = barrier_id }
+        entity._barrier = barrier_id
+        return nil, tostring(info)
+    end
     if not info then
         return nil, tostring(err)
     end

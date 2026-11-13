@@ -188,6 +188,16 @@ t.describe("capability 签发边界", function()
         t.expect(issuer).to.be_nil()
         t.expect(err).to.equal("namespace is not a trusted dispatch entry")
         capability.ALLOWED_NAMESPACES = nil
+
+        -- 公开查询函数也不能作为签发判定的入口
+        local original_is_allowed = capability.is_allowed_namespace
+        capability.is_allowed_namespace = function()
+            return true
+        end
+        local forged, forged_err = capability.new_issuer("client", { "grant_coin" })
+        t.expect(forged).to.be_nil()
+        t.expect(forged_err).to.equal("namespace is not a trusted dispatch entry")
+        capability.is_allowed_namespace = original_is_allowed
     end)
 
     t.it("only reports a namespace for a real registered cap", function()

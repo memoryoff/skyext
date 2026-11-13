@@ -44,6 +44,29 @@ local g_default_projection = { _id = false, _fence = false }
 -- 认领 fence 时需要读回 _fence 判断归属，之后再从文档里剔除（schema 中没有这个字段）。
 local g_claim_projection = { _id = false }
 local FENCE_CLAIM_ATTEMPTS = 3
+
+local function align_cached_critical(entry, raw, critical, handle)
+    if handle and entry.handle ~= handle then
+        return nil, "owner changed"
+    end
+    local target = raw._version
+    if math.type(target) ~= "integer" then
+        return nil, "invalid version in document"
+    end
+    if target < entry.doc._version then
+        -- 库里的版本更低说明读到了旧副本：绝不能把内存版本退回去
+        return nil, "stale read"
+    end
+    while entry.doc._version < target do
+        local current = entry.doc._version
+        if not orm.advance_persisted_version(entry.doc, current, current + 1) then
+            return nil, "version advance failed"
+        end
+    end
+    entry.critical = critical
+    entry.stale = nil
+    return true, target
+end
 -- 配置有可能在模块加载之后才注入（dbmgr 会被很早 require 到），
 -- 在加载期读取会把 nil / 空表永久缓存下来，因此改成惰性读取 + 缓存
 local g_mongo_config
@@ -349,6 +372,35 @@ local function save_doc(entry, coll_obj, handle)
     end
     if not orm.is_dirty(doc) then
         return true
+    end
+
+    -- metadata-only CAS 可能已经落库但回包丢失。entry.stale 表示内存里的
+    -- `_version`/关键元数据不再可信；普通 save 绝不能拿这个版本当作自己的写入凭据，
+    -- 否则 CAS 落空后读回 "旧版本 + 1" 会被误认为 dirty 字段已保存并 ack 掉。
+    if entry.stale then
+        local called, raw = read_claim_doc(coll_obj, { [key] = unique_id })
+        if not called or type(raw) ~= "table" then
+            log.warn("cannot clear stale cache before save", "key", key, "unique_id", unique_id)
+            return false
+        end
+        local clean, critical = critical_fields.extract(raw)
+        if not clean then
+            log.error("cannot extract critical fields before save", "key", key, "unique_id", unique_id)
+            return false
+        end
+        local aligned, align_err = align_cached_critical(entry, raw, critical, handle)
+        if not aligned then
+            log.warn(
+                "cannot align stale cache before save",
+                "key",
+                key,
+                "unique_id",
+                unique_id,
+                "err",
+                tostring(align_err)
+            )
+            return false
+        end
     end
 
     local old_version = assert(doc._version, "document has no _version")
@@ -1048,26 +1100,7 @@ function M.refresh_critical(dbname, dbcoll, key, unique_id, opts)
         if not entry then
             return nil, "not cached"
         end
-        if opts.handle and entry.handle ~= opts.handle then
-            return nil, "owner changed"
-        end
-        local target = raw._version
-        if math.type(target) ~= "integer" then
-            return nil, "invalid version in document"
-        end
-        if target < entry.doc._version then
-            -- 库里的版本更低说明读到了旧副本：绝不能把内存版本退回去
-            return nil, "stale read"
-        end
-        while entry.doc._version < target do
-            local current = entry.doc._version
-            if not orm.advance_persisted_version(entry.doc, current, current + 1) then
-                return nil, "version advance failed"
-            end
-        end
-        entry.critical = critical
-        entry.stale = nil
-        return true, target
+        return align_cached_critical(entry, raw, critical, opts.handle)
     end)
 end
 

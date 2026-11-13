@@ -150,18 +150,10 @@ function CMD.start(conf)
     -- 这里 fail-fast，让 launcher 把节点启动拦下来，绝不静默降级。
     local ledger_spec = tc.critical_ledger
     local jobs_spec = tc.critical_jobs
-    local invalid
-    if not critical_config.validate_collection_spec(ledger_spec) then
-        invalid = "critical_ledger"
-    elseif not critical_config.validate_collection_spec(jobs_spec) then
-        invalid = "critical_jobs"
-    end
+    local config_ok, config_err = critical_config.validate_entity_config(tc)
+    local invalid = not config_ok and config_err or nil
     if invalid then
-        local msg = string.format(
-            "entity type %s has no valid %s config (db/coll required)",
-            tostring(g_opts.type_name),
-            invalid
-        )
+        local msg = string.format("entity type %s has invalid critical config: %s", tostring(g_opts.type_name), invalid)
         log.error("critical maintenance not started", "err", msg)
         return false, msg
     end
@@ -187,6 +179,7 @@ function CMD.start(conf)
     -- 任务表只负责调度，资产事实永远取角色文档
     g_reconcile_deps = {
         jobs_coll = jobs,
+        scan_cursor = 0,
         claim = function(rid, op_id, owner, lease_until, version)
             return critical.claim_job(jobs, rid, op_id, owner, lease_until, {
                 job_version = version,
@@ -214,6 +207,9 @@ function CMD.start(conf)
                     )
                 elseif unloaded ~= true then
                     log.warn("critical resolve unload was refused", "rid", tostring(rid), "err", tostring(uerr))
+                end
+                if not called or unloaded ~= true then
+                    return { status = "UNKNOWN", reason = "unload failed: " .. tostring(called and uerr or unloaded) }
                 end
             end
             return result

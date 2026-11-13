@@ -349,7 +349,7 @@ t.describe("config.init", function()
 
     t.it("配置环境提供受限的基础函数", function()
         with_config({
-            ["app.lua"] = 'local parts = {}\nfor i = 1, 3 do parts[#parts + 1] = tostring(i) end\njoined = table.concat(parts, ",")\n',
+            ["app.lua"] = 'local parts = {}\nfor i = 1, 3 do parts[#parts + 1] = tostring(i) end\nlocal ok, value = pcall(function() return table.concat(parts, ",") end)\njoined = ok and value or "pcall failed"\n',
         }, function(dir)
             local h = harness({ app_config_path = fs.join(dir, "app.lua") })
             h.config.init()

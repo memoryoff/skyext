@@ -71,7 +71,10 @@ function M:claim(mail_id)
     end
     local bag = self.entity.modules.bag
     for _, item in ipairs(mail.attach or {}) do
-        bag:add_item(item.res_type, item.res_id, item.res_size)
+        local added, err = bag:add_item(item.res_type, item.res_id, item.res_size)
+        if not added then
+            return nil, err or "mail attachment failed"
+        end
     end
     self.data.mails[mail_id] = nil
     return true

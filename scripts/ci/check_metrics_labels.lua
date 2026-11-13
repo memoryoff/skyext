@@ -25,13 +25,10 @@ local FORBIDDEN = {
     trace_id = true,
 }
 
-local CANDIDATES = {
-    "metrics.counter(",
-    "metrics.gauge(",
-    "metrics.histogram(",
-    "metrics:counter(",
-    "metrics:gauge(",
-    "metrics:histogram(",
+local METRIC_METHODS = {
+    counter = true,
+    gauge = true,
+    histogram = true,
 }
 
 local function read_file(path)
@@ -211,6 +208,10 @@ local function label_names(src, masked, first, last)
     for index, range in ipairs(ranges) do
         local a, b = trimmed(masked, range.first, range.last)
         if a > b then
+            local raw_a, raw_b = trimmed(src, range.first, range.last)
+            if raw_a <= raw_b then
+                return nil, "metric labels must use ordinary quoted literals"
+            end
             if index == #ranges then
                 -- 允许尾随逗号
                 break
@@ -224,47 +225,105 @@ local function label_names(src, masked, first, last)
         if masked:sub(a + 1, b - 1):find("%S") then
             return nil, "metric labels must contain only literal strings"
         end
-        labels[#labels + 1] = src:sub(a + 1, b - 1)
+        local original = src:sub(a + 1, b - 1)
+        if original:find("\\", 1, true) then
+            return nil, "escaped metric labels cannot be audited"
+        end
+        labels[#labels + 1] = original
     end
     return labels
+end
+
+local function metric_names(src)
+    local names = { metrics = true }
+    for alias in src:gmatch("local%s+([%a_][%w_]*)%s*=%s*require%s*[\"']skyext%.metrics[\"']") do
+        names[alias] = true
+    end
+    for alias in src:gmatch("local%s+([%a_][%w_]*)%s*=%s*require%s*%(%s*[\"']skyext%.metrics[\"']%s*%)") do
+        names[alias] = true
+    end
+    return names
+end
+
+local function find_metric_call(masked, names, cursor)
+    local best
+    for name in pairs(names) do
+        local from = cursor
+        while true do
+            local start_pos = masked:find(name, from, true)
+            if not start_pos then
+                break
+            end
+            local before = start_pos > 1 and masked:sub(start_pos - 1, start_pos - 1) or ""
+            if before:match("[%w_]") then
+                from = start_pos + 1
+            else
+                local i = start_pos + #name
+                while masked:sub(i, i):match("%s") do
+                    i = i + 1
+                end
+                local separator = masked:sub(i, i)
+                if separator == "." or separator == ":" then
+                    i = i + 1
+                    while masked:sub(i, i):match("%s") do
+                        i = i + 1
+                    end
+                    local method_start = i
+                    while masked:sub(i, i):match("[%a_]") do
+                        i = i + 1
+                    end
+                    local method = masked:sub(method_start, i - 1)
+                    while masked:sub(i, i):match("%s") do
+                        i = i + 1
+                    end
+                    if METRIC_METHODS[method] and masked:sub(i, i) == "(" then
+                        if not best or start_pos < best.start_pos then
+                            best = { start_pos = start_pos, open_paren = i, method = method }
+                        end
+                    end
+                end
+                from = start_pos + 1
+            end
+        end
+    end
+    return best
 end
 
 local function check_file(path, src)
     local problems = {}
     local masked = mask(src)
+    local names = metric_names(src)
     local cursor = 1
     while true do
-        local start_pos, end_pos
-        for _, needle in ipairs(CANDIDATES) do
-            local a, b = masked:find(needle, cursor, true)
-            if a and (not start_pos or a < start_pos) then
-                start_pos, end_pos = a, b
-            end
-        end
-        if not start_pos then
+        local call = find_metric_call(masked, names, cursor)
+        if not call then
             break
         end
-        local close_paren = call_close(masked, end_pos)
+        local close_paren = call_close(masked, call.open_paren)
         if not close_paren then
-            problems[#problems + 1] =
-                string.format("%s:%d: metric call has no matching close parenthesis", path, line_of(src, start_pos))
+            problems[#problems + 1] = string.format(
+                "%s:%d: metric call has no matching close parenthesis",
+                path,
+                line_of(src, call.start_pos)
+            )
             break
         end
-        local args = split_args(masked, end_pos + 1, close_paren - 1)
-        if #args > 3 then
+        local args = split_args(masked, call.open_paren + 1, close_paren - 1)
+        local max_args = call.method == "histogram" and 4 or 3
+        if #args > max_args then
             problems[#problems + 1] =
-                string.format("%s:%d: metric call has unexpected extra arguments", path, line_of(src, start_pos))
-        elseif #args == 3 then
+                string.format("%s:%d: metric call has unexpected extra arguments", path, line_of(src, call.start_pos))
+        elseif #args >= 3 then
             local labels, label_err = label_names(src, masked, args[3].first, args[3].last)
             if not labels then
-                problems[#problems + 1] = string.format("%s:%d: %s", path, line_of(src, start_pos), label_err)
+                problems[#problems + 1] = string.format("%s:%d: %s", path, line_of(src, call.start_pos), label_err)
             else
                 for _, label in ipairs(labels) do
                     if FORBIDDEN[label] then
                         problems[#problems + 1] = string.format(
                             "%s:%d: metric label %q is high-cardinality; use a result/state category instead",
                             path,
-                            line_of(src, start_pos),
+                            line_of(src, call.start_pos),
                             label
                         )
                     end
@@ -300,6 +359,31 @@ local function self_test()
             expected = 1,
         },
         { name = "safe table", source = [[metrics.counter("x", "help", { "status", "reason" })]], expected = 0 },
+        {
+            name = "histogram buckets are allowed",
+            source = [[metrics.histogram("x", "help", { "status" }, { 0.1, 1 })]],
+            expected = 0,
+        },
+        {
+            name = "metric alias is checked",
+            source = [[local m = require("skyext.metrics"); m.counter("x", "help", { "rid" })]],
+            expected = 1,
+        },
+        {
+            name = "spaced metric call is checked",
+            source = [[metrics.counter ("x", "help", { "rid" })]],
+            expected = 1,
+        },
+        {
+            name = "long string labels fail closed",
+            source = 'metrics.counter("x", "help", { [=[rid]=] })',
+            expected = 1,
+        },
+        {
+            name = "escaped labels fail closed",
+            source = 'metrics.counter("x", "help", { "r\\105d" })',
+            expected = 1,
+        },
     }
     for _, case in ipairs(cases) do
         local got = #check_file("self-test.lua", case.source)

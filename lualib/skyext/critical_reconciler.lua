@@ -47,6 +47,7 @@ function M.run_once(deps, opts)
     end
     local now = opts.now or os.time()
     local lease = opts.lease or M.DEFAULT_LEASE
+    local skip = math.tointeger(opts.skip or deps.scan_cursor) or 0
     local stats = {
         claimed = 0,
         committed = 0,
@@ -58,6 +59,7 @@ function M.run_once(deps, opts)
     }
 
     -- 只扫租约到期的可认领任务；索引是 {state:1, lease_until:1}
+    local scan_limit = opts.scan_limit or M.DEFAULT_SCAN
     local called, jobs, err = pcall(deps.jobs_coll.find_many, deps.jobs_coll, {
         state = { ["$in"] = DUE_STATES },
         ["$or"] = {
@@ -65,7 +67,10 @@ function M.run_once(deps, opts)
             { lease_until = { ["$exists"] = false } },
         },
     }, {
-        limit = opts.scan_limit or M.DEFAULT_SCAN,
+        limit = scan_limit,
+        skip = skip,
+        -- 稳定排序 + 轮转游标：持续 UNKNOWN 的任务不能永远占据队头
+        sort = { { updated_at = 1 }, { rid = 1 }, { op_id = 1 } },
         projection = { _id = 0 },
     })
     if not called then
@@ -74,6 +79,7 @@ function M.run_once(deps, opts)
     if type(jobs) ~= "table" then
         return nil, tostring(err or "reconcile scan failed")
     end
+    deps.scan_cursor = #jobs >= scan_limit and skip + #jobs or 0
 
     for _, job in ipairs(jobs) do
         if type(job) == "table" and type(job.state) == "string" then

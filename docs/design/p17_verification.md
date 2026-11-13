@@ -136,7 +136,7 @@ Outbox 的驻留量（它直接决定单次提交的写放大）。
 > V-02 ~ V-05 与 V-07 的注入方式 / 观察指标 / 通过标准 / 记录模板、失败定位顺序。
 > 本节只保留要点，细节以手册为准。
 
-### B1：真实副本集多数派实测（已跑通，保留步骤供复跑）
+### B1：真实副本集多数派实测（旧脚本曾跑通，新双窗口门禁待复跑）
 
 1. 起三节点副本集（`rs.initiate`），确认 `w:majority, j:true` 生效。
 2. 用 `coll:critical_probe()` 或 GM 命令 `critical_probe`（见 [GM API](../guide/gm_api.md#critical_probe--多数派探针)）

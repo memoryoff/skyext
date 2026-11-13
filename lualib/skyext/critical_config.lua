@@ -21,4 +21,34 @@ function M.validate_collection_spec(spec)
     return true
 end
 
+function M.same_collection(a, b)
+    return type(a) == "table" and type(b) == "table" and a.db == b.db and a.coll == b.coll
+end
+
+function M.validate_entity_config(type_config)
+    if type(type_config) ~= "table" then
+        return false, "entity type config must be a table"
+    end
+    local ledger = type_config.critical_ledger
+    local jobs = type_config.critical_jobs
+    local ok, err = M.validate_collection_spec(ledger)
+    if not ok then
+        return false, "critical_ledger " .. err
+    end
+    ok, err = M.validate_collection_spec(jobs)
+    if not ok then
+        return false, "critical_jobs " .. err
+    end
+    if M.same_collection(ledger, jobs) then
+        return false, "critical_ledger and critical_jobs must use different collections"
+    end
+    if type(type_config.db_name) == "string" and type(type_config.db_coll) == "string" then
+        local role = { db = type_config.db_name, coll = type_config.db_coll }
+        if M.same_collection(role, ledger) or M.same_collection(role, jobs) then
+            return false, "critical ledger collections must differ from the entity collection"
+        end
+    end
+    return true
+end
+
 return M

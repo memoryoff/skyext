@@ -619,6 +619,24 @@ local function commit_core(ctx, req, handlers)
         -- 满了不能只拒绝：COMMITTED/BUSINESS_REJECTED 都是已结算事实，可以安全
         -- 先搬到冷账本再从热账本删除。没有这一步，持续的业务拒绝能让角色永久被
         -- CAPACITY_EXCEEDED 锁死，支付发奖也拿不到提交机会。
+        local refreshed, rerr = dbmgr.refresh_critical(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, {
+            handle = ctx.handle,
+        })
+        if not refreshed then
+            return decision(M.STATUS.UNKNOWN, nil, M.NO_CACHE, {
+                reason = "capacity refresh failed: " .. tostring(rerr),
+            })
+        end
+        critical = critical_of(ctx)
+        if critical == nil then
+            return decision(M.STATUS.UNKNOWN, nil, M.NO_CACHE, {
+                reason = "critical cache disappeared after capacity refresh",
+            })
+        end
+        op_count = 0
+        for _ in pairs(critical[M.OPS_FIELD] or {}) do
+            op_count = op_count + 1
+        end
         if req.ledger then
             local result, aerr = M.archive_ops(ctx, { ledger = req.ledger }, {
                 now = req.now,
@@ -1617,6 +1635,28 @@ function M.archive_ops(ctx_or_entity, deps, opts)
     if state ~= "CONFIRMED" then
         -- 热条目还在、冷账本多一份副本：重复归档是幂等的（$setOnInsert）
         m_archive:inc(1, { result = tostring(state):lower() })
+        if state == "UNKNOWN" then
+            -- 冷账本已经写入，热账本 CAS 可能也生效只是回包丢失。按多数派读回
+            -- 真实关键字段；如果 moved 已从热账本消失，就可以把这次归档当作
+            -- 已确认，否则保留旧缓存等下一轮重试。
+            local refreshed = dbmgr.refresh_critical(ctx.dbname, ctx.dbcoll, ctx.key, ctx.unique_id, {
+                handle = ctx.handle,
+            })
+            local current = refreshed and critical_of(ctx) or nil
+            if current then
+                local applied = true
+                for _, op_id in ipairs(moved) do
+                    if current[M.OPS_FIELD] and current[M.OPS_FIELD][op_id] then
+                        applied = false
+                        break
+                    end
+                end
+                if applied then
+                    m_archive:inc(1, { result = "unknown_converged" })
+                    return { archived = #moved, remaining = remaining_oldest }
+                end
+            end
+        end
         return { archived = 0, retry = true }, state
     end
 

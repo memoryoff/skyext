@@ -144,9 +144,9 @@ scan  --(索引 _critical_outbox_pending_count > 0)--> [rid...]
 - 为什么必须经 owner：`PENDING -> ENQUEUED` 是一次 `_version` CAS，角色文档的写入
   必须和玩家请求走同一条实体队列。绕过 owner 直接写会和业务请求抢同一个 `_version`，
   把版本冲突变成线上随机失败。
-- `outbox_pump` 是**框架内部命令**：`router.call` 固定走 `entity_call`，只认
-  `handler.handlers[cmd]`，所以框架命令在 `entity_agent` 的 `FRAMEWORK` 表里注册，
-  且同名时框架优先——业务 handler 覆盖它会绕过 capability 签发。
+- `outbox_pump` 是**框架内部命令**：`router.call` 固定走 `entity_call`，统一经
+  `handler.resolve` 解析。框架内置命令优先，游戏层扩展必须放在
+  `handler.framework_commands`；同名业务 handler 不能覆盖受保护的框架命令。
 - 索引是门禁：`ensure_indexes` 失败时调度器**不启动**，宁可不投递也不用全表扫描。
 - 轮转游标：每轮记录 `skip`，页满时前进、页不满归零，避免前面的角色一直投不出去时
   后面的角色饿死。
@@ -161,7 +161,7 @@ scan  --(索引 _critical_outbox_pending_count > 0)--> [rid...]
 游戏层的 `__apply_outbox_event` 只需要一行 `return receiver:handle(entity, envelope)`。
 框架在这一层做完四件事：
 
-1. 信封自洽校验（版本、`event_id` 格式、目标、`op_type`、`param_hash` 长度）；
+1. 信封自洽校验（版本、`event_id` 格式、目标、`op_type`、`param_hash` 的 64 位小写 hex）；
 2. **目标必须就是本实体**——错投的事件绝不在本实体上执行；
 3. 用同一条摘要通道重算 `param_hash`，与信封不符按永久无效处理（重试不会成功）；
 4. 在 `entity_agent` 进程内签发 capability（cap 不能跨进程传），再走
@@ -173,7 +173,7 @@ scan  --(索引 _critical_outbox_pending_count > 0)--> [rid...]
 |---|---|---|
 | `COMMITTED` / `BUSINESS_REJECTED` / `PRECHECK_REJECTED` | `critical` 的 decision | 业务终态，ACK |
 | `UNKNOWN` / `IN_PROGRESS` / `CAPACITY_EXCEEDED` | `delivery.retryable(reason)` | 保留 pending，不累计 attempts、不进 DLQ |
-| 永久无效（信封/目标/摘要不符） | `nil, err` | 按旧合同 ACK，不重复重投 |
+| 永久无效（信封/目标/摘要不符） | **抛错** | 计入 attempts，到上限进 DLQ，人工可见 |
 | `OP_CONFLICT` / `INTERNAL_AUTH_DENIED` | **抛错** | 计入 attempts，到上限进 DLQ，人工可见 |
 
 `IN_PROGRESS` 和容量不足都是暂态：ACK 掉会让业务永不执行且不再重投，这是最隐蔽的

@@ -25,6 +25,20 @@ COLL=probe
 CONTROL_COLL=probe_control
 PIDS=()
 
+fail() {
+    echo "replica stepdown check FAILED: $*" >&2
+    exit 1
+}
+
+case "$WORKERS" in
+    ''|*[!0-9]*) fail "workers must be a positive integer" ;;
+esac
+case "$MAX_ITERATIONS" in
+    ''|*[!0-9]*) fail "max_iterations must be a positive integer" ;;
+esac
+[ "$WORKERS" -ge 2 ] || fail "workers must be at least 2 to prove concurrent writes"
+[ "$MAX_ITERATIONS" -ge 1 ] || fail "max_iterations must be at least 1"
+
 cleanup() {
     for pid in "${PIDS[@]:-}"; do
         kill "$pid" 2>/dev/null || true
@@ -33,9 +47,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
-fail() {
-    echo "replica stepdown check FAILED: $*" >&2
-    exit 1
+wait_writers() {
+    for pid in "${PIDS[@]}"; do
+        local alive=0
+        for _ in $(seq 1 100); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                alive=0
+                break
+            fi
+            alive=1
+            sleep 0.2
+        done
+        if [ "$alive" -eq 1 ]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    done
+    PIDS=()
 }
 
 # ---------------------------------------------------------------------------
@@ -47,6 +75,7 @@ TOPOLOGY=$(mongosh "$URI" --quiet --eval "
   print(JSON.stringify({
     setName: h.setName || null,
     primary: h.primary || null,
+    term: h.term || null,
     writable: h.isWritablePrimary === true,
     members: h.hosts ? h.hosts.length : 0
   }));
@@ -55,11 +84,13 @@ TOPOLOGY=$(mongosh "$URI" --quiet --eval "
 SET_NAME=$(printf '%s' "$TOPOLOGY" | sed -n 's/.*"setName":"\([^"]*\)".*/\1/p')
 MEMBER_COUNT=$(printf '%s' "$TOPOLOGY" | sed -n 's/.*"members":\([0-9]*\).*/\1/p')
 PRIMARY_BEFORE=$(printf '%s' "$TOPOLOGY" | sed -n 's/.*"primary":"\([^"]*\)".*/\1/p')
+TERM_BEFORE=$(printf '%s' "$TOPOLOGY" | sed -n 's/.*"term":\([0-9]*\).*/\1/p')
 
 [ -n "$SET_NAME" ] || fail "目标不是副本集（setName 为空），stepDown 语义无从谈起"
 [ "${MEMBER_COUNT:-0}" -ge 3 ] || fail "副本集只有 ${MEMBER_COUNT:-0} 个节点，无法验证多数派切主"
+[ -n "$TERM_BEFORE" ] || fail "无法读取切主前 term"
 
-echo "topology: set=$SET_NAME members=$MEMBER_COUNT primary=$PRIMARY_BEFORE"
+echo "topology: set=$SET_NAME members=$MEMBER_COUNT primary=$PRIMARY_BEFORE term=$TERM_BEFORE"
 
 mongosh "$URI" --quiet --eval "
   const c = db.getSiblingDB('$DB').$COLL;
@@ -75,7 +106,7 @@ mongosh "$URI" --quiet --eval "
 # 并把 phase 切到 post 之后；同一个原子更新会按当时的 phase 累计成功写，
 # 因此最终能证明切主前和切主后都真的发生过写入。
 # ---------------------------------------------------------------------------
-for _ in $(seq 1 "$WORKERS"); do
+for worker in $(seq 1 "$WORKERS"); do
     mongosh "$URI" --quiet --eval "
       const d = db.getSiblingDB('$DB');
       const c = d.$COLL;
@@ -89,7 +120,12 @@ for _ in $(seq 1 "$WORKERS"); do
           const bucket = run.phase === 'post' ? 'post_hits' : 'pre_hits';
           const inc = {_version:1, hits:1};
           inc[bucket] = 1;
-          c.updateOne({_id:'op1', _version:cur._version}, {\$inc:inc});
+          inc[(run.phase === 'post' ? 'post_worker_' : 'pre_worker_') + $worker] = 1;
+          c.updateOne(
+            {_id:'op1', _version:cur._version},
+            {\$inc:inc},
+            {writeConcern:{w:'majority', j:true}}
+          );
         } catch (e) {
           // stepDown 期间的 NotWritablePrimary 是预期内的
         }
@@ -124,23 +160,31 @@ STEPDOWN_RESULT=$(mongosh "$URI" --quiet --eval "
   }
 " 2>&1) || true
 
+case "$STEPDOWN_RESULT" in
+    *"ok=true"*|*"threw="*) ;;
+    *) fail "replSetStepDown 没有得到明确响应（结果: $STEPDOWN_RESULT）" ;;
+esac
+
 PRIMARY_AFTER=""
+TERM_AFTER=""
 for _ in $(seq 1 30); do
-    PRIMARY_AFTER=$(mongosh "$URI" --quiet --eval "print(db.hello().primary || '')" 2>/dev/null || true)
-    if [ -n "$PRIMARY_AFTER" ] && [ "$PRIMARY_AFTER" != "$PRIMARY_BEFORE" ]; then
+    AFTER_TOPOLOGY=$(mongosh "$URI" --quiet --eval "
+      const h = db.hello();
+      print(JSON.stringify({ primary: h.primary || null, term: h.term || null }));
+    " 2>/dev/null || true)
+    PRIMARY_AFTER=$(printf '%s' "$AFTER_TOPOLOGY" | sed -n 's/.*"primary":"\([^"]*\)".*/\1/p')
+    TERM_AFTER=$(printf '%s' "$AFTER_TOPOLOGY" | sed -n 's/.*"term":\([0-9]*\).*/\1/p')
+    if [ -n "$PRIMARY_AFTER" ] && [ "$PRIMARY_AFTER" != "$PRIMARY_BEFORE" ] && [ -n "$TERM_AFTER" ]; then
         break
     fi
     sleep 1
 done
 
-for pid in "${PIDS[@]}"; do
-    wait "$pid" 2>/dev/null || true
-done
-
 [ -n "$PRIMARY_AFTER" ] || fail "切主后读不到新的 primary（stepDown 结果: $STEPDOWN_RESULT）"
 [ "$PRIMARY_AFTER" != "$PRIMARY_BEFORE" ] || fail "primary 仍是 $PRIMARY_BEFORE，stepDown 没有真的发生（结果: $STEPDOWN_RESULT）"
+[ -n "$TERM_AFTER" ] && [ "$TERM_AFTER" -gt "$TERM_BEFORE" ] || fail "term 没有前进（$TERM_BEFORE -> ${TERM_AFTER:-unknown}）"
 
-echo "primary moved: $PRIMARY_BEFORE -> $PRIMARY_AFTER"
+echo "primary moved: $PRIMARY_BEFORE -> $PRIMARY_AFTER (term $TERM_BEFORE -> $TERM_AFTER)"
 
 # ---------------------------------------------------------------------------
 # 门禁 3：在新 primary 上开启 post 窗口，继续让同一批 writer 写。
@@ -173,10 +217,7 @@ mongosh "$URI" --quiet --eval "
   db.getSiblingDB('$DB').$CONTROL_COLL.updateOne({_id:'run'}, {\$set:{stop:true}});
 " >/dev/null 2>&1 || true
 
-for pid in "${PIDS[@]}"; do
-    wait "$pid" 2>/dev/null || true
-done
-PIDS=()
+wait_writers
 
 [ "$POST_READY" -eq 1 ] || fail "切主后没有形成并发成功写（post_hits=${POST_HITS:-0}, workers=$WORKERS）"
 
@@ -188,13 +229,26 @@ mongosh "$URI" --quiet --eval "
   const count = c.countDocuments({});
   const d = c.findOne({_id:'op1'});
   if (!d) { throw new Error('probe document disappeared'); }
+  let preWorkers = 0, postWorkers = 0;
+  for (let i = 1; i <= $WORKERS; i++) {
+    if (d['pre_worker_' + i] > 0) preWorkers++;
+    if (d['post_worker_' + i] > 0) postWorkers++;
+  }
   print('documents=' + count + ' version=' + d._version + ' hits=' + d.hits +
-        ' pre=' + d.pre_hits + ' post=' + d.post_hits);
+        ' pre=' + d.pre_hits + ' post=' + d.post_hits +
+        ' pre_workers=' + preWorkers + ' post_workers=' + postWorkers);
   if (count !== 1) { throw new Error('duplicated document: ' + count); }
   if (d.pre_hits < $WORKERS) { throw new Error('no successful write before stepdown'); }
   if (d.post_hits < $WORKERS) { throw new Error('no successful write after stepdown'); }
+  if (preWorkers < $WORKERS) { throw new Error('not every worker wrote before stepdown'); }
+  if (postWorkers < $WORKERS) { throw new Error('not every worker wrote after stepdown'); }
   if (d.hits !== d.pre_hits + d.post_hits) { throw new Error('phase buckets do not add up to hits'); }
   if (d._version !== d.hits) { throw new Error('version and hits diverged'); }
 " || fail "结果断言未通过"
+
+FINAL_PRIMARY=$(mongosh "$URI" --quiet --eval "print(db.hello().primary || '')" 2>/dev/null || true)
+FINAL_TERM=$(mongosh "$URI" --quiet --eval "print(db.hello().term || '')" 2>/dev/null || true)
+[ "$FINAL_PRIMARY" = "$PRIMARY_AFTER" ] || fail "post 窗口后 primary 再次变化：$PRIMARY_AFTER -> ${FINAL_PRIMARY:-unknown}"
+[ "$FINAL_TERM" = "$TERM_AFTER" ] || fail "post 窗口后 term 再次变化：$TERM_AFTER -> ${FINAL_TERM:-unknown}"
 
 echo "replica stepdown check passed"

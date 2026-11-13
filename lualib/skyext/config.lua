@@ -135,6 +135,7 @@ local function load_config(config_name)
             tonumber = tonumber,
             assert = assert,
             error = error,
+            pcall = pcall,
             select = select,
             string = readonly_view(string),
             table = readonly_view(table),

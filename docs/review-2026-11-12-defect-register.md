@@ -31,7 +31,7 @@
 | 第四轮全量对抗审查 · 待环境 | 1 | D-31 已改为切主前后双窗口门禁，待真实三节点副本集复跑 |
 | 复核 `5bc8073` · 已修 | 8 | RV-01 ~ RV-08，见 §13 |
 | 阻塞生产的 P0 | 1（已修） | 原有 5 条 P0 已收敛；本轮发现并修复 A-06 递归合并引入的配置执行环境回归，见 §12.7 |
-| 需真实环境验证 | 7 | V-01 / V-06 已实测通过；V-02 ~ V-05 需要多节点与故障注入；V-07 已提供可复跑脚本 |
+| 需真实环境验证 | 7 | V-01 待用新双窗口门禁复跑；V-06 已实测；V-02 ~ V-05 需要多节点与故障注入；V-07 已提供可复跑脚本 |
 | 设计权衡（记录不改） | 4 | 见 §5 |
 | 后续优化 | 3 | P2 类，不阻塞生产验收 |
 
@@ -87,7 +87,7 @@
 | R-04（完成） | `pump` 连续投递失败达到 `MAX_DELIVER_ATTEMPTS=5` 时把事件标 `FAILED` 并继续投后续事件，解决「毒事件永久阻塞同角色 outbox」；`FAILED` 可腾 | `outbox.test.lua` 3 例 |
 | R-09 | `critical` 在同一次 CAS 分配 `_critical_outbox_seq`，事件带 `causal_seq`；`pending_events` 优先按因果序号排序，缺失时回退 `created_at` | `critical.test.lua` 1 例、`outbox.test.lua` 2 例 |
 | R-10 | Saga 四组复杂交易：双角色 exactly-once、补偿 ACK 丢失、协调者崩溃接管、重复手工补偿拒绝 | `saga.test.lua` 4 例 |
-| R-12 | 新增 `scripts/ci/check_metrics_labels.lua`，禁止 `conn_id` / `rid` / `msg_id` 等高基数字段作指标标签，接入 `lint.yml` | 本地 187 files 通过 |
+| R-12 | 新增 `scripts/ci/check_metrics_labels.lua`，禁止 `conn_id` / `rid` / `msg_id` 等高基数字段作指标标签，接入 `lint.yml` | 本地 186 files 通过 |
 
 > R-01 只做到**兜底清理**，没有给跨节点 RPC 加 deadline；卡在 `cluster.call` 里的协程仍无法中断，
 > 见 R-01 条目的「建议修复 ②」，这一半仍未完成。
@@ -282,7 +282,7 @@
 | P1-03 | 已修（竞态已堵） | 取消兜底 + 目标端 `migration_abort` / barrier 校验已实现；abort 改为先踢后通知（A-11）；RPC deadline 不做，理由见 R-01 |
 | P1-04 | 已修 + 已实测 | 80% 预警、归档滞后指标（F-08/F-10）；V-06 实测数值见 §4，含索引门禁 34 倍差异 |
 | P1-05 | 已修 | `critical.query` 冷账本 pcall；归档写路径 pcall（F-09） |
-| P1-06 | **已通过** | V-01：本地三节点副本集 + `rs.stepDown()`，`documents=1 / version=hits` |
+| P1-06 | **待环境** | V-01：旧脚本曾在本地点三节点副本集跑通；D-31 强化后的双窗口门禁待复跑 |
 | P1-07 | 待环境 | V-02 双节点回环，需要两个 skynet 节点 + 真实客户端 |
 | P2-01 | 部分修 | 收敛计划 §8、本台账、`p17_verification.md` §3 已同步；`session_snapshot_v1.md` / `outbox_saga_v1.md` 仍需逐篇对齐 |
 | P2-02 | 已修 | R-10 四组复杂交易用例；补偿语义（至少一次）已在 A-14 定清 |
@@ -292,7 +292,7 @@
 | P2-06 | 已修 | R-06 启动配置自检 + A-06 嵌套配置合并 |
 | P2-07 | 部分完成 | V-07 脚本已提供（`bench_critical_capacity.sh`）；生产硬件基准仍待采集 |
 
-**对外表述**：核心架构已实现，跨模块契约由自动化测试验证，副本集切主与容量压测已在本地环境实测；
+**对外表述**：核心架构已实现，跨模块契约由自动化测试验证，容量压测已在本地环境实测；切主新门禁仍待复跑；
 **双节点迁移回环、网络分区、etcd 租约抖动仍未验证**，因此仍不建议直接生产部署。
 
 ---
@@ -300,9 +300,9 @@
 ## 7. 建议修复顺序
 
 1. **代码层已无待修项**：R-01 ~ R-12、A-01 ~ A-14、B-01 ~ B-06 全部收敛，
-   `./bin/skyext test` 124 files / 124 passed。
+   `./bin/skyext test` 128 files / 128 passed。
 2. **真实环境验证**（不是代码缺陷，不能由单测替代）：
-   - V-01 副本集 stepDown —— 已用加强后的脚本重跑通过（见 §4）
+   - V-01 副本集 stepDown —— 旧脚本曾跑通，D-31 双窗口新脚本待复跑（见 §4）
    - V-06 容量压测 —— 已实测，数值见 §4（含索引门禁的 34 倍差异）
    - V-02 双节点迁移回环（需要两个 skynet 节点 + 真实客户端）
    - V-03 Mongo 网络分区、V-04 etcd 租约抖动、V-05 真实 WebSocket 回环
@@ -669,11 +669,11 @@ P0-1 与 P0-2 是同一个病的两个实例。
 | D-27 | `channel.get_or_create` 静默忽略同名频道的第二份配置 → 鉴权策略被首个创建者锁定；`authorize` 未做类型校验。【已修 + 已验证：按有效配置和 `authorize` 身份比较，冲突返回 `channel configuration conflict`；`channel.test.lua` 覆盖复用、冲突及非法回调】 |
 | D-28 | `critical.query` 不校验 op_id 格式 → 大写 hex/少一位被当"从未执行"。【已修 + 已验证：只接受规范 `srv_<64 lowercase hex>` 或 Grant `<32 hex>_<4 hex>`，非法值在任何状态读取前返回 `UNKNOWN/invalid_op_id`；`critical.test.lua` 断言冷账本未读】 |
 | D-29 | 示例 `charge_count` 乘法溢出后负值仍通过 validate。【已修 + 已验证：现有 `math.type + count > 0` 防线保留，新增最大整数与绕回负数回归用例；`role.test.lua` 覆盖】 |
-| D-30 | `check_metrics_labels` 只扫 ≤400 字符的字面量标签表，变量/长表直接跳过 → 门禁假绿。【已修 + 已验证：完整匹配指标调用并平衡解析标签表，动态标签 fail-closed，加入自测并接入 `lint.yml`；本地 `--self-test` 6 例、实仓 187 files 通过】 |
+| D-30 | `check_metrics_labels` 只扫 ≤400 字符的字面量标签表，变量/长表直接跳过 → 门禁假绿。【已修 + 已验证：完整匹配指标调用并平衡解析标签表，支持 histogram buckets 和方法/空白/别名调用，动态标签 fail-closed，加入自测并接入 `lint.yml`；本地 `--self-test` 11 例、实仓 186 files 通过】 |
 | D-31 | `verify_replica_stepdown.sh` 用 `sleep 0.5` 后 stepDown，不证明切主瞬间仍有并发写。【已修、待环境：writer 持续到新 primary 确认后停止，同一 CAS 原子累计 `pre_hits/post_hits`，门禁要求切主前后各自达到 worker 数；真实三节点副本集待复跑】 |
 | D-32 | `entity_types.agent_count = 0` 无下界校验 → 节点"就绪"但无 agent，`% 0` 抛错。【已修 + 已验证：类型配置首次加载统一校验，缺省仍为 1，0/负数/非整数直接拒绝；`types.test.lua` 覆盖】 |
-| D-33 | `critical_ledger` 未配置时 maintenance 静默回退默认集合、entity_agent 返回 UNKNOWN，三处口径不一致。【已修 + 已验证：新增 `critical_config` 共享形状校验，maintenance、launcher、entity_agent 同口径；`critical_config.test.lua`、`launcher.test.lua`、`entity_agent.test.lua` 覆盖】 |
-| D-34 | 引擎硬依赖领域包 `skyext.charge_order`（`entity_agent.lua:230-237`）→ `framework_boundary_v1` 的"可删除"只在测试路径成立。【已修 + 已验证：`entity_agent` 增加 `handler.framework_commands` 扩展点，支付发奖实现移回游戏层 role；内置命令和业务命令禁止被覆盖。`entity_agent.test.lua` 在禁止加载支付包的前提下启动并执行框架命令】 |
+| D-33 | `critical_ledger` 未配置时 maintenance 静默回退默认集合、entity_agent 返回 UNKNOWN，三处口径不一致。【已修 + 已验证：新增 `critical_config` 共享形状与集合冲突校验，maintenance、launcher、entity_agent 同口径；服务级 `critical_maintenance.test.lua` 覆盖启动门禁，`launcher.test.lua`、`entity_agent.test.lua` 覆盖调用侧】 |
+| D-34 | 引擎硬依赖领域包 `skyext.charge_order`（`entity_agent.lua:230-237`）→ `framework_boundary_v1` 的"可删除"只在测试路径成立。【已修 + 已验证：`entity_agent` 增加 `handler.framework_commands` 扩展点，支付发奖实现移回游戏层 role；`charge_grant` 是保留命令，业务 handler 不能冒充。`entity_agent.test.lua` 覆盖扩展、冲突和禁止加载支付包，`role.test.lua` 覆盖真实 role 注册】 |
 | D-35 | `fallback` 清空 `g_inflight` 抵消 abort 的"失败可重试"；且 `fallback` 不在 `REQUIRED_DEPS`。【已修 + 已验证：保留失败 inflight 的既有修复，并将 fallback 提升为必需依赖；`migration_coordinator.test.lua` 缺 fallback 时拒绝启动】 |
 | D-36 | 迁移 `resume` 中网关 RPC 抛错时 `owner_epoch` 已推进且不回滚 → 下行被网关当迟到包丢弃。【已修 + 已验证：bind 用 pcall + 抛错/拒绝双回滚；`session.test.lua` 覆盖】 |
 | D-37 | `skyext_outbox_pending` gauge 是"最后一个被 pump 的角色"，不能当积压告警。【已修 + 已验证：移除错误的 last-role gauge，改为 `skyext_outbox_pending_scanned` 扫描页索引汇总；`outbox_worker.test.lua` 断言 `scan_pending`】 |

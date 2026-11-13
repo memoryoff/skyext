@@ -707,6 +707,17 @@ t.describe("outbox 接收方", function()
         t.expect(#h.holder.calls).to.equal(0)
     end)
 
+    t.it("rejects a 64-character non-hex param_hash", function()
+        local h = receiver_harness()
+        local env = h.envelope()
+        env.param_hash = string.rep("z", 64)
+        t.expect(function()
+            h.receiver:handle(h.entity, env, {})
+        end).to
+            .throw("invalid param_hash")
+        t.expect(#h.holder.calls).to.equal(0)
+    end)
+
     t.it("refuses to create a receiver without a namespace", function()
         local h = receiver_harness()
         t.expect(h.outbox.new_receiver({ op_types = { "" } })).to.be_nil()

@@ -112,6 +112,11 @@ end
 -- 同名时框架优先。游戏层需要扩展框架命令时，只能在 handler.framework_commands
 -- 显式声明，不能把同名函数塞进 handler.handlers 绕过命令归属检查。
 local FRAMEWORK = {}
+-- 支付回调只暴露一个稳定的框架命令名。即使某个游戏 handler 没有注册扩展，
+-- 也绝不能回退到同名的业务 handler，否则业务返回值可以伪造关键提交结果。
+local RESERVED_FRAMEWORK_COMMANDS = {
+    charge_grant = true,
+}
 
 local function install_framework_commands(commands)
     if commands == nil then
@@ -141,6 +146,9 @@ local function handler_of(cmd)
     local framework = FRAMEWORK[cmd]
     if framework then
         return framework
+    end
+    if RESERVED_FRAMEWORK_COMMANDS[cmd] then
+        error(string.format("reserved framework command is not registered: %s", cmd))
     end
     local handler_func = handler.handlers[cmd]
     if not handler_func then
@@ -242,6 +250,9 @@ end
 -- 静默跳过会让维护扫描看起来在跑、实际什么都没做。
 -- 定义在所有 FRAMEWORK 命令之前，避免函数体把同名局部误解析成全局
 local function config_collection(spec)
+    if not critical_config.validate_entity_config(type_config) then
+        return nil
+    end
     local valid = critical_config.validate_collection_spec(spec)
     if not valid then
         return nil
@@ -347,6 +358,19 @@ FRAMEWORK.critical_resolve_intent = function(entity, op_id)
             return { status = "NOT_COMMITTED", discard = true }
         end
         if state == "REJECTED" and detail == "no pending intent" then
+            -- 第一次 abort 可能已经清掉 intent，但 mark_discarded 失败；第二次
+            -- 多轮查询看到 no pending intent，不能据此直接结案。隔离态仍要重试
+            -- 标作废，否则实体永远没有下一次卸载机会。
+            local dbmgr = require "skyext.dbmgr"
+            local state_now = dbmgr.state_of(type_config.db_name, type_config.db_coll, entity.id)
+            if state_now == "CRITICAL_QUARANTINED" then
+                local marked, mark_err =
+                    dbmgr.mark_discarded(type_config.db_name, type_config.db_coll, entity.id, entity.handle)
+                if not marked then
+                    return { status = "UNKNOWN", reason = "mark_discarded failed: " .. tostring(mark_err) }
+                end
+                return { status = "NOT_COMMITTED", discard = true }
+            end
             return { status = "NOT_COMMITTED" }
         end
         return { status = "UNKNOWN", reason = tostring(detail) }
@@ -388,6 +412,9 @@ FRAMEWORK.session_export = function(entity, barrier_id, target_owner_epoch)
     local io_ = entity.session_io
     if not io_ then
         return nil, "no session io"
+    end
+    if io_.unresumable then
+        return nil, "session is unresumable"
     end
     local current = io_.owner_epoch or 1
     -- 新 owner 的 epoch 必须严格前进：网关用严格大于来拒绝旧 owner 的迟到下行
@@ -552,6 +579,9 @@ function CMD.bind_session(entity_id, conn_id, session_mode)
 
     local key = conn_id
     local bound, result, nonce, epoch, mode = entitymgr:with_entity(entity_id, function(entity)
+        if entity.migrating then
+            return errcode.SESSION_CLOSED
+        end
         local old = entity.session
         if old and old.key ~= key then
             session.unbind_kick(old.key, entity)
@@ -588,6 +618,9 @@ function CMD.resume_session(entity_id, conn_id, nonce, recv, session_mode, sessi
         return errcode.PARAM_ERROR
     end
     local ok, code, new_nonce, sent, epoch, mode = entitymgr:with_loaded_entity(entity_id, function(entity)
+        if entity.migrating then
+            return errcode.RESUME_UNAVAILABLE
+        end
         local c, n, s, e, m = session.resume(conn_id, entity, self_service_name(), nonce, recv, {
             session_mode = session_mode,
             session_epoch = session_epoch,

@@ -84,6 +84,54 @@ function M.self_check()
                 )
             end
         end
+        if
+            type(tc) == "table"
+            and critical_config.validate_collection_spec(tc.critical_ledger)
+            and critical_config.validate_collection_spec(tc.critical_jobs)
+        then
+            local role_spec = { db = tc.db_name, coll = tc.db_coll }
+            if critical_config.same_collection(tc.critical_ledger, tc.critical_jobs) then
+                report.problems[#report.problems + 1] =
+                    "critical_ledger and critical_jobs must use different collections"
+            elseif
+                critical_config.same_collection(role_spec, tc.critical_ledger)
+                or critical_config.same_collection(role_spec, tc.critical_jobs)
+            then
+                report.problems[#report.problems + 1] =
+                    "critical ledger collections must differ from the entity collection"
+            end
+        end
+    end
+
+    -- 支付回调的目标类型必须是真实持久化实体，并且具备关键账本配置；否则
+    -- 回调服务会先落单、之后每次路由都失败，钱收了却永远没有发奖路径。
+    local pay = config.get_table("pay_callback")
+    if type(pay) == "table" and pay.enabled == true and pay.role_type ~= nil then
+        local entity_types = config.get_table("entity_types")
+        local tc = type(entity_types) == "table" and entity_types[pay.role_type] or nil
+        if type(tc) ~= "table" then
+            report.problems[#report.problems + 1] =
+                string.format("pay_callback role_type %s is not configured in entity_types", tostring(pay.role_type))
+        else
+            if tc.persistent == false then
+                report.problems[#report.problems + 1] =
+                    string.format("pay_callback role_type %s must be a persistent entity type", tostring(pay.role_type))
+            end
+            for _, key in ipairs({ "critical_ledger", "critical_jobs" }) do
+                if not critical_config.validate_collection_spec(tc[key]) then
+                    report.problems[#report.problems + 1] =
+                        string.format("pay_callback role_type %s has no valid %s config", tostring(pay.role_type), key)
+                end
+            end
+            if
+                critical_config.validate_collection_spec(tc.critical_ledger)
+                and critical_config.validate_collection_spec(tc.critical_jobs)
+                and critical_config.same_collection(tc.critical_ledger, tc.critical_jobs)
+            then
+                report.problems[#report.problems + 1] =
+                    "pay_callback critical_ledger and critical_jobs must use different collections"
+            end
+        end
     end
     return report
 end

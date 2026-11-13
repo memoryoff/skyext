@@ -143,6 +143,20 @@ local function fake_dbmgr(store)
         if store.state == M.STATE.CRITICAL_QUARANTINED and not (opts and opts.allow_quarantined_intent_abort) then
             return "REJECTED", "CRITICAL_QUARANTINED", M.REASON.STATE_INVALID
         end
+        if opts and opts.metadata_only and store.metadata_unknown then
+            if store.metadata_unknown_apply then
+                local op_prefix = "_critical_ops_v1."
+                for path in pairs(update["$unset"] or {}) do
+                    if path:sub(1, #op_prefix) == op_prefix then
+                        local op_id = path:sub(#op_prefix + 1)
+                        store.critical._critical_ops_v1 = store.critical._critical_ops_v1 or {}
+                        store.critical._critical_ops_v1[op_id] = nil
+                    end
+                end
+                store.doc._version = expected + 1
+            end
+            return "UNKNOWN", store.metadata_unknown, M.REASON.UNKNOWN
+        end
         -- unknown_at / reject_at 只让第 N 次写入失败，用来单独覆盖 PREPARE 与 COMMIT 两条路径
         if store.unknown and (store.unknown_at == nil or store.unknown_at == n) then
             store.state = M.STATE.CRITICAL_QUARANTINED
@@ -1258,6 +1272,39 @@ t.describe("critical 隔离路径", function()
         t.expect(archived).to.equal(h.critical.CAPACITY_ARCHIVE_LIMIT)
         local left = 0
         for _ in pairs(h.store.critical._critical_ops_v1) do
+            left = left + 1
+        end
+        t.expect(left).to.equal(h.critical.MAX_OPS - h.critical.CAPACITY_ARCHIVE_LIMIT + 1)
+    end)
+
+    t.it("refreshes a capacity archive whose metadata CAS result is unknown", function()
+        local h = harness()
+        local ops = {}
+        for i = 1, h.critical.MAX_OPS do
+            ops[string.format("%032x_%04x", i, i)] = {
+                status = "COMMITTED",
+                op_type = "shop.buy",
+                param_hash = string.rep("a", 64),
+                at = h.now - 100,
+            }
+        end
+        h.store.critical._critical_ops_v1 = ops
+        h.store.critical._critical_ops_oldest_at = h.now - 100
+        h.store.metadata_unknown = "write concern timeout"
+        h.store.metadata_unknown_apply = true
+        local ledger = {
+            critical_find = function()
+                return nil
+            end,
+            critical_find_and_modify = function()
+                return "CONFIRMED", { n = 1, nModified = 1 }
+            end,
+        }
+
+        local result = h.client(1, nil, nil, { ledger = ledger })
+        t.expect(result.status).to.equal(h.critical.STATUS.COMMITTED)
+        local left = 0
+        for _ in pairs(h.store.critical._critical_ops_v1 or {}) do
             left = left + 1
         end
         t.expect(left).to.equal(h.critical.MAX_OPS - h.critical.CAPACITY_ARCHIVE_LIMIT + 1)

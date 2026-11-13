@@ -22,4 +22,22 @@ t.describe("critical collection config", function()
             t.expect(type(err)).to.equal("string")
         end
     end)
+
+    t.it("rejects reusing the same collection for ledger, jobs or the entity", function()
+        local same = { db = "role", coll = "op_ledger" }
+        t.expect(critical_config.validate_entity_config({
+            db_name = "role",
+            db_coll = "role",
+            critical_ledger = same,
+            critical_jobs = same,
+        })).to
+            .equal(false)
+        t.expect(critical_config.validate_entity_config({
+            db_name = "role",
+            db_coll = "op_ledger",
+            critical_ledger = { db = "role", coll = "op_ledger" },
+            critical_jobs = { db = "role", coll = "jobs" },
+        })).to
+            .equal(false)
+    end)
 end)

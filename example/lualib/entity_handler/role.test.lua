@@ -119,6 +119,7 @@ t.describe("role 充值发奖 handler", function()
         local bag = { items = {} }
         function bag:add_item(res_type, res_id, count)
             self.items[#self.items + 1] = { res_type = res_type, res_id = res_id, count = count }
+            return true
         end
         return { id = 7, data = { modules = {} }, modules = { bag = bag } }, bag
     end

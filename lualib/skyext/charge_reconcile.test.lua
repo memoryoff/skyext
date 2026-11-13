@@ -230,6 +230,27 @@ t.describe("charge_reconcile 扫描", function()
 end)
 
 t.describe("charge_reconcile 对账", function()
+    t.it("normalizes a legacy string rid before querying the owner", function()
+        local queried
+        local orders = fake_orders()
+        local order = {
+            provider = "wechat",
+            order_id = "legacy",
+            rid = "7",
+            service_op_id = "srv_" .. string.rep("a", 64),
+            status = "GRANTING",
+        }
+        orders.store.docs[1] = copy(order)
+        local outcome = charge_reconcile.reconcile_order(orders, order, {
+            query_op = function(rid)
+                queried = rid
+                return { status = "COMMITTED", version = 2 }
+            end,
+        }, { now = 10 })
+        t.expect(outcome).to.equal(charge_reconcile.OUTCOME.GRANTED)
+        t.expect(queried).to.equal(7)
+    end)
+
     t.it("moves a stuck GRANTING order to GRANTED on proof", function()
         local orders = fake_orders()
         make_order(orders)

@@ -46,9 +46,18 @@ function M.new(opts)
     if type(name) ~= "string" or #name == 0 or #name > 128 then
         return nil, "invalid channel name"
     end
-    local max_members = opts.max_members or M.DEFAULT_MAX_MEMBERS
-    local batch_size = opts.batch_size or M.DEFAULT_BATCH_SIZE
-    local max_failures = opts.max_failures or M.DEFAULT_MAX_FAILURES
+    local max_members = opts.max_members
+    if max_members == nil then
+        max_members = M.DEFAULT_MAX_MEMBERS
+    end
+    local batch_size = opts.batch_size
+    if batch_size == nil then
+        batch_size = M.DEFAULT_BATCH_SIZE
+    end
+    local max_failures = opts.max_failures
+    if max_failures == nil then
+        max_failures = M.DEFAULT_MAX_FAILURES
+    end
     if opts.authorize ~= nil and type(opts.authorize) ~= "function" then
         return nil, "authorize must be a function"
     end

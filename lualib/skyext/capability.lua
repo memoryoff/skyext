@@ -51,8 +51,12 @@ local ALLOWED_NAMESPACES = {
     saga = true,
 }
 
-function M.is_allowed_namespace(namespace)
+local function is_allowed_namespace(namespace)
     return type(namespace) == "string" and ALLOWED_NAMESPACES[namespace] == true
+end
+
+function M.is_allowed_namespace(namespace)
+    return is_allowed_namespace(namespace)
 end
 
 local function check_text(value, name)
@@ -68,7 +72,7 @@ function M.new_issuer(namespace, allowed_op_types)
     if not ns then
         return nil, err
     end
-    if not M.is_allowed_namespace(ns) then
+    if not is_allowed_namespace(ns) then
         return nil, "namespace is not a trusted dispatch entry"
     end
     -- 空白名单原本等价于"放行任意 op_type"，等于把业务白名单交给了签发调用方。

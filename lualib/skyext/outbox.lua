@@ -149,7 +149,7 @@ function M.event(opts)
         end
         param_hash = computed
     end
-    if type(param_hash) ~= "string" or #param_hash ~= 64 then
+    if not critical_fields.is_param_hash(param_hash) then
         return nil, "param_hash must be 64 hex characters"
     end
     return {
@@ -226,7 +226,7 @@ function M.validate_envelope(envelope)
     if type(envelope.op_type) ~= "string" or #envelope.op_type == 0 then
         return nil, "invalid op_type"
     end
-    if type(envelope.param_hash) ~= "string" or #envelope.param_hash ~= 64 then
+    if not critical_fields.is_param_hash(envelope.param_hash) then
         return nil, "invalid param_hash"
     end
     if type(envelope.source_type) ~= "string" or #envelope.source_type == 0 then

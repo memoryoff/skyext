@@ -30,10 +30,14 @@ function M:add_item(res_type, res_id, count)
     local res = bags[res_type].res
     local item = res[res_id]
     if item then
+        if item.res_size > math.maxinteger - count then
+            return nil, "item count overflow"
+        end
         item.res_size = item.res_size + count
     else
         res[res_id] = { res_id = res_id, res_size = count }
     end
+    return true
 end
 
 function M:count(res_type, res_id)

@@ -181,7 +181,10 @@ function Webhook:handle(req)
     -- 渠道允许先 ACK：订单已可靠落库并进入 GRANTING，发奖交给后台与对账。
     -- 即使 schedule_grant 失败，对账也会按 GRANTING 把单子捞起来
     if provider.ack_before_grant then
-        self:ack(name, order, now)
+        if not self:ack(name, order, now) then
+            m_requests:inc(1, { result = "ack_failed" })
+            return reject(503, "ack_not_persisted", { retryable = true })
+        end
         if type(self.schedule_grant) == "function" then
             local ok, serr = pcall(self.schedule_grant, order)
             if not ok then
@@ -229,7 +232,10 @@ function Webhook:handle(req)
             -- 已 GRANTED 的重复回调不会再触发状态迁移，但仍应解除此前的人工阻断
             charge_order.unblock_reconcile(self.orders_coll, order, now)
         end
-        self:ack(name, order, now)
+        if not self:ack(name, order, now) then
+            m_requests:inc(1, { result = "ack_failed" })
+            return reject(503, "ack_not_persisted", { retryable = true })
+        end
         m_requests:inc(1, { result = "granted" })
         return { status = 200, body = { result = "accepted", status = charge_order.STATUS.GRANTED } }
     end
@@ -250,7 +256,10 @@ function Webhook:handle(req)
         -- critical.query 只会回 NOT_STARTED；它不是契约失败，回 500 让渠道
         -- 反复重推同一个服务端 bug 只会制造重复回调，拿不到额外信息。
         -- 对账侧会重投 grant，重投仍失败时按 RETRY 留待下一轮。
-        self:ack(name, order, now)
+        if not self:ack(name, order, now) then
+            m_requests:inc(1, { result = "ack_failed" })
+            return reject(503, "ack_not_persisted", { retryable = true })
+        end
         m_requests:inc(1, { result = "unknown" })
         return { status = 200, body = { result = "accepted", status = charge_order.STATUS.GRANTING } }
     end
@@ -259,7 +268,10 @@ function Webhook:handle(req)
         -- 钱收了、东西没给：留 GRANTING 并记原因，等人工补偿。
         -- 渠道侧仍然 ACK，避免它无限重推同一笔
         charge_order.note_error(self.orders_coll, order, tostring(decision.reason or status), now)
-        self:ack(name, order, now)
+        if not self:ack(name, order, now) then
+            m_requests:inc(1, { result = "ack_failed" })
+            return reject(503, "ack_not_persisted", { retryable = true })
+        end
         log.error(
             "pay grant rejected by business rules, manual compensation required",
             "order",

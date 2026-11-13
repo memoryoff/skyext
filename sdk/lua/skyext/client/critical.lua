@@ -19,6 +19,21 @@ local function non_empty(v)
     return type(v) == "string" and #v > 0
 end
 
+local function valid_op_id(op_id)
+    if type(op_id) ~= "string" then
+        return false
+    end
+    if #op_id == 68 and op_id:sub(1, 4) == "srv_" and op_id:sub(5):match("^[0-9a-f]+$") then
+        return true
+    end
+    local grant_id, seq = op_id:match("^([0-9a-f]+)_([0-9a-f]+)$")
+    if not grant_id or #grant_id ~= 32 or #seq ~= 4 then
+        return false
+    end
+    local n = tonumber(seq, 16)
+    return n ~= nil and n >= 1
+end
+
 -- 结构校验。返回 true 或 nil, reason
 function M.validate_grant(grant)
     if type(grant) ~= "table" then
@@ -91,8 +106,8 @@ function M.query(opts)
     if not non_empty(opts.protocol) then
         return nil, "protocol is required"
     end
-    if not non_empty(opts.op_id) then
-        return nil, "op_id is required"
+    if not valid_op_id(opts.op_id) then
+        return nil, "invalid op_id"
     end
     return {
         protocol = opts.protocol,
