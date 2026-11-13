@@ -3,6 +3,7 @@
 - [架构概览](overview.md)
 - [架构与目录索引](architecture.md)
 - [不做的事](non-goals.md)
+- [框架边界与业务渗入](design/framework_boundary_v1.md)
 
 - **使用指南**
   - [登录流程](guide/login.md)
