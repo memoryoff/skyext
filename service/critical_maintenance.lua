@@ -16,12 +16,14 @@ local config = require "skyext.config"
 local critical = require "skyext.critical"
 local critical_maintenance = require "skyext.critical_maintenance"
 local critical_reconciler = require "skyext.critical_reconciler"
+local gm_api = require "skyext.gm_api"
 local log = require "skyext.log"
 local mongo_conn = require "skyext.mongo_conn"
 local router = require "skyext.entity.router"
 local types = require "skyext.entity.types"
 
 local CMD = {}
+local GM_CMD = {}
 
 local g_deps
 local g_opts
@@ -234,6 +236,42 @@ function CMD.stop()
     return true
 end
 
+-- 多数派探针的运维入口。探针本身在 mongo_conn（那里才持有连接），这里只负责
+-- 把"哪个实体类型的库"翻译成集合，并把失败原因原样带回。
+--
+-- 为什么需要这个入口：`critical_probe` 是真探针（真写 + 多数派读回 + 清理），
+-- 但在接上 GM 之前没有任何调用点，运维只能靠手册里的代码片段，等于没接。
+GM_CMD.critical_probe = {
+    desc = "跑一次多数派探针：真实 w:majority+j 写入 -> 多数派读回 -> 清理",
+    params = {
+        type_name = "实体类型（可选，默认 critical_maintenance.type_name）",
+    },
+    handler = function(params)
+        local type_name = (type(params) == "table" and params.type_name) or settings().type_name
+        local called, tc = pcall(types.get, type_name)
+        if not called then
+            return false, tostring(tc)
+        end
+        if type(tc.db_name) ~= "string" or type(tc.db_coll) ~= "string" then
+            return false, "entity type has no db coordinates: " .. tostring(type_name)
+        end
+        local coll_called, coll = pcall(mongo_conn.get_collection, tc.db_name, tc.db_coll)
+        if not coll_called then
+            return false, tostring(coll)
+        end
+        return critical_maintenance.probe({
+            collection = coll,
+            type_name = type_name,
+            collection_name = tc.db_name .. "." .. tc.db_coll,
+        })
+    end,
+}
+
 skynet.start(function()
     cmd_api.dispatch(CMD)
+    -- 注册失败不该拖垮服务：没有 GM 只是少了运维入口，账本维护本身照常跑
+    local ok, err = pcall(gm_api.register, GM_CMD)
+    if not ok then
+        log.warn("critical maintenance GM registration failed", "err", tostring(err))
+    end
 end)

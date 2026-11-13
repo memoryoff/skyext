@@ -16,8 +16,9 @@ local M = {}
 --   PREPARING             关键事务进行中：只允许关键 CAS 推进，普通回存必须让路，
 --                         否则 PREPARE 之后的一次回存会把普通脏字段抢先写进去，
 --                         COMMIT 的 _version 就对不上了
---   CRITICAL_QUARANTINED  关键写入结果未决：内存可能已被 apply 污染，禁止任何回写，
---                         等恢复任务按持久化事实判定后重载
+--   CRITICAL_QUARANTINED  关键写入结果未决：内存可能已被 apply 污染，禁止任何回写。
+--                         缓存里还挂着 `_critical_intent_v1` 时只能等恢复任务按持久化
+--                         事实判定；没有意图说明库里从没写过 PREPARE，`load` 可以直接丢弃重读
 --   DISCARDED             缓存已作废：任何写入都必须拒绝
 M.STATE = {
     NORMAL = "NORMAL",
@@ -379,12 +380,17 @@ function M.load(dbname, dbcoll, key, unique_id, handle, opts)
             -- 交出去只会在下一次回存里把污染状态写进库。DISCARDED 是确定作废，可以直接丢。
             local state = cached.state or M.STATE.NORMAL
             if state == M.STATE.CRITICAL_QUARANTINED then
-                return nil, "critical state unknown"
-            end
-            if state == M.STATE.PREPARING then
+                -- 没有未决意图说明库里从没写过 PREPARE：内存里的脏数据只属于那次失败的操作，
+                -- 丢掉重读是安全的，否则一次 CAS 未命中就会把角色永久卡在"加载不了"。
+                -- 有意图时必须等恢复任务判定——那次写入可能已经落库，只是 ACK 丢了
+                if cached.critical and cached.critical[critical_fields.INTENT] then
+                    return nil, "critical state unknown"
+                end
+                save_wheel_obj():remove(cached)
+                cache_collection[unique_id] = nil
+            elseif state == M.STATE.PREPARING then
                 return nil, "critical write in progress"
-            end
-            if state == M.STATE.DISCARDED then
+            elseif state == M.STATE.DISCARDED then
                 save_wheel_obj():remove(cached)
                 cache_collection[unique_id] = nil
             elseif cached.handle == handle then

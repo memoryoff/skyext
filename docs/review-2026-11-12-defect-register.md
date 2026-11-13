@@ -25,7 +25,7 @@
 | --- | --- | --- |
 | 已修复并验证（第五 ~ 九批） | 22 | F-01 ~ F-10、R-01 ~ R-12 |
 | 对抗审查发现 · 已修 | 14 | A-01 ~ A-14，见 §8 |
-| 第二轮源码审计 · 已修 | 6 | B-01 ~ B-06（DB Fence / Critical Commit），见 §10 |
+| 第二轮源码审计 · 已修 | 8 | B-01 ~ B-08（DB Fence / Critical Commit），见 §10 |
 | 代码层待修 | 0 | — |
 | 需真实环境验证 | 7 | V-01 / V-06 已实测通过；V-02 ~ V-05 需要多节点与故障注入；V-07 已提供可复跑脚本 |
 | 设计权衡（记录不改） | 4 | 见 §5 |
@@ -488,6 +488,8 @@
 | B-04 | `critical_probe` 只发 `hello`，注释却写"确认能走 majority 写"；secondary 也能应答 `hello` | 改成真实的 `w:majority, j:true` 写入 → 多数派读回 → 清理，写的是独立集合 `skyext_health_probe`（绝不往角色集合插测试记录）。任一条腿没确认都返回失败，清理失败也不报健康 | `service/mongo_conn.test.lua` 2 例（命令序列 + 三种失败腿） |
 | B-05 | `execute_client` 只强制 `hmac_fn`，漏传 `equal_fn` 时 `grant.verify` 静默退回 `==` | 入口强制要求 `equal_fn` 是函数，缺失/类型错一律 `INTERNAL_AUTH_DENIED` | `critical.test.lua`「refuses a client call without a constant-time comparator」 |
 | B-06 | 示例游戏没有 `charge_handlers`：`pay_callback → charge_grant → critical.execute_internal` 链路在框架侧完整，但游戏层缺资产效果，启用支付会直接报 "entity handler has no charge_handlers" | `example/lualib/entity_handler/role.lua` 实现充值到账 handler：validate 纯读、apply 只改内存（`modules.bag:add_item`），换算只写一份避免 validate/apply 分叉 | `example/lualib/entity_handler/role.test.lua` 3 例 |
+| B-07 | B-03 的隔离把 PREPARE 被拒的角色卡成"加载不了"：`dbmgr.load` 对 `CRITICAL_QUARANTINED` 一律拒绝，而 `unload` 又因为状态非 NORMAL 失败，只能等实体卸载重试到 `give_up` 再 discard | `load` 区分"有没有未决意图"：缓存里**没有** `_critical_intent_v1` 说明库里从没写过 PREPARE，内存里的脏数据只属于那次失败的操作，丢掉重读是安全的；有意图时必须等恢复任务判定（可能已落库、只是 ACK 丢了） | `dbmgr.test.lua`「quarantines the cache when the majority write is unknown」（重载拿回库里文档）与「refuses to reload a quarantined cache that still carries an intent」 |
+| B-08 | `critical_probe` 修成真探针后仍然没有任何调用点，运维只能照手册抄代码片段，等于没接 | `critical_maintenance.probe()` 收口"取集合 → 调探针 → 归一原因"，`service/critical_maintenance.lua` 注册 GM 命令 `critical_probe`（可按 `type_name` 指定实体类型），注册失败只告警不拖垮服务 | `critical_maintenance.test.lua` 4 例；GM 文档新增命令说明 |
 
 顺带修正的文档不一致：
 

@@ -138,8 +138,9 @@ Outbox 的驻留量（它直接决定单次提交的写放大）。
 ### B1：真实副本集多数派实测（已跑通，保留步骤供复跑）
 
 1. 起三节点副本集（`rs.initiate`），确认 `w:majority, j:true` 生效。
-2. 用 `coll:critical_probe()` 确认多数派写可用（它真的写一条探针、多数派读回、再清理；
-   只发 `hello` 不能证明 secondary 上的连接能完成 `w:majority, j:true`）。
+2. 用 `coll:critical_probe()` 或 GM 命令 `critical_probe`（见 [GM API](../guide/gm_api.md#critical_probe--多数派探针)）
+   确认多数派写可用（它真的写一条探针、多数派读回、再清理；只发 `hello` 不能证明
+   secondary 上的连接能完成 `w:majority, j:true`）。
 3. 压测期间对主节点执行 `rs.stepDown(60)`：期望进行中的关键操作返回 `UNKNOWN`，
    缓存进入隔离，恢复任务把它推进到终态，**不出现**"同一 op 两次入账"。
 4. 断言：`_critical_ops_v1` 里同一 `op_id` 只有一条记录，`_version` 单调递增。

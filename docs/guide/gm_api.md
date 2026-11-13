@@ -495,6 +495,25 @@ curl -H "Authorization: Bearer <token>" \
 
 返回可靠消息的 `msg_id`。邮件经可靠消息投递，收件人离线或在别的节点上都能收到。
 
+## 关键账本命令
+
+由 `service/critical_maintenance.lua` 注册，只在启用了 `critical_maintenance` 的节点上存在。
+
+### critical_probe — 多数派探针
+
+```bash
+curl -H "Authorization: Bearer <token>" \
+  "http://localhost:9092/gm/execute?cmd=critical_probe&type_name=role"
+```
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| type_name | string | 否 | 实体类型，默认取 `critical_maintenance.type_name` |
+
+它**真的写一条** `w:majority, j:true` 的记录到独立集合 `skyext_health_probe`，用多数派读回，再清理。只发 `hello` 不能证明多数派写可用——secondary 也能应答 `hello`，而经济操作要的是"多数派确认 + journal 落盘"。
+
+返回 `true` 表示三件事都成立：写入被多数派确认、多数派读可见、清理也确认。任一条不成立都返回失败原因（例如 `probe majority write not confirmed (UNKNOWN): not majority`），不会把"可能写了"报成健康。
+
 ## 指标命令
 
 ### metrics — 导出 Prometheus 文本

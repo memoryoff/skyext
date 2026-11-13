@@ -203,4 +203,28 @@ function M.ensure_indexes(colls)
     return critical.ensure_indexes(colls)
 end
 
+-- 多数派探针的调度入口：把"取集合 → 调探针 → 归一结果"收在一处，
+-- 服务层只做 GM 接线。
+--
+-- 探针本身在 `service/mongo_conn.lua`（只有那里持有连接），它会真写一条
+-- `w:majority, j:true` 的记录、多数派读回、再清理；这里不重复实现语义，
+-- 只负责把失败翻译成可读原因，让运维知道是"连不上"还是"多数派不成立"。
+function M.probe(deps)
+    if type(deps) ~= "table" or type(deps.collection) ~= "table" then
+        return false, "deps.collection is required"
+    end
+    local coll = deps.collection
+    if type(coll.critical_probe) ~= "function" then
+        return false, "collection has no critical_probe"
+    end
+    local called, ok, err = pcall(coll.critical_probe, coll)
+    if not called then
+        return false, "probe raised: " .. tostring(ok)
+    end
+    if ok ~= true then
+        return false, tostring(err or "probe failed")
+    end
+    return true, { type_name = deps.type_name, collection = deps.collection_name }
+end
+
 return M

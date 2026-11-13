@@ -1168,13 +1168,38 @@ t.describe("dbmgr 关键状态机", function()
         t.expect(reason).to.equal("write concern timeout")
         t.expect(h.db.state_of("demo", "role", 7)).to.equal(h.db.STATE.CRITICAL_QUARANTINED)
 
-        -- 隔离之后：普通回存、关键 CAS、重新加载都必须拒绝
+        -- 隔离之后：普通回存、关键 CAS 都必须拒绝
         t.expect(h.db.save("demo", "role", "rid", 7)).to.equal(false)
         t.expect(h.db.critical_update("demo", "role", "rid", 7, 0, { ["$set"] = { [OP] = { status = "COMMITTED" } } })).to
             .equal("REJECTED")
+        -- 但缓存里**没有**未决意图，说明库里从没写过 PREPARE：重载是安全的，
+        -- 拿回的是库里的文档（内存里那份被污染的 name 不会写回去）
+        local doc, err = h.db.load("demo", "role", "rid", 7, nil, { create = true })
+        t.expect(err).to.be_nil()
+        t.expect(doc.name).to.equal("original")
+        t.expect(h.db.state_of("demo", "role", 7)).to.equal(h.db.STATE.NORMAL)
+    end)
+
+    -- 有未决意图时不能重载：那次 PREPARE 可能已经落库、只是 ACK 丢了，
+    -- 必须等恢复任务按持久化事实判定，不能靠"重新读一次"把未决状态抹掉
+    t.it("refuses to reload a quarantined cache that still carries an intent", function()
+        local h = harness(nil, nil, true)
+        h.doc = assert(h.db.load("demo", "role", "rid", 7, nil, { create = true }))
+        h.db.quarantine_critical("demo", "role", 7, nil, "commit unknown")
+        assert(
+            h.db.set_critical(
+                "demo",
+                "role",
+                7,
+                { ["_critical_intent_v1"] = { op_id = "op_a", state = "PREPARED" } },
+                nil
+            )
+        )
+
         local doc, err = h.db.load("demo", "role", "rid", 7, nil, { create = true })
         t.expect(doc).to.be_nil()
         t.expect(err).to.equal("critical state unknown")
+        t.expect(h.db.state_of("demo", "role", 7)).to.equal(h.db.STATE.CRITICAL_QUARANTINED)
     end)
 
     t.it("does not let a dirty-cache recovery write a quarantined document back", function()

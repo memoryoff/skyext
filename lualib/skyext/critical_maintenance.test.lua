@@ -114,3 +114,49 @@ t.describe("critical_maintenance 单轮", function()
         t.expect(maintenance.run_once({}, {})).to.be_nil()
     end)
 end)
+
+-- 探针入口：语义在 mongo_conn，这里只保证"结果不被吞、原因不丢"
+t.describe("critical_maintenance 多数派探针", function()
+    local function probe_coll(result, err)
+        local coll = {}
+        function coll:critical_probe()
+            if result == "raise" then
+                error("socket closed")
+            end
+            return result, err
+        end
+        return coll
+    end
+
+    t.it("passes a confirmed probe through with the collection it checked", function()
+        local ok, info = maintenance.probe({
+            collection = probe_coll(true),
+            type_name = "role",
+            collection_name = "role.role",
+        })
+        t.expect(ok).to.equal(true)
+        t.expect(info.type_name).to.equal("role")
+        t.expect(info.collection).to.equal("role.role")
+    end)
+
+    t.it("surfaces the probe's reason instead of a generic failure", function()
+        local ok, err = maintenance.probe({
+            collection = probe_coll(nil, "probe majority write not confirmed (UNKNOWN): not majority"),
+        })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.match("not confirmed")
+    end)
+
+    t.it("turns a raised probe into a readable failure", function()
+        local ok, err = maintenance.probe({ collection = probe_coll("raise") })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.match("probe raised")
+    end)
+
+    t.it("refuses a collection without the probe channel", function()
+        local ok, err = maintenance.probe({ collection = {} })
+        t.expect(ok).to.equal(false)
+        t.expect(err).to.equal("collection has no critical_probe")
+        t.expect(maintenance.probe({})).to.equal(false)
+    end)
+end)
