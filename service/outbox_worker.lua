@@ -80,7 +80,8 @@ local function build_deps(opts)
         type_name = opts.type_name,
         role_coll = mongo_conn.get_collection(tc.db_name, tc.db_coll),
         key = tc.id_field or "rid",
-        cursor = 0,
+        -- keyset 游标由 run_once 维护：上一页最后一个 rid，首轮 nil 表示从队头开始
+        cursor = nil,
         pump = pump_loaded_only(opts.type_name),
         pump_loaded = pump_with_load(opts.type_name),
         sleep = function(sec)

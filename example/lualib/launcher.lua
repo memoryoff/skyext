@@ -117,20 +117,57 @@ function M.self_check()
                 report.problems[#report.problems + 1] =
                     string.format("pay_callback role_type %s must be a persistent entity type", tostring(pay.role_type))
             end
-            for _, key in ipairs({ "critical_ledger", "critical_jobs" }) do
-                if not critical_config.validate_collection_spec(tc[key]) then
-                    report.problems[#report.problems + 1] =
-                        string.format("pay_callback role_type %s has no valid %s config", tostring(pay.role_type), key)
-                end
+            -- 复用维护服务的同一套校验（集合规格、两集合必须不同、必须落在实体库）。
+            -- 支付分支自己写一套不完整的检查，口径迟早和维护服务分家：
+            -- 自检通过、服务启动失败就会同时发生
+            local ok, err = critical_config.validate_entity_config(tc)
+            if not ok then
+                report.problems[#report.problems + 1] = string.format(
+                    "pay_callback role_type %s has invalid critical config: %s",
+                    tostring(pay.role_type),
+                    tostring(err)
+                )
             end
-            if
-                critical_config.validate_collection_spec(tc.critical_ledger)
-                and critical_config.validate_collection_spec(tc.critical_jobs)
-                and critical_config.same_collection(tc.critical_ledger, tc.critical_jobs)
-            then
-                report.problems[#report.problems + 1] =
-                    "pay_callback critical_ledger and critical_jobs must use different collections"
-            end
+        end
+    end
+
+    -- 跨服务实体类型一致性：维护服务只归档自己 type_name 的冷账本、只恢复该类型的
+    -- UNKNOWN 任务。支付/Outbox 指到别的类型时自检照样能过，但那份热账本永远不归档、
+    -- 恢复任务无人处理、订单停在 GRANTING、Outbox 事件长期积压
+    local maintenance_type = maintenance_on and (maintenance.type_name or "role") or nil
+    if maintenance_type then
+        local entity_types = config.get_table("entity_types")
+        local configured = function(name)
+            return type(entity_types) == "table" and type(entity_types[name]) == "table"
+        end
+        -- 只比较"确实是已配置实体"的类型：未配置的类型上面已经报过，
+        -- 再报一条"类型不一致"只会把根因埋进重复告警里
+        if
+            type(pay) == "table"
+            and pay.enabled == true
+            and type(pay.role_type) == "string"
+            and configured(pay.role_type)
+            and pay.role_type ~= maintenance_type
+        then
+            report.problems[#report.problems + 1] = string.format(
+                "pay_callback.role_type %s does not match critical_maintenance.type_name %s",
+                pay.role_type,
+                maintenance_type
+            )
+        end
+        local outbox = config.get_table("outbox_worker")
+        if
+            type(outbox) == "table"
+            and outbox.enabled == true
+            and type(outbox.type_name) == "string"
+            and configured(outbox.type_name)
+            and outbox.type_name ~= maintenance_type
+        then
+            report.problems[#report.problems + 1] = string.format(
+                "outbox_worker.type_name %s does not match critical_maintenance.type_name %s",
+                outbox.type_name,
+                maintenance_type
+            )
         end
     end
     return report

@@ -179,7 +179,8 @@ function CMD.start(conf)
     -- 任务表只负责调度，资产事实永远取角色文档
     g_reconcile_deps = {
         jobs_coll = jobs,
-        scan_cursor = 0,
+        -- keyset 游标由 run_once 维护：(rid, op_id)，首轮为 nil 表示从头扫
+        scan_cursor = nil,
         claim = function(rid, op_id, owner, lease_until, version)
             return critical.claim_job(jobs, rid, op_id, owner, lease_until, {
                 job_version = version,

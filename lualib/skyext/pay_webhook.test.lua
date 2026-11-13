@@ -312,6 +312,48 @@ t.describe("pay_webhook 落单与发奖", function()
         -- 钱收了、东西没给：留在 GRANTING 并记原因，等人工补偿
         t.expect(h.orders.store.docs[1].status).to.equal("GRANTING")
         t.expect(h.orders.store.docs[1].last_error).to.equal("role banned")
+        -- 必须在 ACK 之前就退出自动对账：对账会按 NOT_STARTED 重新投递发奖
+        t.expect(h.orders.store.docs[1].reconcile_blocked_at).to.equal(1700000000)
+    end)
+
+    -- PRECHECK_REJECTED 发生在 PREPARE 之前、零写入，critical.query 只会回 NOT_STARTED。
+    -- 只记 last_error 就 ACK，会让对账把它当成"发奖从未开始"并自动重投——
+    -- 与"人工补偿、不再自动发奖"的契约相反
+    t.it("blocks automatic reconciliation before acking a precheck rejection", function()
+        local h = harness()
+        h.decision = { status = "PRECHECK_REJECTED", reason = "mail module is not loaded" }
+        local out = h.webhook:handle(fake_req("/pay/wechat/callback", h.body))
+        t.expect(out.status).to.equal(200)
+        t.expect(out.body.status).to.equal("REJECTED")
+        local order = h.orders.store.docs[1]
+        t.expect(order.status).to.equal("GRANTING")
+        t.expect(order.last_error).to.equal("mail module is not loaded")
+        t.expect(order.reconcile_blocked_at).to.equal(1700000000)
+        t.expect(order.ack_result).to.equal("ACCEPTED")
+    end)
+
+    -- 阻断标记没写进多数派，就等于对账还会自动发奖。此时不能回 200 宣称"已可靠接收"
+    t.it("does not ack when the reconciliation block cannot be persisted", function()
+        local h = harness()
+        h.decision = { status = "PRECHECK_REJECTED", reason = "mail module is not loaded" }
+        function h.orders:critical_find_and_modify(opts)
+            local set = opts.update and opts.update["$set"]
+            if set and set.reconcile_blocked_at ~= nil then
+                return "UNKNOWN", "write concern timeout"
+            end
+            local ret = self:find_and_modify(opts)
+            if type(ret) == "table" and ret.ok == 1 then
+                return "CONFIRMED", ret
+            end
+            return "REJECTED", ret
+        end
+        local out = h.webhook:handle(fake_req("/pay/wechat/callback", h.body))
+        t.expect(out.status).to.equal(503)
+        t.expect(out.body.code).to.equal("block_not_persisted")
+        t.expect(out.body.retryable).to.equal(true)
+        local order = h.orders.store.docs[1]
+        t.expect(order.reconcile_blocked_at).to.be_nil()
+        t.expect(order.ack_result).to.be_nil()
     end)
 
     t.it("asks the channel to retry when storage fails", function()

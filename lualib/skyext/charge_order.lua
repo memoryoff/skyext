@@ -42,23 +42,35 @@ local m_unknown = metrics.counter(
     "Charge grants whose outcome could not be confirmed",
     { "provider" }
 )
+local m_unconfirmed = metrics.counter(
+    "skyext_charge_order_unconfirmed_total",
+    "Order writes whose majority confirmation was lost",
+    { "provider" }
+)
 
 -- 订单写入。订单是**资金凭证**：切主回滚会让"渠道已 ACK、订单行消失"变成永久丢单，
 -- 所以必须多数派 + journal。驱动的 `findAndModify` 不注入写关注（走服务端默认 w:1），
 -- 集合支持 `critical_find_and_modify` 时优先用它。
 --
--- 三态里只有 CONFIRMED 算写成功；UNKNOWN 返回失败让调用方重试（落单是幂等的，
--- 渠道重推会命中已有订单）。返回形状与 `find_and_modify` 对齐：成功回原始回复。
+-- 返回 (ret, state, detail)，state ∈ CONFIRMED / UNKNOWN / REJECTED：
+--   * CONFIRMED  多数派确认，ret 是原始回复
+--   * UNKNOWN    写入可能已生效但确认丢失。**不能**用普通读把它当成功
+--   * REJECTED   明确失败（唯一索引冲突、连接报错等），可由调用方按重复单处理
 local function write_order(orders_coll, doc)
     if type(orders_coll.critical_find_and_modify) == "function" then
         local state, ret = orders_coll:critical_find_and_modify(doc)
         if state == "CONFIRMED" then
-            return ret
+            return ret, "CONFIRMED"
         end
-        -- UNKNOWN 可能是"已经写了但 ACK 丢了"，调用方必须按未确认处理，不能当成没写
-        return nil, tostring(state), ret
+        return nil, state or "UNKNOWN", ret
     end
-    return orders_coll:find_and_modify(doc)
+    -- 没有多数派通道时只能退回默认写关注。这是降级路径：服务启动门禁
+    -- （check_write_channel）会拦住生产环境的这种集合
+    local ret, err = orders_coll:find_and_modify(doc)
+    if type(ret) == "table" and ret.ok == 1 then
+        return ret, "CONFIRMED"
+    end
+    return nil, "REJECTED", (type(ret) == "table" and ret.errmsg) or err
 end
 
 local function hex(bytes)
@@ -176,7 +188,7 @@ function M.record(orders_coll, opts)
     end
 
     local now = opts.now or os.time()
-    local ret, ferr = write_order(orders_coll, {
+    local ret, state, detail = write_order(orders_coll, {
         query = { provider = provider, order_id = order_id },
         update = {
             ["$setOnInsert"] = {
@@ -199,6 +211,13 @@ function M.record(orders_coll, opts)
         new = true,
     })
     if type(ret) ~= "table" or ret.ok ~= 1 then
+        if state == "UNKNOWN" then
+            -- 写入可能已在主节点生效、只是多数派确认丢了。普通 find_one 此刻
+            -- 可能看得到这条记录，但那是未确认状态：切主回滚后订单会消失而渠道
+            -- 已收到 200，就变成永久丢单。必须按失败返回，让渠道重推（落单幂等）
+            m_unconfirmed:inc(1, { provider = provider })
+            return nil, "UNKNOWN"
+        end
         -- 并发重复回调可能撞唯一索引（E11000）。这不是存储故障：回读一次，
         -- 是同一笔就按已有订单处理，否则才算冲突
         local existing = orders_coll:find_one({ provider = provider, order_id = order_id })
@@ -229,7 +248,7 @@ function M.record(orders_coll, opts)
             existing.rid = rid
             return existing, false
         end
-        return nil, (type(ret) == "table" and ret.errmsg) or ferr or "order upsert failed"
+        return nil, detail or "order upsert failed"
     end
     local order = ret.value
     if type(order) ~= "table" then
@@ -286,12 +305,12 @@ function M.transition(orders_coll, provider, order_id, from, to, extra, now, uns
     if unset then
         update["$unset"] = unset
     end
-    local ret, err = write_order(orders_coll, {
+    local ret, state, err = write_order(orders_coll, {
         query = { provider = provider, order_id = order_id, status = from },
         update = update,
         new = true,
     })
-    if type(ret) ~= "table" or ret.ok ~= 1 then
+    if state ~= "CONFIRMED" or type(ret) ~= "table" or ret.ok ~= 1 then
         return nil, (type(ret) == "table" and ret.errmsg) or err or "transition failed"
     end
     if type(ret.value) ~= "table" then
@@ -307,12 +326,12 @@ function M.ack(orders_coll, provider, order_id, result, now)
     if result ~= M.ACK.ACCEPTED and result ~= M.ACK.REJECTED then
         return nil, "invalid ack result"
     end
-    local ret, err = write_order(orders_coll, {
+    local ret, state, err = write_order(orders_coll, {
         query = { provider = provider, order_id = order_id },
         update = { ["$set"] = { webhook_ack_at = now or os.time(), ack_result = result } },
         new = true,
     })
-    if type(ret) ~= "table" or ret.ok ~= 1 then
+    if state ~= "CONFIRMED" or type(ret) ~= "table" or ret.ok ~= 1 then
         return nil, (type(ret) == "table" and ret.errmsg) or err or "ack failed"
     end
     return type(ret.value) == "table" and ret.value or nil
@@ -434,6 +453,18 @@ function M.ensure_indexes(orders_coll)
     return true
 end
 
+-- 启动门禁：没有多数派写入通道时，落单/状态推进/ACK 全部退化成服务端默认写关注。
+-- 订单是资金凭证，这类降级不能在生产里静默生效——由 service/pay_callback 在启动时拦下。
+function M.check_write_channel(orders_coll)
+    if type(orders_coll) ~= "table" then
+        return nil, "orders collection is required"
+    end
+    if type(orders_coll.critical_find_and_modify) ~= "function" then
+        return nil, "orders collection has no critical_find_and_modify (majority write) channel"
+    end
+    return true
+end
+
 -- 退款/拒付是新的补偿操作：用独立的 service_op_id，不删原流水
 function M.compensation_op_id(order, hash_fn)
     if type(order) ~= "table" then
@@ -448,12 +479,12 @@ function M.note_error(orders_coll, order, err, now)
     if type(order) ~= "table" then
         return nil, "order is required"
     end
-    local ret, ferr = write_order(orders_coll, {
+    local ret, state, ferr = write_order(orders_coll, {
         query = { provider = order.provider, order_id = order.order_id },
         update = { ["$set"] = { last_error = tostring(err), last_error_at = now or os.time() } },
         new = true,
     })
-    if type(ret) ~= "table" or ret.ok ~= 1 then
+    if state ~= "CONFIRMED" or type(ret) ~= "table" or ret.ok ~= 1 then
         return nil, (type(ret) == "table" and ret.errmsg) or ferr or "note_error failed"
     end
     return type(ret.value) == "table" and ret.value or nil
@@ -465,7 +496,7 @@ function M.block_reconcile(orders_coll, order, reason, now)
     if type(order) ~= "table" then
         return nil, "order is required"
     end
-    local ret, ferr = write_order(orders_coll, {
+    local ret, state, ferr = write_order(orders_coll, {
         query = { provider = order.provider, order_id = order.order_id },
         update = {
             ["$set"] = {
@@ -475,7 +506,7 @@ function M.block_reconcile(orders_coll, order, reason, now)
         },
         new = true,
     })
-    if type(ret) ~= "table" or ret.ok ~= 1 then
+    if state ~= "CONFIRMED" or type(ret) ~= "table" or ret.ok ~= 1 then
         return nil, (type(ret) == "table" and ret.errmsg) or ferr or "block_reconcile failed"
     end
     return type(ret.value) == "table" and ret.value or nil
@@ -487,7 +518,7 @@ function M.unblock_reconcile(orders_coll, order, now)
     if type(order) ~= "table" then
         return nil, "order is required"
     end
-    local ret, ferr = write_order(orders_coll, {
+    local ret, state, ferr = write_order(orders_coll, {
         query = { provider = order.provider, order_id = order.order_id },
         update = {
             ["$set"] = { reconcile_unblocked_at = now or os.time() },
@@ -495,7 +526,7 @@ function M.unblock_reconcile(orders_coll, order, now)
         },
         new = true,
     })
-    if type(ret) ~= "table" or ret.ok ~= 1 then
+    if state ~= "CONFIRMED" or type(ret) ~= "table" or ret.ok ~= 1 then
         return nil, (type(ret) == "table" and ret.errmsg) or ferr or "unblock_reconcile failed"
     end
     if type(ret.value) ~= "table" then
@@ -516,7 +547,7 @@ function M.mark_reconciled(orders_coll, order, proof, now)
     if type(proof) ~= "table" then
         return nil, "proof is required"
     end
-    local ret, err = write_order(orders_coll, {
+    local ret, state, err = write_order(orders_coll, {
         query = {
             provider = order.provider,
             order_id = order.order_id,
@@ -532,7 +563,7 @@ function M.mark_reconciled(orders_coll, order, proof, now)
         },
         new = true,
     })
-    if type(ret) ~= "table" or ret.ok ~= 1 then
+    if state ~= "CONFIRMED" or type(ret) ~= "table" or ret.ok ~= 1 then
         return nil, (type(ret) == "table" and ret.errmsg) or err or "reconcile transition failed"
     end
     if type(ret.value) ~= "table" then

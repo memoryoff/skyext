@@ -135,6 +135,14 @@ function CMD.start(conf)
 
     g_orders = mongo_conn.get_collection(g_conf.db, g_conf.coll)
 
+    -- 写通道门禁：没有多数派写入，落单/推进/ACK 都是 w:1，切主回滚会让
+    -- "渠道已 ACK、订单行消失"变成永久丢单。缺通道必须在启动时拦下，不能降级运行
+    local writable, werr = charge_order.check_write_channel(g_orders)
+    if not writable then
+        log.error("pay callback not started, majority write gate failed", "err", tostring(werr))
+        return false, werr
+    end
+
     -- 索引门禁：没有 (provider, order_id) 唯一索引，重复回调会落出两条订单，
     -- 发奖就可能执行两次。索引建不起来时**不启动**服务
     local indexed, ierr = charge_order.ensure_indexes(g_orders)

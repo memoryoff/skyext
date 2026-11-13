@@ -439,4 +439,39 @@ t.describe("charge_order 多数派写入", function()
         -- 没有落单成功就不能往下走：否则发奖会建立在一张可能不存在的订单上
         t.expect(next(h.orders.store)).to.be_nil()
     end)
+
+    -- 写入可能已经在主节点生效、只是多数派确认丢了。普通 find_one 能看到它，
+    -- 但那不是"可靠落单"：切主回滚后订单会消失，而渠道已经收到 200
+    t.it("never confirms an unconfirmed write through a plain read", function()
+        local h = harness()
+        h.orders.critical_find_and_modify = function(self, opts)
+            self:find_and_modify(opts)
+            return "UNKNOWN", "write concern timeout"
+        end
+        local order, err = h.record()
+        t.expect(order).to.be_nil()
+        t.expect(err).to.equal("UNKNOWN")
+        -- 文档确实已经能被普通读看到，正是这条"看得见但没确认"的路径
+        t.expect(h.orders:find_one({ provider = "wechat", order_id = "ORDER-1" })).to.exist()
+
+        -- 渠道重推时会重新走多数派通道，命中已有订单即视为幂等成功
+        h.orders.critical_find_and_modify = function(self, opts)
+            return "CONFIRMED", self:find_and_modify(opts)
+        end
+        local again, created = h.record()
+        t.expect(again).to.exist()
+        t.expect(created).to.equal(false)
+    end)
+
+    -- 缺多数派通道时所有状态推进都会退化成 w:1。支付模块必须在启动时 fail-fast
+    t.it("refuses to start without a majority write channel", function()
+        local h = harness()
+        local ok, err = h.charge.check_write_channel(h.orders)
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.match("critical_find_and_modify")
+        h.orders.critical_find_and_modify = function()
+            return "CONFIRMED", {}
+        end
+        t.expect(h.charge.check_write_channel(h.orders)).to.equal(true)
+    end)
 end)

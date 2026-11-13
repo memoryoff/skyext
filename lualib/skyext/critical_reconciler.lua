@@ -25,13 +25,50 @@ local m_due =
 local STATES = critical.JOB_STATE
 local DUE_STATES = { STATES.PENDING, STATES.CLAIMING_FENCE, STATES.RETRY_WAIT }
 
+-- 游标只能落在扫描期间不变的字段上。任务主键 (rid, op_id) 在 claim 前后都不变，
+-- 而 updated_at / lease_until 会被 claim 改掉——拿它们做游标或排序键，页边界会随
+-- 集合收缩漂移，后面的任务被反复跳过（只是延后，不会永久丢单，但恢复时间不可预测）。
+local function normalize_cursor(value)
+    if type(value) ~= "table" then
+        return nil
+    end
+    if math.type(value.rid) ~= "integer" or type(value.op_id) ~= "string" then
+        return nil
+    end
+    return { rid = value.rid, op_id = value.op_id }
+end
+
+local function scan_query(now, cursor)
+    local query = {
+        state = { ["$in"] = DUE_STATES },
+        -- 租约条件必须单独成组：cursor 也是 $or（复合键），两个 $or 平铺会互相覆盖
+        ["$and"] = {
+            {
+                ["$or"] = {
+                    { lease_until = { ["$lte"] = now } },
+                    { lease_until = { ["$exists"] = false } },
+                },
+            },
+        },
+    }
+    if cursor then
+        query["$and"][2] = {
+            ["$or"] = {
+                { rid = { ["$gt"] = cursor.rid } },
+                { rid = cursor.rid, op_id = { ["$gt"] = cursor.op_id } },
+            },
+        }
+    end
+    return query
+end
+
 -- deps:
 --   jobs_coll                      任务集合（find_many）
 --   claim(rid, op_id, owner, lease_until, job_version) -> true, job | false, reason
 --   resolve(rid, op_id)            -> { status = COMMITTED | NOT_COMMITTED | UNKNOWN }
 --                                    必须经实际持锁 owner 的实体队列与 Fence 屏障
 --   finish(rid, op_id, job_version, state_name) -> true | false, reason
--- opts: now / owner / scan_limit / lease
+-- opts: now / owner / scan_limit / lease / cursor
 function M.run_once(deps, opts)
     opts = opts or {}
     if type(deps) ~= "table" or type(deps.jobs_coll) ~= "table" then
@@ -47,7 +84,7 @@ function M.run_once(deps, opts)
     end
     local now = opts.now or os.time()
     local lease = opts.lease or M.DEFAULT_LEASE
-    local skip = math.tointeger(opts.skip or deps.scan_cursor) or 0
+    local cursor = normalize_cursor(opts.cursor) or normalize_cursor(deps.scan_cursor)
     local stats = {
         claimed = 0,
         committed = 0,
@@ -57,20 +94,16 @@ function M.run_once(deps, opts)
         failed = 0,
         due = {},
     }
+    for _, state in ipairs(DUE_STATES) do
+        stats.due[state] = 0
+    end
 
     -- 只扫租约到期的可认领任务；索引是 {state:1, lease_until:1}
     local scan_limit = opts.scan_limit or M.DEFAULT_SCAN
-    local called, jobs, err = pcall(deps.jobs_coll.find_many, deps.jobs_coll, {
-        state = { ["$in"] = DUE_STATES },
-        ["$or"] = {
-            { lease_until = { ["$lte"] = now } },
-            { lease_until = { ["$exists"] = false } },
-        },
-    }, {
+    local called, jobs, err = pcall(deps.jobs_coll.find_many, deps.jobs_coll, scan_query(now, cursor), {
         limit = scan_limit,
-        skip = skip,
-        -- 稳定排序 + 轮转游标：持续 UNKNOWN 的任务不能永远占据队头
-        sort = { { updated_at = 1 }, { rid = 1 }, { op_id = 1 } },
+        -- 主键排序：不可变、唯一，keyset 续扫不会因为 claim 改字段而重排
+        sort = { { rid = 1 }, { op_id = 1 } },
         projection = { _id = 0 },
     })
     if not called then
@@ -79,7 +112,13 @@ function M.run_once(deps, opts)
     if type(jobs) ~= "table" then
         return nil, tostring(err or "reconcile scan failed")
     end
-    deps.scan_cursor = #jobs >= scan_limit and skip + #jobs or 0
+    local next_cursor
+    if #jobs >= scan_limit and #jobs > 0 then
+        local last = jobs[#jobs]
+        next_cursor = normalize_cursor(last)
+    end
+    -- 页没满说明本轮已经扫到末尾：下一轮从头开始，避免游标永久停在尾部
+    deps.scan_cursor = next_cursor
 
     for _, job in ipairs(jobs) do
         if type(job) == "table" and type(job.state) == "string" then
@@ -133,8 +172,9 @@ function M.run_once(deps, opts)
             end
         end
     end
-    for state, count in pairs(stats.due) do
-        m_due:set(count, { state = state })
+    -- 每个可扫状态每轮都要写：只写本轮见到的状态，归零的 gauge 会永远停在旧值
+    for _, state in ipairs(DUE_STATES) do
+        m_due:set(stats.due[state] or 0, { state = state })
     end
     return stats
 end

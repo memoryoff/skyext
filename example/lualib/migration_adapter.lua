@@ -152,20 +152,51 @@ function M.freeze(entity, barrier_id)
     if not entity.owner_epoch then
         return nil, "entity has no owner epoch"
     end
+    -- 先登记、再发 RPC：远端可能已经建立了屏障，而回包永远不回来（网络断、节点假死）。
+    -- 等到返回才登记的话，这种"屏障已生效、源端并不知道"的连接在 abort 里找不到，
+    -- 停服宽限一到，玩家连接就永久卡在网关的 frozen_epoch 上。
+    -- 状态区分"确定未冻结"与"结果未知"：只有网关明确拒绝才能撤销这条登记
+    g_inflight[entity.id] = {
+        id = entity.id,
+        conn_id = entity.conn_id,
+        barrier_id = barrier_id,
+        state = "FREEZE_UNKNOWN",
+    }
+    entity._barrier = barrier_id
     local called, info, err =
         pcall(call_gate, entity.conn_id, "freeze_owner", entity.conn_id, entity.owner_epoch, barrier_id)
     if not called then
-        -- 网关可能已经建立屏障，只是连接在回包前断了。按 UNKNOWN 保留 barrier
-        -- 身份，让 fallback 必须踢客户端解除可能存在的 frozen_epoch。
-        g_inflight[entity.id] = { id = entity.id, conn_id = entity.conn_id, barrier_id = barrier_id }
-        entity._barrier = barrier_id
+        -- 网关可能已经建立屏障，只是回包前连接断了。登记保留为 FREEZE_UNKNOWN，
+        -- fallback 与 abort 都必须踢客户端，解除可能存在的 frozen_epoch
         return nil, tostring(info)
     end
     if not info then
+        -- 网关明确拒绝：屏障没有建立，撤销登记，别让 abort 误踢一条健康连接
+        local entry = g_inflight[entity.id]
+        if entry and entry.state == "FREEZE_UNKNOWN" and entry.conn_id == entity.conn_id then
+            g_inflight[entity.id] = nil
+            entity._barrier = nil
+        end
         return nil, tostring(err)
     end
-    -- 屏障已经建立：从这里到 activate 之间无论失败还是取消，都必须有人解屏障
-    g_inflight[entity.id] = { id = entity.id, conn_id = entity.conn_id, barrier_id = barrier_id }
+    -- 屏障已经建立：从这里到 activate 之间无论失败还是取消，都必须有人解屏障。
+    -- 只更新已有登记，不重建：abort 可能已经在回包到达前踢过并清掉了这一条，
+    -- 迟到的成功回包不能把它复活成一条没人再处理的记录
+    local entry = g_inflight[entity.id]
+    if entry then
+        entry.state = "FROZEN"
+        entity._barrier = barrier_id
+        return true
+    end
+    if g_aborted then
+        return nil, "migration aborted"
+    end
+    g_inflight[entity.id] = {
+        id = entity.id,
+        conn_id = entity.conn_id,
+        barrier_id = barrier_id,
+        state = "FROZEN",
+    }
     entity._barrier = barrier_id
     return true
 end

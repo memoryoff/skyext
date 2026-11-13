@@ -210,6 +210,57 @@ t.describe("launcher 启动自检", function()
         t.expect(#h.launcher.self_check().problems).to.equal(0)
     end)
 
+    -- 维护服务只归档自己 type_name 的冷账本、只恢复该类型的 UNKNOWN 任务。
+    -- 支付与 Outbox 用了别的实体类型时，自检照样能过，但热账本不归档、订单停在 GRANTING
+    t.it("flags pay_callback and outbox_worker targeting a different entity type", function()
+        local other = {
+            rank = {
+                critical_ledger = { db = "rank", coll = "op_ledger" },
+                critical_jobs = { db = "rank", coll = "critical_reconcile_jobs" },
+            },
+            role = {
+                critical_ledger = { db = "role", coll = "op_ledger" },
+                critical_jobs = { db = "role", coll = "critical_reconcile_jobs" },
+            },
+        }
+        local h = harness({
+            conf = {
+                entity_types = other,
+                critical_maintenance = { enabled = true, type_name = "rank" },
+                pay_callback = { enabled = true, role_type = "role", providers = { "mock" } },
+                outbox_worker = { enabled = true, type_name = "role" },
+            },
+        })
+        local report = h.launcher.self_check()
+        t.expect(#report.problems).to.equal(2)
+        t.expect(report.problems[1]).to.match("pay_callback.role_type role")
+        t.expect(report.problems[1]).to.match("rank")
+        t.expect(report.problems[2]).to.match("outbox_worker.type_name role")
+    end)
+
+    -- 支付分支必须复用 critical_config.validate_entity_config，而不是自己再写一套
+    -- 不完整的集合校验：口径分裂会让"自检通过、维护服务启动失败"同时发生
+    t.it("reuses the shared critical config validation for the pay branch", function()
+        local h = harness({
+            conf = {
+                entity_types = {
+                    role = {
+                        critical_ledger = { db = "role", coll = "op_ledger" },
+                        critical_jobs = { db = "role", coll = "op_ledger" },
+                    },
+                },
+                critical_maintenance = { enabled = true, type_name = "role" },
+                pay_callback = { enabled = true, role_type = "role", providers = { "mock" } },
+            },
+        })
+        local report = h.launcher.self_check()
+        -- 维护分支先报（按字段逐条），支付分支复用同一套校验并带上 "invalid critical config"
+        t.expect(#report.problems).to.equal(2)
+        t.expect(report.problems[1]).to.match("different collections")
+        t.expect(report.problems[2]).to.match("invalid critical config")
+        t.expect(report.problems[2]).to.match("different collections")
+    end)
+
     t.it("blocks node startup when critical_maintenance is enabled but misconfigured", function()
         local h = harness({
             conf = {

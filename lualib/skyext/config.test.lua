@@ -367,3 +367,44 @@ t.describe("config.init", function()
         end)
     end)
 end)
+
+-- 四个 getter 共用一份缓存时，先 get 会把原始字符串留在缓存里：之后 get_boolean
+-- 直接返回字符串 "false"（Lua 里非空字符串为真），get_number 返回字符串而不是数字。
+-- 类型化取值必须是各自的视图，不能被别的 getter 的类型污染。
+t.describe("config 类型化缓存互不污染", function()
+    t.it("get 之后 get_boolean 仍返回布尔值", function()
+        local h = harness({ feature_enabled = "false" })
+        t.expect(h.config.get("feature_enabled")).to.equal("false")
+        t.expect(type(h.config.get_boolean("feature_enabled"))).to.equal("boolean")
+        t.expect(h.config.get_boolean("feature_enabled")).to.equal(false)
+        -- 两个 getter 共用一次环境变量读取，缓存仍然有效
+        t.expect(h.gets.feature_enabled).to.equal(1)
+    end)
+
+    t.it("get 之后 get_number 仍返回数字", function()
+        local h = harness({ maxclient = "1024" })
+        t.expect(h.config.get("maxclient")).to.equal("1024")
+        t.expect(type(h.config.get_number("maxclient"))).to.equal("number")
+        t.expect(h.config.get_number("maxclient")).to.equal(1024)
+        t.expect(h.gets.maxclient).to.equal(1)
+    end)
+
+    t.it("get_boolean 之后 get 仍返回原始字符串", function()
+        local h = harness({ feature_enabled = "false" })
+        t.expect(h.config.get_boolean("feature_enabled")).to.equal(false)
+        t.expect(h.config.get("feature_enabled")).to.equal("false")
+    end)
+
+    t.it("get_boolean 之后 get_table 仍按字符串求值", function()
+        local h = harness({ payload = "{ a = 1 }" })
+        t.expect(h.config.get_boolean("payload")).to.equal(false)
+        local v = h.config.get_table("payload")
+        t.expect(v.a).to.equal(1)
+    end)
+
+    t.it("get_number 之后 get_table 不被数字缓存吞掉", function()
+        local h = harness({ payload = "{ 1, 2 }" })
+        t.expect(h.config.get_number("payload")).to.be_nil()
+        t.expect(h.config.get_table("payload")).to.equal({ 1, 2 })
+    end)
+end)

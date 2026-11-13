@@ -79,7 +79,14 @@ local function harness(opts)
                 if opts.freeze_raises then
                     error("gate unavailable")
                 end
-                return h.freeze_info or { sent = 0, epoch = 2, barrier_id = "b1" }, h.freeze_err
+                if opts.on_freeze_call then
+                    opts.on_freeze_call(h)
+                end
+                -- freeze_info=false 表示网关明确拒绝（返回 nil 而非屏障信息）
+                if h.freeze_info == nil then
+                    return { sent = 0, epoch = 2, barrier_id = "b1" }, h.freeze_err
+                end
+                return h.freeze_info, h.freeze_err
             end
             -- 取消兜底的两条腿要能分别注入失败：A-11 的核心是
             -- "目标不可达时踢人仍然必须发生"
@@ -501,6 +508,45 @@ end)
 -- 停服超时后协调器只置 is_cancelled，卡在 cluster.call 里的阶段协程收不到。
 -- 兜底必须主动解掉网关屏障，否则客户端上下行会被永久丢弃。
 t.describe("migration_adapter 取消兜底", function()
+    -- 网关可能在回包前就已经建好屏障（网络断、节点假死）。等 RPC 返回再登记的话，
+    -- abort 遍历不到这条连接：停服宽限一到，客户端就永久卡在 frozen_epoch 上
+    t.it("can abort a connection whose freeze RPC has not come back yet", function()
+        local kicked
+        local h = harness({
+            on_freeze_call = function(hh)
+                -- 远端正在建屏障、回包还在路上，协调器此刻收到 cancel
+                kicked = hh.adapter.abort("shutdown deadline").kicked
+            end,
+        })
+        local e = entity()
+        local ok, err = h.adapter.freeze(e, "b1")
+        t.expect(kicked).to.equal(1)
+        -- 取消先落地：屏障虽然建起来了，但客户端已经被踢，阶段协程必须收手
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.equal("migration aborted")
+        t.expect(h.last_call("kick")).to.exist()
+        t.expect(h.last_call("kick").args[1]).to.equal("conn-7")
+        -- 迟到的成功回包不得把这条连接重新登记回来，下一次 abort 不能再踢一次
+        local stats = h.adapter.abort("shutdown deadline")
+        t.expect(stats.kicked).to.equal(0)
+        t.expect(count_calls(h, "kick")).to.equal(1)
+    end)
+
+    -- 明确拒绝 = 屏障没建起来。此时登记必须撤销，不能让 abort 误踢一条健康连接
+    t.it("does not register a freeze the gate explicitly refused", function()
+        local h = harness()
+        h.freeze_info = false
+        h.freeze_err = "epoch mismatch"
+        local e = entity()
+        local ok, err = h.adapter.freeze(e, "b1")
+        t.expect(ok).to.be_nil()
+        t.expect(err).to.equal("epoch mismatch")
+        t.expect(e._barrier).to.be_nil()
+        local stats = h.adapter.abort("shutdown deadline")
+        t.expect(stats.kicked).to.equal(0)
+        t.expect(h.last_call("kick")).to.be_nil()
+    end)
+
     t.it("kicks every client still behind a barrier", function()
         local h = harness()
         local e = entity()

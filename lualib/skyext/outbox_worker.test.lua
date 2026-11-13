@@ -7,7 +7,69 @@ local source = fs.join(fs.absolute(os.getenv("SKYTEST_ROOT") or lfs.currentdir()
 local FIELD = "_critical_outbox_pending_count"
 local CLEANUP_FIELD = "_critical_outbox_cleanup_at"
 
--- 假集合：记录查询条件，按注入的页返回文档
+-- 假集合：按查询条件过滤、按 sort 排序、按 limit 取页。
+-- 必须实现真实过滤语义：投影和 skip 的老实现在集合收缩时会被测出漂移
+local function match_cond(doc, key, cond)
+    if type(cond) ~= "table" then
+        return doc[key] == cond
+    end
+    local value = doc[key]
+    if cond["$gt"] ~= nil then
+        return value ~= nil and value > cond["$gt"]
+    end
+    if cond["$lte"] ~= nil then
+        return value ~= nil and value <= cond["$lte"]
+    end
+    if cond["$exists"] == false then
+        return value == nil
+    end
+    error("unsupported query operator")
+end
+
+local function matches(doc, query)
+    for key, cond in pairs(query) do
+        if key == "$and" then
+            for _, sub in ipairs(cond) do
+                if not matches(doc, sub) then
+                    return false
+                end
+            end
+        elseif key == "$or" then
+            local hit = false
+            for _, sub in ipairs(cond) do
+                if matches(doc, sub) then
+                    hit = true
+                    break
+                end
+            end
+            if not hit then
+                return false
+            end
+        elseif not match_cond(doc, key, cond) then
+            return false
+        end
+    end
+    return true
+end
+
+local function sort_docs(docs, sort)
+    table.sort(docs, function(a, b)
+        for _, spec in ipairs(sort or {}) do
+            for field, dir in pairs(spec) do
+                local x, y = a[field], b[field]
+                if x ~= y then
+                    if dir == 1 then
+                        return x < y
+                    end
+                    return x > y
+                end
+            end
+        end
+        return false
+    end)
+    return docs
+end
+
 local function fake_coll(docs, fail)
     local coll = { calls = {} }
     function coll:find_many(query, opts)
@@ -15,11 +77,17 @@ local function fake_coll(docs, fail)
         if fail then
             error(fail)
         end
+        local hits = {}
+        for _, doc in ipairs(docs) do
+            if matches(doc, query) then
+                hits[#hits + 1] = doc
+            end
+        end
+        sort_docs(hits, opts and opts.sort)
         local out = {}
-        local skip = (opts and opts.skip) or 0
-        local limit = (opts and opts.limit) or #docs
-        for i = skip + 1, math.min(#docs, skip + limit) do
-            out[#out + 1] = docs[i]
+        local limit = (opts and opts.limit) or #hits
+        for i = 1, math.min(#hits, limit) do
+            out[i] = hits[i]
         end
         return out
     end
@@ -82,7 +150,7 @@ t.describe("outbox_worker 扫描", function()
     t.it("queries pending roles and cleanup-due roles", function()
         local h = harness()
         local coll = fake_coll({ { rid = 3, [FIELD] = 2 }, { rid = 4, [FIELD] = 1 } })
-        local list, next_skip = h.mod.scan(coll, { limit = 10, now = 1000 })
+        local list, next_cursor = h.mod.scan(coll, { limit = 10, now = 1000 })
         t.expect(#list).to.equal(2)
         t.expect(list[1].rid).to.equal(3)
         t.expect(list[1].pending).to.equal(2)
@@ -94,15 +162,16 @@ t.describe("outbox_worker 扫描", function()
         t.expect(branches[2][CLEANUP_FIELD]).to.equal({ ["$lte"] = 1000 })
         t.expect(coll.calls[1].opts.limit).to.equal(10)
         -- 这一页没满 -> 下一轮从头开始
-        t.expect(next_skip).to.equal(0)
+        t.expect(next_cursor).to.be_nil()
     end)
 
     t.it("marks a role whose cleanup time has arrived", function()
         local h = harness()
+        -- 三个角色都必须真的命中扫描条件：$or 的第一支是 pending>0，第二支是清理到期
         local coll = fake_coll({
             { rid = 5, [FIELD] = 0, [CLEANUP_FIELD] = 900 },
-            { rid = 6, [FIELD] = 0, [CLEANUP_FIELD] = 2000 },
-            { rid = 7, [FIELD] = 0 },
+            { rid = 6, [FIELD] = 1, [CLEANUP_FIELD] = 2000 },
+            { rid = 7, [FIELD] = 1 },
         })
         local list = assert(h.mod.scan(coll, { limit = 10, now = 1000 }))
         t.expect(list[1].cleanup_due).to.equal(true)
@@ -110,16 +179,19 @@ t.describe("outbox_worker 扫描", function()
         t.expect(list[3].cleanup_due).to.equal(false)
     end)
 
-    t.it("advances the cursor when a page is full", function()
+    t.it("advances the cursor to the last rid of a full page", function()
         local h = harness()
         local docs = {}
         for i = 1, 6 do
             docs[i] = { rid = i, [FIELD] = 1 }
         end
         local coll = fake_coll(docs)
-        local list, next_skip = h.mod.scan(coll, { limit = 4 })
+        local list, next_cursor = h.mod.scan(coll, { limit = 4 })
         t.expect(#list).to.equal(4)
-        t.expect(next_skip).to.equal(4)
+        t.expect(next_cursor).to.equal(4)
+        -- skip 分页会被"pump 后 pending 归零"的集合收缩带偏，这里必须没有 skip
+        t.expect(coll.calls[1].opts.skip).to.be_nil()
+        t.expect(coll.calls[1].opts.sort).to.equal({ { rid = 1 } })
     end)
 
     t.it("reports a scan error instead of an empty page", function()
@@ -133,6 +205,67 @@ t.describe("outbox_worker 扫描", function()
     t.it("rejects a missing collection", function()
         local h = harness()
         t.expect(h.mod.scan(nil)).to.be_nil()
+    end)
+end)
+
+-- pump 会把 pending 归零，角色随即退出扫描集合。skip 分页的页边界按旧集合位置
+-- 推进，一次遍历只能捞到一部分角色；keyset 游标落在不可变的 rid 上，必须一轮遍历全覆盖
+t.describe("outbox_worker keyset 分页", function()
+    t.it("continues right after the previous page's last rid", function()
+        local h = harness()
+        local docs = {}
+        for i = 1, 10 do
+            docs[i] = { rid = i, [FIELD] = 1 }
+        end
+        local coll = fake_coll(docs)
+        assert(h.mod.scan(coll, { limit = 4 }))
+        local second, cursor = h.mod.scan(coll, { limit = 4, cursor = 4 })
+        t.expect(second[1].rid).to.equal(5)
+        t.expect(cursor).to.equal(8)
+        t.expect(coll.calls[2].query["$and"][1].rid).to.equal({ ["$gt"] = 4 })
+        -- 待发条件仍然独立成 $or，不能被游标条件顶掉
+        t.expect(#coll.calls[2].query["$or"]).to.equal(2)
+    end)
+
+    t.it("pumps every backlogged role even though pumping empties the scanned set", function()
+        local h = harness()
+        local docs = {}
+        for i = 1, 240 do
+            docs[i] = { rid = i, [FIELD] = 1 }
+        end
+        local coll = fake_coll(docs)
+        local pumped = {}
+        local deps = {
+            role_coll = coll,
+            pump = function(rid)
+                for _, doc in ipairs(docs) do
+                    if doc.rid == rid then
+                        doc[FIELD] = 0
+                    end
+                end
+                pumped[#pumped + 1] = rid
+                return true, { enqueued = 1, failed = 0, unknown = 0, already = 0, batches = 1, pending = 0 }
+            end,
+        }
+        local rounds = 0
+        while true do
+            local stats = assert(h.mod.run_once(deps, { scan_limit = 16 }))
+            rounds = rounds + 1
+            if stats.pumped == 0 then
+                break
+            end
+            assert(rounds < 60, "outbox 分页没有收敛：offset 漂移")
+        end
+        -- 240 条、每页 16：15 页取完，第 16 轮空扫退出
+        t.expect(rounds).to.equal(16)
+        t.expect(#pumped).to.equal(240)
+        local seen = {}
+        for _, rid in ipairs(pumped) do
+            assert(not seen[rid], "同一个角色被重复投递: " .. tostring(rid))
+            seen[rid] = true
+        end
+        -- 扫到末尾后游标归零，下一轮重新从队头开始
+        t.expect(deps.cursor).to.be_nil()
     end)
 end)
 
@@ -201,14 +334,16 @@ t.describe("outbox_worker 单轮调度", function()
     t.it("skips roles whose indexed count is already zero", function()
         local h = harness()
         local calls = 0
+        -- 索引字段陈旧、但清理标记不是可用的整数秒（写成浮点）时，不能被当成到期任务：
+        -- 既不加载实体，也不能把一条坏标记当成"该清理了"
         local deps = {
-            role_coll = fake_coll({ { rid = 1, [FIELD] = 0 } }),
+            role_coll = fake_coll({ { rid = 1, [FIELD] = 0, [CLEANUP_FIELD] = 500.5 } }),
             pump = function()
                 calls = calls + 1
                 return true, {}
             end,
         }
-        local stats = assert(h.mod.run_once(deps, {}))
+        local stats = assert(h.mod.run_once(deps, { now = 1000 }))
         t.expect(calls).to.equal(0)
         t.expect(stats.skipped).to.equal(1)
     end)

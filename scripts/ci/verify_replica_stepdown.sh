@@ -149,6 +149,18 @@ for _ in $(seq 1 30); do
 done
 [ "$PRE_READY" -eq 1 ] || fail "切主前没有形成并发成功写（pre_hits=${PRE_HITS:-0}, workers=$WORKERS）"
 
+# 并发证明必须在 stepDown **之前**采样。writer 先读 control 里的 phase 再写，
+# 切主完成到 phase 切到 post 之间成功的写仍然计进 pre_*：事后统计的
+# pre_workers 会把切主后的写算成切主前，证明不了"切主前有两个 worker 并发成功"。
+PRE_WORKERS=$(mongosh "$URI" --quiet --eval "
+  const d = db.getSiblingDB('$DB').$COLL.findOne({_id:'op1'});
+  if (!d) { print(0); quit(); }
+  let n = 0;
+  for (let i = 1; i <= $WORKERS; i++) { if (d['pre_worker_' + i] > 0) n++; }
+  print(n);
+" 2>/dev/null || echo 0)
+[ "${PRE_WORKERS:-0}" -ge 2 ] || fail "切主前成功写的 worker 不足两个（pre_workers=${PRE_WORKERS:-0}, workers=$WORKERS）"
+
 # ---------------------------------------------------------------------------
 # 门禁 2：真的切主。这里**不吞** stepDown 的结果，并且要求 primary 换人
 # ---------------------------------------------------------------------------
@@ -240,11 +252,12 @@ mongosh "$URI" --quiet --eval "
   }
   print('documents=' + count + ' version=' + d._version + ' hits=' + d.hits +
         ' pre=' + d.pre_hits + ' post=' + d.post_hits +
-        ' pre_workers=' + preWorkers + ' post_workers=' + postWorkers);
+        ' pre_workers_now=' + preWorkers + ' post_workers=' + postWorkers);
   if (count !== 1) { throw new Error('duplicated document: ' + count); }
   if (d.pre_hits < $WORKERS) { throw new Error('no successful write before stepdown'); }
   if (d.post_hits < $WORKERS) { throw new Error('no successful write after stepdown'); }
-  if (preWorkers < 2) { throw new Error('fewer than two workers wrote before stepdown'); }
+  // 切主前的并发证明用 stepDown 前的采样值（见上面的 PRE_WORKERS）：
+  // 这里的 preWorkers 可能包含"切主后、phase 切换前"的写，不能用来证明
   if (postWorkers < 2) { throw new Error('fewer than two workers wrote after stepdown'); }
   if (d.hits !== d.pre_hits + d.post_hits) { throw new Error('phase buckets do not add up to hits'); }
   if (d._version !== d.hits) { throw new Error('version and hits diverged'); }

@@ -94,9 +94,10 @@ function M.ensure_indexes(colls)
     return true
 end
 
--- 扫描待处理角色。skip 用于轮转，避免"永远只处理最前面那一批"：
--- 前面的角色一直投不出去时，后面的角色会饿死
--- 返回 [{ rid, pending, cleanup_due }], next_skip 或 nil, err
+-- 扫描待处理角色。游标是上一页最后一个 rid（不可变主键），不是偏移量：
+-- pump 会把 pending 归零，角色随即退出结果集，skip 的页边界会跟着集合收缩漂移，
+-- 一次遍历只能捞到一部分角色。keyset 续扫不受集合变小的干扰。
+-- 返回 [{ rid, pending, cleanup_due }], next_cursor 或 nil, err
 --
 -- 两个条件取并集：
 --   * pending > 0        还有待发事件
@@ -108,18 +109,22 @@ function M.scan(role_coll, opts)
     end
     local key = opts.key or "rid"
     local limit = opts.limit or M.DEFAULT_SCAN
-    local skip = opts.skip or 0
+    local cursor = opts.cursor
     local now = opts.now or os.time()
-    local called, docs, err = pcall(role_coll.find_many, role_coll, {
+    local query = {
         ["$or"] = {
             { [M.FIELD] = { ["$gt"] = 0 } },
             { [M.CLEANUP_FIELD] = { ["$lte"] = now } },
         },
-    }, {
+    }
+    if cursor ~= nil then
+        -- 游标条件单独成组：待发条件是 $or，两个 $or 平铺会互相覆盖
+        query["$and"] = { { [key] = { ["$gt"] = cursor } } }
+    end
+    local called, docs, err = pcall(role_coll.find_many, role_coll, query, {
         projection = { [key] = 1, [M.FIELD] = 1, [M.CLEANUP_FIELD] = 1, _id = 0 },
-        -- 按主键排序保证轮转分页稳定；不排序时 Mongo 的返回顺序在数据变动后会漂移
+        -- 按主键排序保证 wheel 分页稳定；不排序时 Mongo 的返回顺序在数据变动后会漂移
         sort = { { [key] = 1 } },
-        skip = skip,
         limit = limit,
     })
     if not called then
@@ -139,12 +144,15 @@ function M.scan(role_coll, opts)
             }
         end
     end
-    -- 这一页没满说明已经到末尾，下一轮从头开始
-    local next_skip = skip + #list
-    if #docs < limit then
-        next_skip = 0
+    -- 这一页没满说明已经到末尾，下一轮从头开始；满页则从最后一个主键续扫
+    local next_cursor
+    if #docs >= limit and #docs > 0 then
+        local last = docs[#docs]
+        if type(last) == "table" then
+            next_cursor = last[key]
+        end
     end
-    return list, next_skip
+    return list, next_cursor
 end
 
 -- 默认投递：走现有可靠消息接口。msg_id 由可靠消息模块分配，event_id 才是业务去重键。
@@ -216,17 +224,17 @@ function M.run_once(deps, opts)
     end
     local batch = opts.limit or M.DEFAULT_BATCH
     local max_loads = opts.max_loads or M.DEFAULT_MAX_LOADS
-    local list, next_skip = M.scan(deps.role_coll, {
+    local list, next_cursor = M.scan(deps.role_coll, {
         key = opts.key or deps.key,
         limit = opts.scan_limit or M.DEFAULT_SCAN,
-        skip = deps.cursor or 0,
+        cursor = deps.cursor,
         now = opts.now or os.time(),
     })
     if not list then
         m_scan:inc(1, { result = "error" })
-        return nil, next_skip
+        return nil, next_cursor
     end
-    deps.cursor = next_skip
+    deps.cursor = next_cursor
     m_scan:inc(1, { result = "ok" })
     m_scan_size:set(#list, { type = opts.type_name or "role" })
 

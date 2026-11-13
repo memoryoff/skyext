@@ -211,6 +211,37 @@ function M.reconcile_order(orders_coll, order, deps, opts)
             m_outcome:inc(1, { outcome = M.OUTCOME.GRANTED })
             return M.OUTCOME.GRANTED, reconcile_proof
         end
+        if
+            type(result) == "table"
+            and (result.status == "BUSINESS_REJECTED" or result.status == "PRECHECK_REJECTED")
+        then
+            -- 重投仍然被业务拒绝：这条 op 不会在角色文档里留下任何记录，继续留在
+            -- RETRY 等于每一轮都自动重投一次。必须转人工阻断，与首轮拒绝同一口径
+            local reason = tostring(result.reason or result.status)
+            local blocked, berr = charge_order.block_reconcile(orders_coll, order, reason, now)
+            if not blocked then
+                log.error(
+                    "charge regrant rejection could not be blocked",
+                    "order",
+                    tostring(order.order_id),
+                    "err",
+                    tostring(berr)
+                )
+                m_outcome:inc(1, { outcome = M.OUTCOME.PENDING })
+                return M.OUTCOME.PENDING, berr
+            end
+            log.error(
+                "charge regrant was rejected by business rules, manual compensation required",
+                "order",
+                tostring(order.order_id),
+                "rid",
+                tostring(order.rid),
+                "status",
+                tostring(result.status)
+            )
+            m_outcome:inc(1, { outcome = M.OUTCOME.BUSINESS_REJECTED })
+            return M.OUTCOME.BUSINESS_REJECTED, result
+        end
         m_outcome:inc(1, { outcome = M.OUTCOME.RETRY })
         return M.OUTCOME.RETRY, result
     end

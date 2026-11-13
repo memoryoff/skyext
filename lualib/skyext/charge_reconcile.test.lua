@@ -348,6 +348,49 @@ t.describe("charge_reconcile 对账", function()
         t.expect(orders.store.docs[1].reconcile_blocked_at).to.equal(10)
     end)
 
+    -- 重投发奖仍然被预检拒绝：这条 op 永远不会在角色文档里留下记录，若只记 RETRY，
+    -- 对账会每一轮都自动重投一次，等于把"人工补偿单"变成无限自动重试
+    t.it("blocks a rejected regrant instead of retrying it forever", function()
+        local orders = fake_orders()
+        local order = make_order(orders)
+        assert(charge_order.transition(orders, "wechat", "o-1", "VERIFIED_RECEIVED", "GRANTING", nil, 2))
+
+        local grants = 0
+        local deps = deps_for(orders, { status = "NOT_STARTED" })
+        deps.grant = function()
+            grants = grants + 1
+            return { status = "PRECHECK_REJECTED", reason = "mail module is not loaded" }
+        end
+        local outcome = charge_reconcile.reconcile_order(orders, order, deps, { now = 10 })
+        t.expect(grants).to.equal(1)
+        t.expect(outcome).to.equal("BUSINESS_REJECTED")
+        t.expect(orders.store.docs[1].status).to.equal("GRANTING")
+        t.expect(orders.store.docs[1].reconcile_blocked_at).to.equal(10)
+        t.expect(orders.store.docs[1].last_error).to.equal("mail module is not loaded")
+    end)
+
+    t.it("stops regranting the rejected order on later rounds", function()
+        local orders = fake_orders()
+        make_order(orders)
+        assert(charge_order.transition(orders, "wechat", "o-1", "VERIFIED_RECEIVED", "GRANTING", nil, 2))
+
+        local grants = 0
+        local deps = deps_for(orders, { status = "NOT_STARTED" })
+        deps.grant = function()
+            grants = grants + 1
+            return { status = "PRECHECK_REJECTED", reason = "mail module is not loaded" }
+        end
+
+        local first = assert(charge_reconcile.run_once(deps, { now = 1000, grace = 60 }))
+        t.expect(first.rejected).to.equal(1)
+        t.expect(grants).to.equal(1)
+
+        -- 第二轮：订单已被阻断，不再进入扫描集合，发奖函数一次都不该再被调用
+        local second = assert(charge_reconcile.run_once(deps, { now = 1060, grace = 60 }))
+        t.expect(second.scanned).to.equal(0)
+        t.expect(grants).to.equal(1)
+    end)
+
     t.it("leaves an in-progress grant for the next round", function()
         local orders = fake_orders()
         local order = make_order(orders)

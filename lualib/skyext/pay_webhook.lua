@@ -265,9 +265,28 @@ function Webhook:handle(req)
     end
 
     if status == "BUSINESS_REJECTED" or status == "PRECHECK_REJECTED" then
-        -- 钱收了、东西没给：留 GRANTING 并记原因，等人工补偿。
-        -- 渠道侧仍然 ACK，避免它无限重推同一笔
-        charge_order.note_error(self.orders_coll, order, tostring(decision.reason or status), now)
+        -- 钱收了、东西没给：留在 GRANTING，并且**先落人工阻断标记**再 ACK。
+        --
+        -- PRECHECK_REJECTED 发生在 PREPARE 之前、零写入，critical.query 只会回
+        -- NOT_STARTED。只记 last_error 就 ACK，对账会把它当成"发奖从未开始"并自动
+        -- 重投，与"人工补偿、不再自动发奖"的契约相反。阻断写不进多数派时，订单仍
+        -- 会被自动重投，此时不能回 200 宣称可靠接收，让渠道重推即可
+        local reason = tostring(decision.reason or status)
+        charge_order.note_error(self.orders_coll, order, reason, now)
+        local blocked, berr = charge_order.block_reconcile(self.orders_coll, order, reason, now)
+        if not blocked then
+            log.error(
+                "pay grant rejection could not be blocked for manual compensation",
+                "order",
+                tostring(order.order_id),
+                "status",
+                tostring(status),
+                "err",
+                tostring(berr)
+            )
+            m_requests:inc(1, { result = "block_failed" })
+            return reject(503, "block_not_persisted", { retryable = true })
+        end
         if not self:ack(name, order, now) then
             m_requests:inc(1, { result = "ack_failed" })
             return reject(503, "ack_not_persisted", { retryable = true })
